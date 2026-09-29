@@ -3,18 +3,22 @@ from tkinter import filedialog, messagebox
 from PIL import ImageGrab
 from datetime import datetime
 from pathlib import Path
+from dataclasses import dataclass
+from io import BytesIO
 import threading
 import time
 import ctypes
 import sys
+import os
 import subprocess
 import importlib
 
 
 # ============================================================
-# Recording packages (installed automatically if missing)
+# Optional packages (installed automatically if missing)
 # ============================================================
 # Screen recording needs OpenCV (to write .mp4) and NumPy.
+# Adding screenshots to a Word document needs python-docx.
 # If they are not installed in the Python environment that runs
 # this script, we install them with pip on first start.
 
@@ -41,12 +45,22 @@ def ensure_package(import_name, pip_name):
 
 np = ensure_package("numpy", "numpy")
 cv2 = ensure_package("cv2", "opencv-python")
+docx = ensure_package("docx", "python-docx")
 
 RECORDING_AVAILABLE = np is not None and cv2 is not None
+DOCX_AVAILABLE = docx is not None
+
+if DOCX_AVAILABLE:
+    from docx import Document
+    from docx.shared import Emu, Inches, Pt
 
 if not RECORDING_AVAILABLE:
     print("Screen recording is disabled. To enable it, run:")
     print(f'  "{sys.executable}" -m pip install opencv-python numpy')
+
+if not DOCX_AVAILABLE:
+    print("Saving to Word documents is disabled. To enable it, run:")
+    print(f'  "{sys.executable}" -m pip install python-docx')
 
 
 # ============================================================
@@ -66,10 +80,18 @@ except Exception:
 
 
 # ============================================================
-# Recording Settings
+# Settings
 # ============================================================
 
 RECORDING_FPS = 15
+
+# How often (ms) to retry writing to the Word document while it is
+# open in Word and therefore locked.
+WORD_RETRY_MS = 3000
+
+# Screen pixels -> Word size (EMU) at 96 DPI. Used so small region
+# captures are not blown up larger than their real size.
+EMU_PER_PIXEL = 9525
 
 
 # ============================================================
@@ -161,34 +183,386 @@ def ensure_save_folder():
 # Generate Filenames
 # ============================================================
 
-def timestamp():
-    return datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+def timestamp(when=None):
+    return (when or datetime.now()).strftime("%Y-%m-%d_%H-%M-%S")
 
 
-def get_screenshot_filename():
-    return save_folder / f"Screenshot_{timestamp()}.png"
+def unique_path(folder, stem, suffix):
+    """folder/stem.suffix, adding _2, _3 ... if that name is already taken
+    (e.g. two captures within the same second)."""
+    path = folder / f"{stem}{suffix}"
+    n = 2
+    while path.exists():
+        path = folder / f"{stem}_{n}{suffix}"
+        n += 1
+    return path
+
+
+def get_screenshot_filename(taken_at=None):
+    folder = save_folder or (word_doc_path.parent if word_doc_path else Path.cwd())
+    return unique_path(folder, f"Screenshot_{timestamp(taken_at)}", ".png")
 
 
 def get_recording_filename():
-    return save_folder / f"Recording_{timestamp()}.mp4"
+    return unique_path(save_folder, f"Recording_{timestamp()}", ".mp4")
 
 
 # ============================================================
-# Save Screenshot
+# Save Screenshot as a standalone .png file
 # ============================================================
 
-def save_screenshot(image):
-    filename = get_screenshot_filename()
+def save_screenshot(image, taken_at=None, update_status=True):
+    filename = get_screenshot_filename(taken_at)
 
     try:
         image.save(filename, format="PNG")
         print("Screenshot saved successfully:")
         print(filename)
-        status_var.set(f"Saved: {filename.name}")
+        if update_status:
+            status_var.set(f"Saved: {filename.name}")
 
     except Exception as e:
         print(f"Error saving screenshot: {e}")
         status_var.set("Error saving screenshot (see console)")
+
+
+# ============================================================
+# Word Document Output
+# ============================================================
+# When a Word document is selected, every screenshot is appended to the
+# end of that document (with a caption showing the capture time) and the
+# document is saved straight away. Screenshots are always added in the
+# order they were captured, so the earliest one is at the top.
+#
+# If the document is open in Word, Windows locks the file and it can't be
+# written. In that case captures wait in a queue (in capture order) and
+# are written automatically as soon as the document is closed in Word.
+
+@dataclass
+class Capture:
+    taken_at: datetime
+    kind: str          # "Full screen" or "Region"
+    png: bytes         # the image, PNG-encoded
+    size: tuple        # (width, height) in pixels
+
+
+word_doc_path = None     # Path of the selected .docx, or None
+pending_captures = []    # captures not yet written to the document
+retry_job = None         # id of the scheduled auto-retry, if any
+
+
+def make_capture(image, kind, taken_at):
+    buffer = BytesIO()
+    image.save(buffer, format="PNG")
+    return Capture(taken_at=taken_at, kind=kind,
+                   png=buffer.getvalue(), size=image.size)
+
+
+def _length(value, default):
+    return value if value is not None else default
+
+
+def append_captures_to_docx(path, captures):
+    """
+    Open the .docx, add each capture (oldest first) at the end of the
+    document with a caption, and save it. The file is written to a
+    temporary file first and then swapped in, so the document can't be
+    left half-written.
+    """
+    path = Path(path)
+    doc = Document(str(path)) if path.exists() else Document()
+
+    # Usable area of the page (inside the margins)
+    section = doc.sections[-1]
+    page_w = _length(section.page_width, Inches(8.5))
+    page_h = _length(section.page_height, Inches(11))
+    usable_w = (page_w
+                - _length(section.left_margin, Inches(1))
+                - _length(section.right_margin, Inches(1)))
+    usable_h = (page_h
+                - _length(section.top_margin, Inches(1))
+                - _length(section.bottom_margin, Inches(1)))
+    max_h = int(usable_h * 0.95)
+
+    # Images only (no captions), oldest capture first
+    for capture in sorted(captures, key=lambda c: c.taken_at):
+        # Fit the image to the page width (and height), keeping its
+        # proportions, but never enlarge it beyond its real size.
+        w_px, h_px = capture.size
+        width = min(usable_w, w_px * EMU_PER_PIXEL)
+        if width * h_px / w_px > max_h:
+            width = max_h * w_px / h_px
+
+        doc.add_picture(BytesIO(capture.png), width=Emu(int(width)))
+
+        # A little space below each image so they don't touch
+        doc.paragraphs[-1].paragraph_format.space_after = Pt(12)
+
+    temp_path = path.with_name(f".{path.stem}.saving.tmp")
+    doc.save(str(temp_path))
+    try:
+        os.replace(temp_path, path)
+    except Exception:
+        try:
+            temp_path.unlink()
+        except Exception:
+            pass
+        raise
+
+
+def is_file_locked(path):
+    """True if another program (usually Word) has the file open."""
+    if not path.exists():
+        return False
+    try:
+        with open(path, "r+b"):
+            return False
+    except OSError:
+        return True
+
+
+def flush_pending(interactive=False):
+    """
+    Write any waiting captures to the Word document.
+    Returns True if nothing is left waiting.
+    """
+    if not pending_captures or word_doc_path is None:
+        update_word_controls()
+        return True
+
+    name = word_doc_path.name
+
+    if is_file_locked(word_doc_path):
+        report_document_locked()
+        return False
+
+    count = len(pending_captures)
+
+    try:
+        append_captures_to_docx(word_doc_path, pending_captures)
+
+    except PermissionError:
+        report_document_locked()
+        return False
+
+    except Exception as e:
+        print(f"Error updating Word document: {e}")
+        status_var.set(f"Could not update {name} (see console)")
+        update_word_controls()
+        if interactive:
+            messagebox.showerror(
+                "Could not update Word document",
+                f"{word_doc_path}\n\n{e}",
+                parent=root
+            )
+        return False
+
+    pending_captures.clear()
+    noun = "image" if count == 1 else "images"
+    print(f"Added {count} {noun} to {word_doc_path}")
+    status_var.set(f"Added {count} {noun} to {name} and saved it")
+    update_word_controls()
+    return True
+
+
+def report_document_locked():
+    n = len(pending_captures)
+    noun = "capture" if n == 1 else "captures"
+    status_var.set(
+        f"{word_doc_path.name} is open in Word - {n} {noun} waiting. "
+        f"Close the document and they will be added automatically."
+    )
+    update_word_controls()
+    schedule_retry()
+
+
+def schedule_retry():
+    global retry_job
+    if retry_job is None:
+        retry_job = root.after(WORD_RETRY_MS, auto_retry)
+
+
+def auto_retry():
+    global retry_job
+    retry_job = None
+    if pending_captures:
+        flush_pending()
+
+
+def save_pending_as_png():
+    """Fallback: write waiting captures out as separate .png files."""
+    saved = []
+    for capture in sorted(pending_captures, key=lambda c: c.taken_at):
+        filename = get_screenshot_filename(capture.taken_at)
+        try:
+            filename.write_bytes(capture.png)
+            saved.append(filename)
+        except Exception as e:
+            print(f"Error saving {filename}: {e}")
+    pending_captures.clear()
+    return saved
+
+
+def handle_capture(image, kind, taken_at):
+    """Route a new screenshot to the Word document or to a .png file."""
+    if word_doc_path is not None:
+        pending_captures.append(make_capture(image, kind, taken_at))
+
+        if keep_png_var.get():
+            save_screenshot(image, taken_at, update_status=False)
+
+        flush_pending()
+    else:
+        save_screenshot(image, taken_at)
+
+
+def can_change_document():
+    """Don't switch documents while captures are still waiting."""
+    if not pending_captures or flush_pending(interactive=True):
+        return True
+
+    messagebox.showwarning(
+        "Captures still waiting",
+        f"{len(pending_captures)} capture(s) are still waiting to be added to:\n\n"
+        f"{word_doc_path}\n\n"
+        "Close that document in Word so they can be saved, then try again.",
+        parent=root
+    )
+    return False
+
+
+def document_start_folder():
+    if word_doc_path is not None:
+        return str(word_doc_path.parent)
+    typed = folder_var.get().strip().strip('"')
+    if typed and Path(typed).is_dir():
+        return typed
+    return str(save_folder) if save_folder else str(Path.home())
+
+
+def select_word_document():
+    if not DOCX_AVAILABLE or not can_change_document():
+        return
+
+    path = filedialog.askopenfilename(
+        parent=root,
+        title="Select the Word document to add screenshots to",
+        initialdir=document_start_folder(),
+        filetypes=[("Word documents", "*.docx")]
+    )
+    if not path:
+        return
+
+    path = Path(path)
+
+    if path.name.startswith("~$"):
+        messagebox.showerror(
+            "Not a document",
+            "That is a temporary lock file Word creates while a document "
+            "is open. Please select the real .docx file.",
+            parent=root
+        )
+        return
+
+    # Make sure python-docx can actually read it
+    try:
+        Document(str(path))
+    except Exception as e:
+        messagebox.showerror(
+            "Can't use this document",
+            f"{path}\n\n{e}\n\n"
+            "Only Word .docx files are supported (not older .doc files). "
+            "Open it in Word and use Save As > Word Document (*.docx).",
+            parent=root
+        )
+        return
+
+    set_word_document(path)
+
+
+def new_word_document():
+    if not DOCX_AVAILABLE or not can_change_document():
+        return
+
+    path = filedialog.asksaveasfilename(
+        parent=root,
+        title="Create a new Word document for screenshots",
+        initialdir=document_start_folder(),
+        initialfile=f"Screen Captures {datetime.now():%Y-%m-%d}.docx",
+        defaultextension=".docx",
+        filetypes=[("Word documents", "*.docx")]
+    )
+    if not path:
+        return
+
+    path = Path(path)
+
+    try:
+        doc = Document()
+        doc.add_heading("Screen Captures", level=1)
+        doc.save(str(path))
+    except Exception as e:
+        messagebox.showerror(
+            "Could not create document",
+            f"{path}\n\n{e}",
+            parent=root
+        )
+        return
+
+    set_word_document(path)
+
+
+def set_word_document(path):
+    global word_doc_path
+
+    word_doc_path = path
+    doc_var.set(str(path))
+
+    # Use the document's folder as the save folder if none is set yet
+    if not folder_var.get().strip():
+        set_save_folder(str(path.parent))
+
+    status_var.set(f"Screenshots will be added to: {path.name}")
+    print(f"Screenshots will be added to Word document: {path}")
+    update_word_controls()
+
+
+def clear_word_document():
+    global word_doc_path
+
+    if word_doc_path is None or not can_change_document():
+        return
+
+    word_doc_path = None
+    doc_var.set("")
+    status_var.set("No Word document - screenshots will be saved as .png files")
+    update_word_controls()
+
+
+def open_word_document():
+    if word_doc_path is None:
+        return
+    try:
+        os.startfile(str(word_doc_path))  # Windows: open in Word
+    except Exception as e:
+        messagebox.showerror("Could not open document", str(e), parent=root)
+
+
+def update_word_controls():
+    """Enable/disable the Word buttons to match the current state."""
+    has_doc = word_doc_path is not None
+    state = "normal" if has_doc else "disabled"
+
+    clear_doc_button.config(state=state)
+    open_doc_button.config(state=state)
+    keep_png_check.config(state=state)
+
+    n = len(pending_captures)
+    if n:
+        save_pending_button.config(text=f"Save to Word now ({n} waiting)",
+                                   state="normal")
+    else:
+        save_pending_button.config(text="Save to Word now", state="disabled")
 
 
 # ============================================================
@@ -209,8 +583,9 @@ def capture_screen():
 
 def perform_full_screen_capture():
     try:
+        taken_at = datetime.now()
         screenshot = ImageGrab.grab(all_screens=True)
-        save_screenshot(screenshot)
+        handle_capture(screenshot, "Full screen", taken_at)
 
     except Exception as e:
         print(f"Error capturing screen: {e}")
@@ -318,8 +693,9 @@ def select_region():
 
 def capture_selected_region(x1, y1, x2, y2):
     try:
+        taken_at = datetime.now()
         screenshot = ImageGrab.grab(bbox=(x1, y1, x2, y2))
-        save_screenshot(screenshot)
+        handle_capture(screenshot, "Region", taken_at)
 
     except Exception as e:
         print(f"Error capturing selected region: {e}")
@@ -467,7 +843,7 @@ def toggle_screen_recording():
 
 
 def record_region():
-    if recorder is not None:
+    if recorder is not None or not RECORDING_AVAILABLE:
         return
 
     if not ensure_save_folder():
@@ -554,7 +930,7 @@ def update_recording_status():
 
     seconds = int(recorder.elapsed())
     minutes, seconds = divmod(seconds, 60)
-    status_var.set(f"\u25CF Recording...  {minutes:02d}:{seconds:02d}   "
+    status_var.set(f"● Recording...  {minutes:02d}:{seconds:02d}   "
                    f"(click Stop Recording or press Ctrl+Shift+V)")
 
     root.after(500, update_recording_status)
@@ -568,6 +944,28 @@ def on_close():
     # Finish the video file properly so it isn't left corrupted
     if recorder is not None:
         stop_recording()
+
+    # Make sure every screenshot ends up in the Word document
+    while pending_captures and not flush_pending(interactive=True):
+        retry = messagebox.askretrycancel(
+            "Word document is open",
+            f"{len(pending_captures)} capture(s) haven't been added to:\n\n"
+            f"{word_doc_path}\n\n"
+            "The document is probably open in Word. Close it there, "
+            "then click Retry.\n\n"
+            "Cancel saves them as separate .png files instead.",
+            parent=root
+        )
+        if not retry:
+            saved = save_pending_as_png()
+            if saved:
+                messagebox.showinfo(
+                    "Saved as .png files",
+                    f"{len(saved)} capture(s) were saved in:\n\n{saved[0].parent}",
+                    parent=root
+                )
+            break
+
     root.destroy()
 
 
@@ -577,11 +975,12 @@ def on_close():
 
 root = tk.Tk()
 root.title("Screen Capture Utility")
-root.geometry("480x400")
 root.resizable(False, False)
 root.protocol("WM_DELETE_WINDOW", on_close)
 
 folder_var = tk.StringVar()
+doc_var = tk.StringVar()
+keep_png_var = tk.BooleanVar(value=False)
 status_var = tk.StringVar(value="Choose a folder to save screenshots and recordings.")
 
 
@@ -597,7 +996,7 @@ tk.Label(folder_frame, text="Save folder:").pack(anchor="w")
 entry_row = tk.Frame(folder_frame)
 entry_row.pack(fill="x")
 
-folder_entry = tk.Entry(entry_row, textvariable=folder_var)
+folder_entry = tk.Entry(entry_row, textvariable=folder_var, width=50)
 folder_entry.pack(side="left", fill="x", expand=True, ipady=3)
 
 browse_button = tk.Button(
@@ -609,11 +1008,65 @@ browse_button.pack(side="left", padx=(5, 0))
 
 
 # ============================================================
+# Word Document Row
+# ============================================================
+
+word_frame = tk.LabelFrame(
+    root,
+    text="Word document (optional) - screenshots are added in capture order",
+    padx=10,
+    pady=8
+)
+word_frame.pack(pady=(10, 5), padx=15, fill="x")
+
+doc_row = tk.Frame(word_frame)
+doc_row.pack(fill="x")
+
+doc_entry = tk.Entry(doc_row, textvariable=doc_var, state="readonly")
+doc_entry.pack(side="left", fill="x", expand=True, ipady=3)
+
+select_doc_button = tk.Button(doc_row, text="Select...",
+                              command=select_word_document)
+select_doc_button.pack(side="left", padx=(5, 0))
+
+new_doc_button = tk.Button(doc_row, text="New...",
+                           command=new_word_document)
+new_doc_button.pack(side="left", padx=(5, 0))
+
+clear_doc_button = tk.Button(doc_row, text="Clear",
+                             command=clear_word_document)
+clear_doc_button.pack(side="left", padx=(5, 0))
+
+doc_options_row = tk.Frame(word_frame)
+doc_options_row.pack(fill="x", pady=(6, 0))
+
+keep_png_check = tk.Checkbutton(
+    doc_options_row,
+    text="Also save separate .png files",
+    variable=keep_png_var
+)
+keep_png_check.pack(side="left")
+
+open_doc_button = tk.Button(doc_options_row, text="Open Document",
+                            command=open_word_document)
+open_doc_button.pack(side="right")
+
+save_pending_button = tk.Button(doc_options_row, text="Save to Word now",
+                                command=lambda: flush_pending(interactive=True))
+save_pending_button.pack(side="right", padx=(0, 5))
+
+if not DOCX_AVAILABLE:
+    for widget in (select_doc_button, new_doc_button):
+        widget.config(state="disabled")
+    word_frame.config(text="Word document - unavailable (python-docx not installed)")
+
+
+# ============================================================
 # Screenshot Buttons
 # ============================================================
 
-screenshot_frame = tk.LabelFrame(root, text="Screenshot (.png)", padx=10, pady=8)
-screenshot_frame.pack(pady=(12, 5), padx=15, fill="x")
+screenshot_frame = tk.LabelFrame(root, text="Screenshot", padx=10, pady=8)
+screenshot_frame.pack(pady=5, padx=15, fill="x")
 
 capture_button = tk.Button(
     screenshot_frame,
@@ -676,10 +1129,19 @@ status_label = tk.Label(
     root,
     textvariable=status_var,
     fg="gray25",
-    wraplength=450,
+    height=3,
     justify="center"
 )
-status_label.pack(pady=(10, 0))
+status_label.pack(pady=(5, 10), padx=15, fill="x")
+
+
+def fit_status_wrap(event=None):
+    status_label.config(wraplength=max(200, root.winfo_width() - 40))
+
+
+root.after(100, fit_status_wrap)
+
+update_word_controls()
 
 
 # ============================================================
@@ -697,5 +1159,6 @@ root.bind("<Control-Shift-V>", lambda event: toggle_screen_recording())
 
 print("Screen Capture Utility started.")
 print("Choose a save folder in the window (type a path or click Browse...).")
+print("Optionally select a Word document to collect screenshots in.")
 
 root.mainloop()
