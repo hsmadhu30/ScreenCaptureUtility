@@ -694,7 +694,7 @@ def select_region():
 def capture_selected_region(x1, y1, x2, y2):
     try:
         taken_at = datetime.now()
-        screenshot = ImageGrab.grab(bbox=(x1, y1, x2, y2))
+        screenshot = ImageGrab.grab(bbox=(x1, y1, x2, y2), all_screens=True)
         handle_capture(screenshot, "Region", taken_at)
 
     except Exception as e:
@@ -714,6 +714,8 @@ class ScreenRecorder:
     Records an area of the screen to an .mp4 file in a background
     thread. Frames are written on a fixed clock so the video plays
     back at real-time speed even if capturing is sometimes slow.
+    Recording can be paused and resumed; paused time is left out of
+    the video.
     """
 
     def __init__(self, filename, area, fps=RECORDING_FPS):
@@ -732,10 +734,14 @@ class ScreenRecorder:
         }
 
         self.stop_event = threading.Event()
+        self.lock = threading.Lock()
         self.thread = None
         self.error = None
         self.frames_written = 0
         self.start_time = None
+        self.paused = False
+        self.pause_started = None
+        self.paused_total = 0.0
 
     def start(self):
         self.start_time = time.perf_counter()
@@ -747,13 +753,29 @@ class ScreenRecorder:
         if self.thread is not None:
             self.thread.join(timeout=10)
 
+    def pause(self):
+        with self.lock:
+            if not self.paused:
+                self.paused = True
+                self.pause_started = time.perf_counter()
+
+    def resume(self):
+        with self.lock:
+            if self.paused:
+                self.paused_total += time.perf_counter() - self.pause_started
+                self.paused = False
+                self.pause_started = None
+
     def is_running(self):
         return self.thread is not None and self.thread.is_alive()
 
     def elapsed(self):
-        if self.start_time is None:
-            return 0
-        return time.perf_counter() - self.start_time
+        """Recorded time in seconds (not counting paused time)."""
+        with self.lock:
+            if self.start_time is None:
+                return 0
+            now = self.pause_started if self.paused else time.perf_counter()
+            return now - self.start_time - self.paused_total
 
     def _run(self):
         width = self.area["width"]
@@ -780,10 +802,19 @@ class ScreenRecorder:
         )
 
         try:
-            self.start_time = time.perf_counter()
+            with self.lock:
+                self.start_time = time.perf_counter()
 
             while not self.stop_event.is_set():
-                shot = ImageGrab.grab(bbox=bbox)
+                if self.paused:
+                    self.stop_event.wait(0.05)
+                    continue
+
+                shot = ImageGrab.grab(bbox=bbox, all_screens=True)
+
+                # Paused while grabbing? Drop this frame.
+                if self.paused:
+                    continue
 
                 frame = np.array(shot.convert("RGB"))
                 frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
@@ -800,8 +831,7 @@ class ScreenRecorder:
                     self.frames_written += 1
 
                 # Sleep until the next frame is due
-                next_due = self.start_time + self.frames_written * frame_interval
-                delay = next_due - time.perf_counter()
+                delay = self.frames_written * frame_interval - self.elapsed()
                 if delay > 0:
                     self.stop_event.wait(delay)
 
@@ -811,6 +841,138 @@ class ScreenRecorder:
         finally:
             writer.release()
 
+
+# ============================================================
+# Recording Mode (compact control bar)
+# ============================================================
+# While recording, the main window shrinks into a small control bar
+# (blinking dot, timer, Pause/Resume, Stop). It is a normal window with
+# a title bar, so it is always visible and shows on the taskbar.
+#
+# On Windows 10 (version 2004) and later the bar is also excluded from
+# screen capture, so it doesn't appear in the video. For region
+# recordings it is additionally placed outside the recorded area.
+
+WDA_NONE = 0x00000000
+WDA_EXCLUDEFROMCAPTURE = 0x00000011
+GA_ROOT = 2
+
+BAR_BG = "#202124"
+DOT_ON = "#ff4b4b"
+DOT_PAUSED = "#fbbc04"
+
+
+def window_handle(window):
+    user32 = ctypes.windll.user32
+    return user32.GetAncestor(window.winfo_id(), GA_ROOT)
+
+
+def set_capture_excluded(window, excluded):
+    """Hide/show a window in screenshots and recordings.
+    Returns True if Windows accepted the setting."""
+    try:
+        window.update_idletasks()
+        affinity = WDA_EXCLUDEFROMCAPTURE if excluded else WDA_NONE
+        return bool(ctypes.windll.user32.SetWindowDisplayAffinity(
+            window_handle(window), affinity))
+    except Exception as e:
+        print(f"Could not change capture visibility: {e}")
+        return False
+
+
+def virtual_screen_bounds():
+    """(left, top, width, height) of the whole desktop, all monitors."""
+    try:
+        user32 = ctypes.windll.user32
+        bounds = (user32.GetSystemMetrics(76), user32.GetSystemMetrics(77),
+                  user32.GetSystemMetrics(78), user32.GetSystemMetrics(79))
+        if bounds[2] > 0 and bounds[3] > 0:
+            return bounds
+    except Exception:
+        pass
+    return (0, 0, root.winfo_screenwidth(), root.winfo_screenheight())
+
+
+saved_main_position = None
+bar_excluded = False
+dot_visible = True
+
+
+def bar_position_for(area):
+    """Top-left corner for the control bar: just below the recorded
+    area, else just above it, else inside its top edge."""
+    root.update_idletasks()
+    w = rec_bar.winfo_reqwidth() + 20      # + window border
+    h = rec_bar.winfo_reqheight() + 45     # + title bar
+    vx, vy, vw, vh = virtual_screen_bounds()
+
+    left, top = area["left"], area["top"]
+    right, bottom = left + area["width"], top + area["height"]
+    gap = 10
+
+    x = left + (area["width"] - w) // 2
+    x = max(vx + gap, min(x, vx + vw - w - gap))
+
+    if bottom + gap + h <= vy + vh - 50:      # below (clear of the taskbar)
+        y = bottom + gap
+    elif top - gap - h >= vy:                 # above
+        y = top - gap - h
+    else:                                     # inside, near the top
+        y = top + gap
+
+    return x, y
+
+
+def enter_recording_mode(area):
+    """Turn the main window into the small control bar."""
+    global saved_main_position, bar_excluded, dot_visible
+
+    saved_main_position = (root.winfo_x(), root.winfo_y())
+
+    main_frame.pack_forget()
+    rec_bar.pack()
+    rec_time_label.config(text="00:00")
+    rec_pause_button.config(text="Pause")
+    rec_dot.itemconfigure(rec_dot_id, fill=DOT_ON, state="normal")
+    dot_visible = True
+
+    root.title("Recording")
+    root.attributes("-topmost", True)
+
+    x, y = bar_position_for(area)
+    root.geometry(f"+{x}+{y}")
+    root.deiconify()
+    root.lift()
+    root.update()
+
+    bar_excluded = set_capture_excluded(root, True)
+    if bar_excluded:
+        print("Recording controls are hidden from the video.")
+    else:
+        print("Note: this version of Windows can't hide the recording "
+              "controls from capture.")
+
+
+def exit_recording_mode():
+    """Turn the control bar back into the main window."""
+    set_capture_excluded(root, False)
+
+    rec_bar.pack_forget()
+    main_frame.pack()
+
+    root.title("Screen Capture Utility")
+    root.attributes("-topmost", False)
+
+    if saved_main_position is not None:
+        root.geometry(f"+{saved_main_position[0]}+{saved_main_position[1]}")
+
+    root.deiconify()
+    root.lift()
+
+
+# ============================================================
+# Recording Controls
+# ============================================================
 
 recorder = None
 
@@ -839,7 +1001,11 @@ def toggle_screen_recording():
         status_var.set("No save folder selected - recording cancelled")
         return
 
-    start_recording(primary_monitor_area())
+    area = primary_monitor_area()
+
+    # Hide the full window first, then show the bar and start
+    root.withdraw()
+    root.after(300, lambda: start_recording(area))
 
 
 def record_region():
@@ -854,9 +1020,6 @@ def record_region():
 
 
 def start_region_recording(x1, y1, x2, y2):
-    root.deiconify()
-    root.lift()
-
     start_recording({
         "left": x1,
         "top": y1,
@@ -868,18 +1031,40 @@ def start_region_recording(x1, y1, x2, y2):
 def start_recording(area):
     global recorder
 
-    filename = get_recording_filename()
+    try:
+        enter_recording_mode(area)
 
-    recorder = ScreenRecorder(filename, area)
-    recorder.start()
+        filename = get_recording_filename()
+        recorder = ScreenRecorder(filename, area)
+        recorder.start()
+        print(f"Recording started: {filename}")
 
-    print(f"Recording started: {filename}")
+    except Exception as e:
+        recorder = None
+        exit_recording_mode()
+        print(f"Could not start recording: {e}")
+        status_var.set("Could not start recording (see console)")
+        messagebox.showerror("Recording failed", str(e), parent=root)
+        return
 
-    record_button.config(text="Stop Recording", fg="white", bg="#c62828",
-                         activebackground="#b71c1c", activeforeground="white")
-    record_region_button.config(state="disabled")
+    # Give Windows a moment to show the bar, then start the timer
+    root.after(200, update_recording_status)
 
-    update_recording_status()
+
+def toggle_pause():
+    if recorder is None:
+        return
+
+    if recorder.paused:
+        recorder.resume()
+        rec_pause_button.config(text="Pause")
+        rec_dot.itemconfigure(rec_dot_id, fill=DOT_ON, state="normal")
+        print("Recording resumed")
+    else:
+        recorder.pause()
+        rec_pause_button.config(text="Resume")
+        rec_dot.itemconfigure(rec_dot_id, fill=DOT_PAUSED, state="normal")
+        print("Recording paused")
 
 
 def stop_recording():
@@ -891,47 +1076,63 @@ def stop_recording():
     current = recorder
     recorder = None
 
-    status_var.set("Finishing recording...")
+    rec_time_label.config(text="Saving...")
     root.update_idletasks()
 
     current.stop()
 
-    reset_record_buttons()
+    exit_recording_mode()
 
     if current.error:
         print(f"Error while recording: {current.error}")
-        status_var.set("Recording failed (see console)")
+        status_var.set(f"Recording failed: {current.error}")
         messagebox.showerror("Recording failed", current.error, parent=root)
+        return
+
+    if current.frames_written == 0:
+        status_var.set("Recording failed: no frames were captured.")
+        messagebox.showerror(
+            "Recording failed",
+            "No frames were captured, so the video is empty.",
+            parent=root
+        )
         return
 
     duration = current.frames_written / current.fps
     print("Recording saved successfully:")
     print(current.filename)
-    status_var.set(f"Saved: {current.filename.name}  ({duration:.1f} s)")
-
-
-def reset_record_buttons():
-    record_button.config(text="Record Screen", fg="black",
-                         bg=default_button_bg,
-                         activebackground=default_button_active_bg,
-                         activeforeground="black")
-    record_region_button.config(state="normal")
+    message = f"Saved: {current.filename.name}  ({duration:.1f} s)"
+    if not bar_excluded:
+        message += ("\nNote: the recording controls may be visible in the "
+                    "video (hiding them needs Windows 10 version 2004 or later).")
+    status_var.set(message)
 
 
 def update_recording_status():
-    """Refresh the elapsed-time display while recording (runs on the UI thread)."""
+    """Refresh the timer on the control bar (runs on the UI thread)."""
+    global dot_visible
+
     if recorder is None:
         return
 
     # The recording thread stopped on its own because of an error
-    if not recorder.is_running() and recorder.error:
+    if not recorder.is_running():
         stop_recording()
         return
 
     seconds = int(recorder.elapsed())
     minutes, seconds = divmod(seconds, 60)
-    status_var.set(f"● Recording...  {minutes:02d}:{seconds:02d}   "
-                   f"(click Stop Recording or press Ctrl+Shift+V)")
+    hours, minutes = divmod(minutes, 60)
+    rec_time_label.config(
+        text=f"{hours}:{minutes:02d}:{seconds:02d}" if hours
+        else f"{minutes:02d}:{seconds:02d}"
+    )
+
+    # Blink the dot while recording; solid yellow while paused
+    if not recorder.paused:
+        dot_visible = not dot_visible
+        rec_dot.itemconfigure(rec_dot_id,
+                              state="normal" if dot_visible else "hidden")
 
     root.after(500, update_recording_status)
 
@@ -941,9 +1142,10 @@ def update_recording_status():
 # ============================================================
 
 def on_close():
-    # Finish the video file properly so it isn't left corrupted
+    # While recording, the window's X button just stops the recording
     if recorder is not None:
         stop_recording()
+        return
 
     # Make sure every screenshot ends up in the Word document
     while pending_captures and not flush_pending(interactive=True):
@@ -983,12 +1185,49 @@ doc_var = tk.StringVar()
 keep_png_var = tk.BooleanVar(value=False)
 status_var = tk.StringVar(value="Choose a folder to save screenshots and recordings.")
 
+# Everything in the normal window lives in main_frame, so it can be
+# swapped for the small control bar while recording.
+main_frame = tk.Frame(root)
+main_frame.pack()
+
+
+# ============================================================
+# Recording Control Bar (shown only while recording)
+# ============================================================
+
+rec_bar = tk.Frame(root, bg=BAR_BG, padx=10, pady=8)
+
+rec_dot = tk.Canvas(rec_bar, width=14, height=14, bg=BAR_BG,
+                    highlightthickness=0)
+rec_dot_id = rec_dot.create_oval(2, 2, 13, 13, fill=DOT_ON, outline="")
+rec_dot.pack(side="left", padx=(0, 6))
+
+rec_time_label = tk.Label(rec_bar, text="00:00", fg="white", bg=BAR_BG,
+                          font=("Segoe UI", 11, "bold"), width=7, anchor="w")
+rec_time_label.pack(side="left", padx=(0, 8))
+
+rec_pause_button = tk.Button(
+    rec_bar, text="Pause", command=toggle_pause,
+    bg="#3c4043", fg="white", activebackground="#5f6368",
+    activeforeground="white", relief="flat", bd=0, padx=10, pady=3,
+    font=("Segoe UI", 9, "bold"), cursor="hand2", width=9
+)
+rec_pause_button.pack(side="left", padx=(0, 6))
+
+rec_stop_button = tk.Button(
+    rec_bar, text="Stop", command=stop_recording,
+    bg="#d93025", fg="white", activebackground="#b3261e",
+    activeforeground="white", relief="flat", bd=0, padx=10, pady=3,
+    font=("Segoe UI", 9, "bold"), cursor="hand2", width=7
+)
+rec_stop_button.pack(side="left")
+
 
 # ============================================================
 # Save Folder Row
 # ============================================================
 
-folder_frame = tk.Frame(root)
+folder_frame = tk.Frame(main_frame)
 folder_frame.pack(pady=(15, 5), padx=15, fill="x")
 
 tk.Label(folder_frame, text="Save folder:").pack(anchor="w")
@@ -1012,7 +1251,7 @@ browse_button.pack(side="left", padx=(5, 0))
 # ============================================================
 
 word_frame = tk.LabelFrame(
-    root,
+    main_frame,
     text="Word document (optional) - screenshots are added in capture order",
     padx=10,
     pady=8
@@ -1065,7 +1304,7 @@ if not DOCX_AVAILABLE:
 # Screenshot Buttons
 # ============================================================
 
-screenshot_frame = tk.LabelFrame(root, text="Screenshot", padx=10, pady=8)
+screenshot_frame = tk.LabelFrame(main_frame, text="Screenshot", padx=10, pady=8)
 screenshot_frame.pack(pady=5, padx=15, fill="x")
 
 capture_button = tk.Button(
@@ -1091,7 +1330,7 @@ region_button.pack(side="left", expand=True)
 # Recording Buttons
 # ============================================================
 
-record_frame = tk.LabelFrame(root, text="Screen Recording (.mp4)", padx=10, pady=8)
+record_frame = tk.LabelFrame(main_frame, text="Screen Recording (.mp4)", padx=10, pady=8)
 record_frame.pack(pady=5, padx=15, fill="x")
 
 record_button = tk.Button(
@@ -1112,9 +1351,6 @@ record_region_button = tk.Button(
 )
 record_region_button.pack(side="left", expand=True)
 
-default_button_bg = record_button.cget("bg")
-default_button_active_bg = record_button.cget("activebackground")
-
 if not RECORDING_AVAILABLE:
     record_button.config(state="disabled")
     record_region_button.config(state="disabled")
@@ -1126,7 +1362,7 @@ if not RECORDING_AVAILABLE:
 # ============================================================
 
 status_label = tk.Label(
-    root,
+    main_frame,
     textvariable=status_var,
     fg="gray25",
     height=3,
@@ -1148,9 +1384,12 @@ update_word_controls()
 # Keyboard Shortcuts (work while this window has focus)
 # ============================================================
 
-root.bind("<Control-Shift-F>", lambda event: capture_screen())
-root.bind("<Control-Shift-R>", lambda event: select_region())
+root.bind("<Control-Shift-F>",
+          lambda event: capture_screen() if recorder is None else None)
+root.bind("<Control-Shift-R>",
+          lambda event: select_region() if recorder is None else None)
 root.bind("<Control-Shift-V>", lambda event: toggle_screen_recording())
+root.bind("<Control-Shift-P>", lambda event: toggle_pause())
 
 
 # ============================================================
