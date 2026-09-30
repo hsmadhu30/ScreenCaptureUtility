@@ -1,6 +1,6 @@
 import tkinter as tk
-from tkinter import filedialog, messagebox
-from PIL import ImageGrab
+from tkinter import filedialog, messagebox, ttk
+from PIL import Image, ImageGrab, ImageOps
 from datetime import datetime
 from pathlib import Path
 from dataclasses import dataclass
@@ -12,7 +12,10 @@ import sys
 import os
 import subprocess
 import importlib
+import importlib.util
 import wave
+import asyncio
+import concurrent.futures
 
 
 # ============================================================
@@ -84,6 +87,41 @@ if not AUDIO_AVAILABLE:
 if not DOCX_AVAILABLE:
     print("Saving to Word documents is disabled. To enable it, run:")
     print(f'  "{sys.executable}" -m pip install python-docx')
+
+# Text extraction (OCR) uses the OCR engine built into Windows 10/11 via
+# PyWinRT. We only check that it's installed here; it is imported later
+# on its own thread (see "Text Extraction").
+OCR_PACKAGES = [
+    "winrt-runtime",
+    "winrt-Windows.Foundation",
+    "winrt-Windows.Foundation.Collections",
+    "winrt-Windows.Globalization",
+    "winrt-Windows.Graphics.Imaging",
+    "winrt-Windows.Media.Ocr",
+    "winrt-Windows.Storage.Streams",
+]
+
+
+def ocr_installed():
+    try:
+        return importlib.util.find_spec("winrt.windows.media.ocr") is not None
+    except Exception:
+        return False
+
+
+OCR_AVAILABLE = False
+if sys.platform == "win32":
+    if not ocr_installed() and not getattr(sys, "frozen", False):
+        print("Installing text extraction (OCR) support (one-time setup)...")
+        try:
+            subprocess.check_call([sys.executable, "-m", "pip", "install"] + OCR_PACKAGES)
+            importlib.invalidate_caches()
+        except Exception as e:
+            print(f"Could not install OCR support: {e}")
+    OCR_AVAILABLE = ocr_installed()
+
+if not OCR_AVAILABLE:
+    print("Text extraction (OCR) is disabled (needs Windows 10/11 and PyWinRT).")
 
 # Run ffmpeg without flashing a console window (matters for the .exe)
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -609,6 +647,357 @@ def update_word_controls():
                                    state="normal")
     else:
         save_pending_button.config(text="Save to Word now", state="disabled")
+
+
+# ============================================================
+# Text Extraction (OCR)
+# ============================================================
+# Uses the OCR engine built into Windows 10/11 (Windows.Media.Ocr):
+# offline, fast, nothing extra to install, and it reads the languages
+# installed in Windows. Python talks to it through PyWinRT.
+#
+# All WinRT calls run on one dedicated background thread. (Importing
+# WinRT on the Tk thread could interfere with the Windows file dialogs.)
+
+OCR_WORKER = concurrent.futures.ThreadPoolExecutor(max_workers=1,
+                                                   thread_name_prefix="ocr")
+
+
+def _prepare_for_ocr(image, max_dimension):
+    """RGBA image sized for best OCR results: small captures are enlarged
+    (Windows OCR reads small text better that way), huge ones reduced to
+    the engine's limit, and a white margin is added around the text."""
+    image = image.convert("RGB")
+    margin = 12
+    image = ImageOps.expand(image, border=margin, fill=(255, 255, 255))
+
+    longest = max(image.size)
+    limit = max_dimension or 4000
+    scale = 1.0
+    if longest < 1600:
+        scale = min(2.0, 1600 / longest)
+    scale = min(scale, limit / longest)
+    if abs(scale - 1.0) > 0.01:
+        image = image.resize((max(1, int(image.width * scale)),
+                              max(1, int(image.height * scale))),
+                             Image.LANCZOS)
+    return image.convert("RGBA")
+
+
+def _lines_to_text(lines):
+    """Join OCR lines, adding a blank line where there's a clear vertical
+    gap (so paragraphs stay separated)."""
+    rows = []
+    for line in lines:
+        text = line.text
+        try:
+            rects = [w.bounding_rect for w in line.words]
+            top = min(r.y for r in rects)
+            bottom = max(r.y + r.height for r in rects)
+        except Exception:
+            top = bottom = None
+        rows.append((text, top, bottom))
+
+    heights = [b - t for _, t, b in rows if t is not None and b is not None and b > t]
+    typical = sorted(heights)[len(heights) // 2] if heights else None
+
+    output = []
+    previous_bottom = None
+    for text, top, bottom in rows:
+        if (typical and previous_bottom is not None and top is not None
+                and top - previous_bottom > typical * 1.2):
+            output.append("")
+        output.append(text)
+        if bottom is not None:
+            previous_bottom = bottom
+    return "\n".join(output).strip()
+
+
+def run_windows_ocr(image, language_tag=None):
+    """Runs on the OCR thread. Returns dict(text, language, languages)."""
+    from winrt.windows.media.ocr import OcrEngine
+    from winrt.windows.globalization import Language
+    from winrt.windows.storage.streams import DataWriter
+    from winrt.windows.graphics.imaging import SoftwareBitmap, BitmapPixelFormat
+    import winrt.windows.foundation            # noqa: F401  (async support)
+    import winrt.windows.foundation.collections  # noqa: F401  (result lists)
+
+    languages = [(lang.display_name, lang.language_tag)
+                 for lang in OcrEngine.available_recognizer_languages]
+
+    engine = None
+    if language_tag:
+        engine = OcrEngine.try_create_from_language(Language(language_tag))
+    if engine is None:
+        engine = OcrEngine.try_create_from_user_profile_languages()
+    if engine is None:
+        raise RuntimeError(
+            "No OCR language is installed in Windows. Add one in Settings > "
+            "Time & language > Language & region (e.g. English), then try again.")
+
+    prepared = _prepare_for_ocr(image, OcrEngine.max_image_dimension)
+
+    writer = DataWriter()
+    writer.write_bytes(prepared.tobytes())
+    bitmap = SoftwareBitmap.create_copy_from_buffer(
+        writer.detach_buffer(), BitmapPixelFormat.RGBA8,
+        prepared.width, prepared.height)
+
+    async def recognize():
+        return await engine.recognize_async(bitmap)
+
+    result = asyncio.run(recognize())
+
+    return {
+        "text": _lines_to_text(list(result.lines)),
+        "language": engine.recognizer_language.display_name,
+        "language_tag": engine.recognizer_language.language_tag,
+        "languages": languages,
+    }
+
+
+def copy_to_clipboard(text):
+    root.clipboard_clear()
+    root.clipboard_append(text)
+    root.update()
+
+
+def extract_text_region():
+    """Drag a rectangle on screen, then read the text inside it."""
+    if recorder is not None:
+        return
+    if not OCR_AVAILABLE:
+        messagebox.showinfo(
+            "Text extraction unavailable",
+            "Text extraction uses the OCR engine built into Windows 10/11.\n\n"
+            "Install its Python bindings with:\n"
+            f'  "{sys.executable}" -m pip install {" ".join(OCR_PACKAGES)}',
+            parent=root)
+        return
+    start_region_selection(ocr_selected_region)
+
+
+def ocr_selected_region(x1, y1, x2, y2):
+    try:
+        image = ImageGrab.grab(bbox=(x1, y1, x2, y2), all_screens=True)
+    except Exception as e:
+        root.deiconify()
+        status_var.set(f"Could not capture the area: {e}")
+        return
+    root.deiconify()
+    root.lift()
+    OcrWindow(image, source="Screen selection")
+
+
+class OcrWindow:
+    """Shows the extracted text: editable, with Copy / Save / language."""
+
+    open_window = None
+
+    def __init__(self, image, source=""):
+        # Reuse one window instead of stacking many
+        if OcrWindow.open_window is not None:
+            try:
+                OcrWindow.open_window.win.destroy()
+            except Exception:
+                pass
+        OcrWindow.open_window = self
+
+        self.image = image
+        self.source = source
+        self.language_tag = None
+        self.language_map = {}
+        self.first_result = True
+        self.future = None
+
+        self.win = tk.Toplevel(root)
+        self.win.title("Extracted Text")
+        self.win.configure(bg=BG)
+        self.win.transient(root)
+        self.win.protocol("WM_DELETE_WINDOW", self.close)
+
+        # --- header ---------------------------------------------------
+        head = tk.Frame(self.win, bg=HEADER_BG)
+        head.pack(fill="x")
+        inner = tk.Frame(head, bg=HEADER_BG)
+        inner.pack(fill="x", padx=S(20), pady=S(12))
+        tk.Label(inner, image=icon("ocr", "white", 22), bg=HEADER_BG).pack(side="left")
+        titles = tk.Frame(inner, bg=HEADER_BG)
+        titles.pack(side="left", padx=(S(10), 0))
+        tk.Label(titles, text="Extracted Text", font=F_TILE, fg="white",
+                 bg=HEADER_BG).pack(anchor="w")
+        self.info_label = tk.Label(titles, text="", font=F_TILE_SUB,
+                                   fg=HEADER_SUB, bg=HEADER_BG)
+        self.info_label.pack(anchor="w")
+        tk.Frame(self.win, bg=ACCENT, height=S(3)).pack(fill="x")
+
+        body = tk.Frame(self.win, bg=BG)
+        body.pack(fill="both", expand=True, padx=S(18), pady=S(14))
+
+        # --- language row --------------------------------------------
+        lang_row = tk.Frame(body, bg=BG)
+        lang_row.pack(fill="x", pady=(0, S(8)))
+        tk.Label(lang_row, text="Language", font=F_BODY_BOLD, fg=TEXT,
+                 bg=BG).pack(side="left", padx=(0, S(8)))
+        self.language_var = tk.StringVar()
+        self.language_box = ttk.Combobox(lang_row, textvariable=self.language_var,
+                                         state="readonly", width=30, font=F_BODY)
+        self.language_box.pack(side="left")
+        self.language_box.bind("<<ComboboxSelected>>", self._language_changed)
+
+        open_button = FlatButton(lang_row, "Open image...", self.open_image)
+        open_button.pack(side="right")
+
+        # --- text area -----------------------------------------------
+        text_frame = tk.Frame(body, bg=CARD, highlightthickness=S(2) if S(2) > 1 else 1,
+                              highlightbackground=FIELD_BORDER)
+        text_frame.pack(fill="both", expand=True)
+        self.text = tk.Text(text_frame, wrap="word", font=("Segoe UI", 11),
+                            fg=TEXT, bg=CARD, relief="flat", bd=0,
+                            padx=S(12), pady=S(10), undo=True,
+                            width=72, height=18, insertbackground=TEXT,
+                            selectbackground="#C7CBF9", selectforeground=TEXT)
+        scroll = tk.Scrollbar(text_frame, command=self.text.yview)
+        self.text.configure(yscrollcommand=scroll.set)
+        scroll.pack(side="right", fill="y")
+        self.text.pack(side="left", fill="both", expand=True)
+
+        # --- buttons -------------------------------------------------
+        buttons = tk.Frame(body, bg=BG)
+        buttons.pack(fill="x", pady=(S(12), 0))
+        self.copy_button = FlatButton(buttons, "Copy text", self.copy, style="primary")
+        self.copy_button.pack(side="left")
+        FlatButton(buttons, "Save as .txt", self.save).pack(side="left", padx=(S(8), 0))
+        FlatButton(buttons, "Close", self.close).pack(side="right")
+
+        self.win.update_idletasks()
+        self._center()
+        self.run()
+
+    def _center(self):
+        left, top, width, height = screen_work_area()
+        w = self.win.winfo_reqwidth()
+        h = self.win.winfo_reqheight() + S(39)
+        self.win.geometry(f"+{left + max(0, (width - w) // 2)}+{top + max(0, (height - h) // 2)}")
+
+    # ---- OCR --------------------------------------------------------
+
+    def run(self):
+        self._set_text("Reading text...")
+        self.text.configure(fg=MUTED)
+        self.info_label.configure(text=f"{self.source}  ·  "
+                                       f"{self.image.width} x {self.image.height} px")
+        self.copy_button.config(state="disabled")
+        self.future = OCR_WORKER.submit(run_windows_ocr, self.image, self.language_tag)
+        self.win.after(100, self._poll)
+
+    def _poll(self):
+        if self.future is None or not self.win.winfo_exists():
+            return
+        if not self.future.done():
+            self.win.after(100, self._poll)
+            return
+
+        try:
+            result = self.future.result()
+        except Exception as e:
+            self.text.configure(fg=RED)
+            self._set_text(f"Text extraction failed:\n{e}")
+            status_var.set("Could not extract text (see the text window)")
+            return
+
+        self.language_map = {name: tag for name, tag in result["languages"]}
+        self.language_box.configure(values=list(self.language_map))
+        self.language_var.set(result["language"])
+        self.language_tag = result["language_tag"]
+
+        text = result["text"]
+        self.text.configure(fg=TEXT)
+        self.copy_button.config(state="normal")
+
+        if not text:
+            self._set_text("")
+            self.info_label.configure(text=f"{self.source}  ·  no text found")
+            status_var.set("No text found in the selected area")
+            return
+
+        self._set_text(text)
+        lines = text.count("\n") + 1
+        words = len(text.split())
+        self.info_label.configure(
+            text=f"{self.source}  ·  {words} words, {lines} lines  ·  "
+                 f"{result['language']}")
+
+        # Copy automatically the first time, so it's ready to paste
+        if self.first_result:
+            self.first_result = False
+            copy_to_clipboard(text)
+            status_var.set(f"Text extracted and copied to clipboard ({words} words)")
+
+    def _set_text(self, value):
+        self.text.delete("1.0", "end")
+        self.text.insert("1.0", value)
+        self.text.edit_reset()
+
+    def _language_changed(self, event=None):
+        tag = self.language_map.get(self.language_var.get())
+        if tag and tag != self.language_tag:
+            self.language_tag = tag
+            self.run()
+
+    # ---- buttons ----------------------------------------------------
+
+    def current_text(self):
+        return self.text.get("1.0", "end-1c")
+
+    def copy(self):
+        text = self.current_text()
+        copy_to_clipboard(text)
+        status_var.set(f"Text copied to clipboard ({len(text.split())} words)")
+        self.copy_button.config(text="Copied!")
+        self.win.after(1500, lambda: self.copy_button.winfo_exists()
+                       and self.copy_button.config(text="Copy text"))
+
+    def save(self):
+        folder = save_folder or (word_doc_path.parent if word_doc_path else Path.home())
+        path = filedialog.asksaveasfilename(
+            parent=self.win,
+            title="Save extracted text",
+            initialdir=str(folder),
+            initialfile=f"Text_{timestamp()}.txt",
+            defaultextension=".txt",
+            filetypes=[("Text files", "*.txt")])
+        if not path:
+            return
+        try:
+            Path(path).write_text(self.current_text(), encoding="utf-8")
+            status_var.set(f"Saved: {Path(path).name}")
+        except Exception as e:
+            messagebox.showerror("Could not save", str(e), parent=self.win)
+
+    def open_image(self):
+        folder = save_folder or Path.home()
+        path = filedialog.askopenfilename(
+            parent=self.win,
+            title="Choose an image to read text from",
+            initialdir=str(folder),
+            filetypes=[("Images", "*.png *.jpg *.jpeg *.bmp *.gif *.tif *.tiff *.webp"),
+                       ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            with Image.open(path) as img:
+                self.image = img.convert("RGB")
+        except Exception as e:
+            messagebox.showerror("Could not open image", str(e), parent=self.win)
+            return
+        self.source = Path(path).name
+        self.first_result = True
+        self.run()
+
+    def close(self):
+        OcrWindow.open_window = None
+        self.win.destroy()
 
 
 # ============================================================
@@ -1625,6 +2014,7 @@ def on_close():
 # ============================================================
 
 root = tk.Tk()
+root.withdraw()   # shown, centred, once the layout is built
 root.title("Screen Capture Utility")
 root.resizable(False, False)
 root.protocol("WM_DELETE_WINDOW", on_close)
@@ -1639,7 +2029,7 @@ status_var = tk.StringVar(value="Choose a folder to save screenshots and recordi
 # Theme
 # ============================================================
 
-from PIL import Image, ImageDraw, ImageTk
+from PIL import ImageDraw, ImageTk
 
 # Colours
 BG = "#E8EBF1"            # window background (darker so cards stand out)
@@ -1724,6 +2114,15 @@ def draw_icon(kind, color, size, accent=RED):
             d.ellipse(box(8.5, 8.5, 15.5, 15.5), fill=accent)
         else:
             d.rounded_rectangle(box(8, 8, 16, 16), radius=1.2 * u, fill=color)
+
+    elif kind == "ocr":
+        L = 5
+        for (x, y, dx, dy) in [(3, 3, 1, 1), (21, 3, -1, 1), (3, 21, 1, -1), (21, 21, -1, -1)]:
+            d.line([x * u, y * u, (x + dx * L) * u, y * u], fill=color, width=w)
+            d.line([x * u, y * u, x * u, (y + dy * L) * u], fill=color, width=w)
+        d.line(box(7.5, 9, 16.5, 9), fill=color, width=w)
+        d.line(box(7.5, 12.5, 16.5, 12.5), fill=color, width=w)
+        d.line(box(7.5, 16, 13, 16), fill=color, width=w)
 
     elif kind == "folder":
         d.rounded_rectangle(box(2, 5, 11, 9), radius=1.5 * u, fill=color)
@@ -1860,7 +2259,8 @@ class Tile(tk.Frame):
 
         self.title = tk.Label(self, text=title, font=F_TILE, fg=TEXT, bg=CARD, anchor="w")
         self.title.grid(row=0, column=1, sticky="sw", pady=(S(11), 0), padx=(0, S(14)))
-        self.sub = tk.Label(self, text=subtitle, font=F_TILE_SUB, fg=MUTED, bg=CARD, anchor="w")
+        self.sub = tk.Label(self, text=subtitle, font=F_TILE_SUB, fg=MUTED, bg=CARD, anchor="w",
+                            justify="left")
         self.sub.grid(row=1, column=1, sticky="nw", pady=(S(1), S(11)), padx=(0, S(14)))
 
         for widget in (self, self.icon_box, self.title, self.sub):
@@ -2030,7 +2430,7 @@ entry_row.pack(fill="x")
 tk.Label(entry_row, image=icon("folder", ACCENT, 18), bg=CARD).pack(side="left", padx=(0, S(8)))
 
 folder_entry = styled_entry(entry_row, folder_var)
-folder_entry.configure(width=64)
+folder_entry.configure(width=62)
 folder_entry.pack(side="left", fill="x", expand=True, ipady=S(5), ipadx=S(4))
 
 browse_button = FlatButton(entry_row, "Browse", browse_folder, style="primary")
@@ -2090,20 +2490,27 @@ if not DOCX_AVAILABLE:
 # Screenshot Card
 # ============================================================
 
-shot_card = Card(content, "Screenshot", badge="PNG / Word")
+shot_card = Card(content, "Screenshot & text", badge="PNG / Word / Text")
 shot_card.pack(fill="x", pady=(0, S(12)))
 
 shot_tiles = tk.Frame(shot_card.body, bg=CARD)
 shot_tiles.pack(fill="x")
-shot_tiles.columnconfigure((0, 1), weight=1, uniform="tiles")
+shot_tiles.columnconfigure((0, 1, 2), weight=1, uniform="tiles")
 
 capture_button = Tile(shot_tiles, icon("screen", ACCENT, 24), "Capture Screen",
-                      "Entire desktop  ·  Ctrl+Shift+F", capture_screen)
-capture_button.grid(row=0, column=0, sticky="nsew", padx=(0, S(8)))
+                      "Entire desktop\nCtrl+Shift+F", capture_screen)
+capture_button.grid(row=0, column=0, sticky="nsew", padx=(0, S(6)))
 
 region_button = Tile(shot_tiles, icon("region", ACCENT, 24), "Capture Region",
-                     "Drag to select  ·  Ctrl+Shift+R", select_region)
-region_button.grid(row=0, column=1, sticky="nsew", padx=(S(8), 0))
+                     "Drag to select\nCtrl+Shift+R", select_region)
+region_button.grid(row=0, column=1, sticky="nsew", padx=(S(6), S(6)))
+
+ocr_button = Tile(shot_tiles, icon("ocr", ACCENT, 24), "Extract Text",
+                  "Copy text from screen\nCtrl+Shift+T", extract_text_region)
+ocr_button.grid(row=0, column=2, sticky="nsew", padx=(S(6), 0))
+
+if not OCR_AVAILABLE:
+    ocr_button.sub.configure(text="Needs Windows OCR\n(see console)")
 
 
 # ============================================================
@@ -2204,17 +2611,88 @@ def fit_status_wrap(event=None):
 root.after(100, fit_status_wrap)
 
 
+def screen_work_area():
+    """(left, top, width, height) of the usable area (without the taskbar)
+    of the monitor the mouse is on - the one the user is looking at."""
+    try:
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+
+        class MONITORINFO(ctypes.Structure):
+            _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT),
+                        ("rcWork", wintypes.RECT), ("dwFlags", wintypes.DWORD)]
+
+        user32.MonitorFromPoint.argtypes = [wintypes.POINT, wintypes.DWORD]
+        user32.MonitorFromPoint.restype = ctypes.c_void_p
+        user32.GetMonitorInfoW.argtypes = [ctypes.c_void_p, ctypes.POINTER(MONITORINFO)]
+
+        cursor = wintypes.POINT()
+        user32.GetCursorPos(ctypes.byref(cursor))
+        monitor = user32.MonitorFromPoint(cursor, 2)   # 2 = nearest monitor
+        info = MONITORINFO()
+        info.cbSize = ctypes.sizeof(MONITORINFO)
+        if monitor and user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+            r = info.rcWork
+            return r.left, r.top, r.right - r.left, r.bottom - r.top
+    except Exception:
+        pass
+    return 0, 0, root.winfo_screenwidth(), root.winfo_screenheight()
+
+
 def fit_to_screen():
     """On small or highly scaled screens, drop two decorative lines so the
     whole window fits above the taskbar."""
     root.update_idletasks()
-    available = root.winfo_screenheight() - S(90)   # taskbar + title bar
+    available = screen_work_area()[3] - S(40)   # minus the title bar
     if root.winfo_reqheight() > available:
         word_hint_label.pack_forget()
         header_subtitle.pack_forget()
 
 
 fit_to_screen()
+
+
+def center_window():
+    """Show the window in the middle of the screen (monitor, laptop,
+    any size or display scaling)."""
+    root.update_idletasks()
+    left, top, width, height = screen_work_area()
+
+    # Guess the title bar / border size first, show the window invisibly,
+    # then correct the position using the real frame size.
+    frame_w, frame_h = S(16), S(39)
+
+    def place():
+        win_w = root.winfo_reqwidth() + frame_w
+        win_h = root.winfo_reqheight() + frame_h
+        x = left + max(0, (width - win_w) // 2)
+        y = top + max(0, (height - win_h) // 2)
+        root.geometry(f"+{x}+{y}")
+
+    try:
+        root.attributes("-alpha", 0.0)
+    except Exception:
+        pass
+
+    place()
+    root.deiconify()
+    root.update()
+
+    # Real frame size = outer window minus the inner (client) area
+    outer_x, outer_y = root.winfo_x(), root.winfo_y()
+    measured_w = 2 * (root.winfo_rootx() - outer_x)
+    measured_h = (root.winfo_rooty() - outer_y) + (root.winfo_rootx() - outer_x)
+    if measured_h > 0:
+        frame_w, frame_h = measured_w, measured_h
+        place()
+        root.update_idletasks()
+
+    try:
+        root.attributes("-alpha", 1.0)
+    except Exception:
+        pass
+    root.lift()
+    root.focus_force()
 
 
 # ============================================================
@@ -2257,6 +2735,8 @@ root.bind("<Control-Shift-F>",
           lambda event: capture_screen() if recorder is None else None)
 root.bind("<Control-Shift-R>",
           lambda event: select_region() if recorder is None else None)
+root.bind("<Control-Shift-T>",
+          lambda event: extract_text_region() if recorder is None else None)
 root.bind("<Control-Shift-V>", lambda event: toggle_screen_recording())
 root.bind("<Control-Shift-P>", lambda event: toggle_pause())
 
@@ -2264,6 +2744,8 @@ root.bind("<Control-Shift-P>", lambda event: toggle_pause())
 # ============================================================
 # Start Application
 # ============================================================
+
+center_window()
 
 print("Screen Capture Utility started.")
 print("Choose a save folder in the window (type a path or click Browse...).")

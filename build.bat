@@ -15,7 +15,10 @@ if exist "venv\Scripts\activate.bat" (
 echo.
 echo === Installing build requirements ===
 python -m pip install --upgrade pip
-python -m pip install pyinstaller pillow python-docx imageio-ffmpeg PyAudioWPatch
+python -m pip install pyinstaller pillow python-docx imageio-ffmpeg PyAudioWPatch ^
+    winrt-runtime winrt-Windows.Foundation winrt-Windows.Foundation.Collections ^
+    winrt-Windows.Globalization winrt-Windows.Graphics.Imaging ^
+    winrt-Windows.Media.Ocr winrt-Windows.Storage.Streams
 if errorlevel 1 goto :error
 
 echo.
@@ -40,6 +43,7 @@ python -m PyInstaller ^
     --collect-all imageio_ffmpeg ^
     --hidden-import pyaudiowpatch ^
     --collect-all pyaudiowpatch ^
+    --collect-all winrt ^
     --exclude-module cv2 ^
     --exclude-module numpy ^
     %ICON_ARG% ^
