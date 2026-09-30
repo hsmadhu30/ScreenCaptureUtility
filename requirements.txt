@@ -1,0 +1,5 @@
+pillow
+python-docx
+imageio-ffmpeg
+PyAudioWPatch; sys_platform == "win32"
+pyinstaller

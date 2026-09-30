@@ -12,12 +12,14 @@ import sys
 import os
 import subprocess
 import importlib
+import wave
 
 
 # ============================================================
 # Optional packages (installed automatically if missing)
 # ============================================================
-# Screen recording needs OpenCV (to write .mp4) and NumPy.
+# Screen recording uses ffmpeg (imageio-ffmpeg) and, for sound,
+# PyAudioWPatch. OpenCV + NumPy are a fallback for video without sound.
 # Adding screenshots to a Word document needs python-docx.
 # If they are not installed in the Python environment that runs
 # this script, we install them with pip on first start.
@@ -47,7 +49,24 @@ np = ensure_package("numpy", "numpy")
 cv2 = ensure_package("cv2", "opencv-python")
 docx = ensure_package("docx", "python-docx")
 
-RECORDING_AVAILABLE = np is not None and cv2 is not None
+# ffmpeg (bundled with imageio-ffmpeg) encodes the video as H.264 and
+# combines it with the recorded audio into one .mp4 file.
+imageio_ffmpeg = ensure_package("imageio_ffmpeg", "imageio-ffmpeg")
+
+# PyAudioWPatch records the microphone and the computer's own sound
+# ("what you hear", via WASAPI loopback). It is Windows-only.
+pyaudio = (ensure_package("pyaudiowpatch", "PyAudioWPatch")
+           if sys.platform == "win32" else None)
+
+FFMPEG_EXE = None
+if imageio_ffmpeg is not None:
+    try:
+        FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception as e:
+        print(f"ffmpeg not available: {e}")
+
+RECORDING_AVAILABLE = FFMPEG_EXE is not None or (np is not None and cv2 is not None)
+AUDIO_AVAILABLE = FFMPEG_EXE is not None and pyaudio is not None
 DOCX_AVAILABLE = docx is not None
 
 if DOCX_AVAILABLE:
@@ -56,11 +75,18 @@ if DOCX_AVAILABLE:
 
 if not RECORDING_AVAILABLE:
     print("Screen recording is disabled. To enable it, run:")
-    print(f'  "{sys.executable}" -m pip install opencv-python numpy')
+    print(f'  "{sys.executable}" -m pip install imageio-ffmpeg')
+
+if not AUDIO_AVAILABLE:
+    print("Audio recording is disabled. To enable it, run:")
+    print(f'  "{sys.executable}" -m pip install imageio-ffmpeg PyAudioWPatch')
 
 if not DOCX_AVAILABLE:
     print("Saving to Word documents is disabled. To enable it, run:")
     print(f'  "{sys.executable}" -m pip install python-docx')
+
+# Run ffmpeg without flashing a console window (matters for the .exe)
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
 # ============================================================
@@ -84,6 +110,10 @@ except Exception:
 # ============================================================
 
 RECORDING_FPS = 15
+
+# Audio is kept aligned with the video clock; if it drifts further
+# than this (seconds), silence is inserted or samples are dropped.
+AUDIO_MAX_DRIFT = 0.08
 
 # How often (ms) to retry writing to the Word document while it is
 # open in Word and therefore locked.
@@ -262,6 +292,21 @@ def _length(value, default):
     return value if value is not None else default
 
 
+BLANK_LINES_BETWEEN_IMAGES = 3
+
+
+def document_has_content(doc):
+    """True if the document already has text, images or tables."""
+    if doc.tables:
+        return True
+    for paragraph in doc.paragraphs:
+        if paragraph.text.strip():
+            return True
+        if paragraph._p.xpath(".//w:drawing") or paragraph._p.xpath(".//w:pict"):
+            return True
+    return False
+
+
 def append_captures_to_docx(path, captures):
     """
     Open the .docx, add each capture (oldest first) at the end of the
@@ -286,6 +331,11 @@ def append_captures_to_docx(path, captures):
 
     # Images only (no captions), oldest capture first
     for capture in sorted(captures, key=lambda c: c.taken_at):
+        # 3 blank lines between images (none before the very first one)
+        if document_has_content(doc):
+            for _ in range(BLANK_LINES_BETWEEN_IMAGES):
+                doc.add_paragraph()
+
         # Fit the image to the page width (and height), keeping its
         # proportions, but never enlarge it beyond its real size.
         w_px, h_px = capture.size
@@ -294,9 +344,6 @@ def append_captures_to_docx(path, captures):
             width = max_h * w_px / h_px
 
         doc.add_picture(BytesIO(capture.png), width=Emu(int(width)))
-
-        # A little space below each image so they don't touch
-        doc.paragraphs[-1].paragraph_format.space_after = Pt(12)
 
     temp_path = path.with_name(f".{path.stem}.saving.tmp")
     doc.save(str(temp_path))
@@ -498,8 +545,7 @@ def new_word_document():
     path = Path(path)
 
     try:
-        doc = Document()
-        doc.add_heading("Screen Captures", level=1)
+        doc = Document()   # empty document - images only, no heading
         doc.save(str(path))
     except Exception as e:
         messagebox.showerror(
@@ -708,17 +754,271 @@ def capture_selected_region(x1, y1, x2, y2):
 # ============================================================
 # Screen Recorder
 # ============================================================
+# Video: screen frames are grabbed on a fixed clock and piped into
+# ffmpeg, which encodes them as H.264 into a temporary file.
+#
+# Audio: the microphone and the computer's own sound (loopback) are
+# each recorded into a temporary WAV file. Every audio chunk is placed
+# on the SAME clock the video uses (the recording's elapsed time, not
+# counting pauses), so gaps are filled with silence and drift is
+# corrected. That keeps sound and picture in sync.
+#
+# When recording stops, ffmpeg mixes the audio tracks and combines them
+# with the video into the final .mp4.
+
+def hidden_temp_path(final_path, suffix):
+    """A temporary file next to the final recording, e.g.
+    .Recording_2026-09-29_21-30-00.mic.wav"""
+    return final_path.with_name(f".{final_path.stem}{suffix}")
+
+
+class AudioTrack:
+    """One audio source written to a WAV file, aligned to the recording clock."""
+
+    def __init__(self, label, path, rate, channels, clock):
+        self.label = label
+        self.path = path
+        self.rate = rate
+        self.channels = channels
+        self.clock = clock                 # the ScreenRecorder
+        self.frame_bytes = 2 * channels    # 16-bit samples
+        self.frames = 0                    # audio frames written so far
+        self.lock = threading.Lock()
+        self.closed = False
+        self.received_audio = False
+
+        self.wav = wave.open(str(path), "wb")
+        self.wav.setnchannels(channels)
+        self.wav.setsampwidth(2)
+        self.wav.setframerate(rate)
+
+    def feed(self, data, frame_count):
+        """Called from the audio callback with raw 16-bit PCM bytes."""
+        if self.clock.paused or frame_count <= 0:
+            return
+
+        with self.lock:
+            if self.closed:
+                return
+
+            self.received_audio = True
+
+            # Where this chunk belongs on the recording timeline
+            end_time = self.clock.elapsed()
+            expected_start = int(end_time * self.rate) - frame_count
+            difference = expected_start - self.frames
+            tolerance = int(self.rate * AUDIO_MAX_DRIFT)
+
+            if difference > tolerance:
+                # Audio is behind the clock (e.g. the computer was silent
+                # and Windows sent nothing): fill the gap with silence.
+                self.wav.writeframes(b"\x00" * (difference * self.frame_bytes))
+                self.frames += difference
+
+            elif difference < -tolerance:
+                # Audio is ahead of the clock: drop the extra samples.
+                drop = min(frame_count, -difference)
+                data = data[drop * self.frame_bytes:]
+                frame_count -= drop
+
+            if frame_count > 0:
+                self.wav.writeframes(data[:frame_count * self.frame_bytes])
+                self.frames += frame_count
+
+    def finish(self, duration):
+        """Pad with silence to the full video length and close the file."""
+        with self.lock:
+            if self.closed:
+                return
+            self.closed = True
+            target = int(duration * self.rate)
+            if self.frames < target:
+                self.wav.writeframes(
+                    b"\x00" * ((target - self.frames) * self.frame_bytes))
+                self.frames = target
+            self.wav.close()
+
+
+class AudioCapture:
+    """Records the default microphone and/or the default speakers
+    (loopback = everything the computer plays) using WASAPI."""
+
+    def __init__(self, final_path, clock, want_mic, want_system):
+        self.final_path = final_path
+        self.clock = clock
+        self.want_mic = want_mic
+        self.want_system = want_system
+        self.pa = None
+        self.streams = []
+        self.tracks = []
+        self.notes = []
+
+    def start(self):
+        if not (self.want_mic or self.want_system):
+            return
+        if not AUDIO_AVAILABLE:
+            self.notes.append("audio recording isn't available")
+            return
+
+        try:
+            self.pa = pyaudio.PyAudio()
+            wasapi = self.pa.get_host_api_info_by_type(pyaudio.paWASAPI)
+        except Exception as e:
+            self.notes.append(f"audio unavailable ({e})")
+            return
+
+        if self.want_system:
+            try:
+                self._open(self._find_loopback(wasapi), "system",
+                           "computer sound")
+            except Exception as e:
+                self.notes.append(f"computer sound not recorded ({e})")
+
+        if self.want_mic:
+            try:
+                index = wasapi["defaultInputDevice"]
+                if index is None or index < 0:
+                    raise RuntimeError("no microphone found")
+                self._open(self.pa.get_device_info_by_index(index), "mic",
+                           "microphone")
+            except Exception as e:
+                self.notes.append(f"microphone not recorded ({e})")
+
+    def _find_loopback(self, wasapi):
+        try:
+            return self.pa.get_default_wasapi_loopback()
+        except Exception:
+            pass
+
+        speakers = self.pa.get_device_info_by_index(wasapi["defaultOutputDevice"])
+        if speakers.get("isLoopbackDevice"):
+            return speakers
+        for loopback in self.pa.get_loopback_device_info_generator():
+            if speakers["name"] in loopback["name"]:
+                return loopback
+        raise RuntimeError("no loopback device for the default speakers")
+
+    def _open(self, device, file_label, label):
+        rate = int(device["defaultSampleRate"])
+        channels = max(1, int(device["maxInputChannels"]))
+        path = hidden_temp_path(self.final_path, f".{file_label}.wav")
+
+        track = AudioTrack(label, path, rate, channels, self.clock)
+
+        def callback(in_data, frame_count, time_info, status):
+            track.feed(in_data, frame_count)
+            return (None, pyaudio.paContinue)
+
+        try:
+            stream = self.pa.open(
+                format=pyaudio.paInt16,
+                channels=channels,
+                rate=rate,
+                input=True,
+                input_device_index=device["index"],
+                frames_per_buffer=1024,
+                stream_callback=callback,
+            )
+            stream.start_stream()
+        except Exception:
+            track.finish(0)
+            try:
+                path.unlink()
+            except Exception:
+                pass
+            raise
+
+        self.streams.append(stream)
+        self.tracks.append(track)
+        print(f"Recording {label} from: {device['name']}")
+
+    def stop(self):
+        for stream in self.streams:
+            try:
+                stream.stop_stream()
+                stream.close()
+            except Exception:
+                pass
+        self.streams.clear()
+        if self.pa is not None:
+            try:
+                self.pa.terminate()
+            except Exception:
+                pass
+            self.pa = None
+
+
+class FfmpegVideoSink:
+    """Encodes raw RGB frames to H.264 with ffmpeg."""
+
+    def __init__(self, path, width, height, fps):
+        self.path = path
+        self.log_path = hidden_temp_path(path, ".log")
+        self.log = open(self.log_path, "wb")
+        self.proc = subprocess.Popen(
+            [FFMPEG_EXE, "-y", "-loglevel", "error",
+             "-f", "rawvideo", "-pix_fmt", "rgb24",
+             "-s", f"{width}x{height}", "-r", str(fps), "-i", "-",
+             "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+             "-pix_fmt", "yuv420p", str(path)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=self.log,
+            creationflags=NO_WINDOW,
+        )
+
+    def write(self, frame_bytes):
+        self.proc.stdin.write(frame_bytes)
+
+    def close(self):
+        error = None
+        try:
+            self.proc.stdin.close()
+        except Exception:
+            pass
+        if self.proc.wait() != 0:
+            error = "Video encoding failed."
+        self.log.close()
+        try:
+            text = self.log_path.read_text(errors="replace").strip()
+            if error and text:
+                error += " " + text.splitlines()[-1]
+            self.log_path.unlink()
+        except Exception:
+            pass
+        return error
+
+
+class Cv2VideoSink:
+    """Fallback when ffmpeg isn't available: OpenCV, no audio."""
+
+    def __init__(self, path, width, height, fps):
+        self.width, self.height = width, height
+        self.writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"),
+                                      fps, (width, height))
+        if not self.writer.isOpened():
+            raise RuntimeError("Could not open the video file for writing.")
+
+    def write(self, frame_bytes):
+        frame = np.frombuffer(frame_bytes, dtype=np.uint8).reshape(
+            self.height, self.width, 3)
+        self.writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+
+    def close(self):
+        self.writer.release()
+        return None
+
 
 class ScreenRecorder:
     """
-    Records an area of the screen to an .mp4 file in a background
-    thread. Frames are written on a fixed clock so the video plays
-    back at real-time speed even if capturing is sometimes slow.
-    Recording can be paused and resumed; paused time is left out of
-    the video.
+    Records an area of the screen (plus optional audio) to an .mp4 file.
+    Frames are written on a fixed clock so the video plays back at
+    real-time speed even if capturing is sometimes slow. Recording can
+    be paused and resumed; paused time is left out of video and audio.
     """
 
-    def __init__(self, filename, area, fps=RECORDING_FPS):
+    def __init__(self, filename, area, fps=RECORDING_FPS,
+                 record_mic=False, record_system=False):
         self.filename = filename
         self.fps = fps
 
@@ -737,25 +1037,33 @@ class ScreenRecorder:
         self.lock = threading.Lock()
         self.thread = None
         self.error = None
+        self.warning = None
         self.frames_written = 0
         self.start_time = None
         self.paused = False
         self.pause_started = None
         self.paused_total = 0.0
 
-    def start(self):
-        self.start_time = time.perf_counter()
-        self.thread = threading.Thread(target=self._run, daemon=True)
-        self.thread.start()
+        self.use_ffmpeg = FFMPEG_EXE is not None
+        self.video_path = (hidden_temp_path(filename, ".video.mp4")
+                           if self.use_ffmpeg else filename)
+        self.audio = AudioCapture(filename, self,
+                                  record_mic and self.use_ffmpeg,
+                                  record_system and self.use_ffmpeg)
 
-    def stop(self):
-        self.stop_event.set()
-        if self.thread is not None:
-            self.thread.join(timeout=10)
+    # ---- clock -----------------------------------------------------
+
+    def elapsed(self):
+        """Recorded time in seconds (not counting paused time)."""
+        with self.lock:
+            if self.start_time is None:
+                return 0
+            now = self.pause_started if self.paused else time.perf_counter()
+            return now - self.start_time - self.paused_total
 
     def pause(self):
         with self.lock:
-            if not self.paused:
+            if not self.paused and self.start_time is not None:
                 self.paused = True
                 self.pause_started = time.perf_counter()
 
@@ -766,30 +1074,123 @@ class ScreenRecorder:
                 self.paused = False
                 self.pause_started = None
 
+    # ---- start / stop ----------------------------------------------
+
+    def start(self):
+        # Video and audio share this one clock, which keeps them in sync
+        with self.lock:
+            self.start_time = time.perf_counter()
+        self.audio.start()
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
     def is_running(self):
         return self.thread is not None and self.thread.is_alive()
 
-    def elapsed(self):
-        """Recorded time in seconds (not counting paused time)."""
-        with self.lock:
-            if self.start_time is None:
-                return 0
-            now = self.pause_started if self.paused else time.perf_counter()
-            return now - self.start_time - self.paused_total
+    def duration(self):
+        return self.frames_written / self.fps
+
+    def stop(self):
+        """Stop capturing (may take a moment while ffmpeg finishes)."""
+        self.stop_event.set()
+        self.audio.stop()
+        if self.thread is not None:
+            self.thread.join()
+
+    def finalize(self):
+        """Combine video and audio into the final .mp4 file.
+        Runs after stop(), in a background thread."""
+        tracks = self.audio.tracks
+        duration = self.duration()
+
+        for track in tracks:
+            track.finish(duration)
+
+        try:
+            if self.error or not self.use_ffmpeg:
+                return
+
+            if self.frames_written == 0:
+                self.error = "No frames were captured, so the video is empty."
+                return
+
+            if not tracks:
+                os.replace(self.video_path, self.filename)
+                return
+
+            command = [FFMPEG_EXE, "-y", "-loglevel", "error",
+                       "-i", str(self.video_path)]
+            for track in tracks:
+                command += ["-i", str(track.path)]
+
+            # Bring every track to 48 kHz stereo, then mix them together
+            filters = []
+            for i in range(len(tracks)):
+                filters.append(
+                    f"[{i + 1}:a]aresample=48000,"
+                    f"aformat=sample_fmts=fltp:channel_layouts=stereo[a{i}]")
+            if len(tracks) == 1:
+                audio_out = "[a0]"
+            else:
+                inputs = "".join(f"[a{i}]" for i in range(len(tracks)))
+                filters.append(
+                    f"{inputs}amix=inputs={len(tracks)}:duration=longest:"
+                    f"normalize=0,alimiter=limit=0.95[mix]")
+                audio_out = "[mix]"
+
+            command += ["-filter_complex", ";".join(filters),
+                        "-map", "0:v", "-map", audio_out,
+                        "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                        "-t", f"{duration:.3f}",
+                        "-movflags", "+faststart",
+                        str(self.filename)]
+
+            result = subprocess.run(command, capture_output=True,
+                                    creationflags=NO_WINDOW)
+
+            if result.returncode != 0:
+                # Keep the video even if adding the sound failed
+                details = result.stderr.decode(errors="replace").strip()
+                print(f"Adding audio failed: {details}")
+                os.replace(self.video_path, self.filename)
+                self.warning = "the sound couldn't be added (see console)"
+
+        except Exception as e:
+            self.error = f"Could not save the recording: {e}"
+
+        finally:
+            for path in [self.video_path] + [t.path for t in tracks]:
+                if path != self.filename:
+                    try:
+                        path.unlink()
+                    except Exception:
+                        pass
+
+    def audio_summary(self):
+        labels = [t.label for t in self.audio.tracks]
+        parts = []
+        if labels:
+            parts.append("with " + " + ".join(labels))
+        elif self.audio.want_mic or self.audio.want_system:
+            parts.append("without sound")
+        parts += self.audio.notes
+        if self.warning:
+            parts.append(self.warning)
+        return "; ".join(parts)
+
+    # ---- capture loop ----------------------------------------------
 
     def _run(self):
         width = self.area["width"]
         height = self.area["height"]
 
-        writer = cv2.VideoWriter(
-            str(self.filename),
-            cv2.VideoWriter_fourcc(*"mp4v"),
-            self.fps,
-            (width, height)
-        )
-
-        if not writer.isOpened():
-            self.error = "Could not open the video file for writing."
+        try:
+            if self.use_ffmpeg:
+                sink = FfmpegVideoSink(self.video_path, width, height, self.fps)
+            else:
+                sink = Cv2VideoSink(self.video_path, width, height, self.fps)
+        except Exception as e:
+            self.error = str(e)
             return
 
         frame_interval = 1.0 / self.fps
@@ -801,45 +1202,60 @@ class ScreenRecorder:
             self.area["top"] + height,
         )
 
-        try:
-            with self.lock:
-                self.start_time = time.perf_counter()
+        last_frame = None
 
+        try:
             while not self.stop_event.is_set():
                 if self.paused:
                     self.stop_event.wait(0.05)
                     continue
 
+                # The moment this frame shows (on the shared clock)
+                capture_time = self.elapsed()
                 shot = ImageGrab.grab(bbox=bbox, all_screens=True)
 
                 # Paused while grabbing? Drop this frame.
                 if self.paused:
                     continue
 
-                frame = np.array(shot.convert("RGB"))
-                frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                shot = shot.convert("RGB")
+                if shot.size != (width, height):
+                    shot = shot.crop((0, 0, width, height))
+                frame_bytes = shot.tobytes()
 
-                # Make sure the frame is exactly the video size
-                frame = frame[:height, :width]
-                if frame.shape[0] != height or frame.shape[1] != width:
-                    frame = cv2.resize(frame, (width, height))
-
-                # Write as many copies as needed to keep real-time speed
-                target_frames = int(self.elapsed() * self.fps) + 1
-                while self.frames_written < target_frames:
-                    writer.write(frame)
+                # Put the frame at its own time in the video. If capturing
+                # fell behind, repeat the previous frame to fill the gap,
+                # so the video always runs in real time (and in sync with
+                # the audio, which uses the same clock).
+                index = round(capture_time * self.fps)
+                filler = last_frame if last_frame is not None else frame_bytes
+                while self.frames_written < index:
+                    sink.write(filler)
                     self.frames_written += 1
+                if self.frames_written <= index:
+                    sink.write(frame_bytes)
+                    self.frames_written += 1
+                last_frame = frame_bytes
 
                 # Sleep until the next frame is due
                 delay = self.frames_written * frame_interval - self.elapsed()
                 if delay > 0:
                     self.stop_event.wait(delay)
 
+            # Hold the last frame until the moment Stop was pressed
+            if last_frame is not None:
+                end_index = round(self.elapsed() * self.fps)
+                while self.frames_written < end_index:
+                    sink.write(last_frame)
+                    self.frames_written += 1
+
         except Exception as e:
             self.error = str(e)
 
         finally:
-            writer.release()
+            close_error = sink.close()
+            if close_error and not self.error:
+                self.error = close_error
 
 
 # ============================================================
@@ -857,7 +1273,6 @@ WDA_NONE = 0x00000000
 WDA_EXCLUDEFROMCAPTURE = 0x00000011
 GA_ROOT = 2
 
-BAR_BG = "#202124"
 DOT_ON = "#ff4b4b"
 DOT_PAUSED = "#fbbc04"
 
@@ -994,7 +1409,7 @@ def toggle_screen_recording():
         stop_recording()
         return
 
-    if not RECORDING_AVAILABLE:
+    if not RECORDING_AVAILABLE or saving_thread is not None:
         return
 
     if not ensure_save_folder():
@@ -1009,7 +1424,7 @@ def toggle_screen_recording():
 
 
 def record_region():
-    if recorder is not None or not RECORDING_AVAILABLE:
+    if recorder is not None or not RECORDING_AVAILABLE or saving_thread is not None:
         return
 
     if not ensure_save_folder():
@@ -1035,7 +1450,11 @@ def start_recording(area):
         enter_recording_mode(area)
 
         filename = get_recording_filename()
-        recorder = ScreenRecorder(filename, area)
+        recorder = ScreenRecorder(
+            filename, area,
+            record_mic=mic_var.get() and AUDIO_AVAILABLE,
+            record_system=system_audio_var.get() and AUDIO_AVAILABLE,
+        )
         recorder.start()
         print(f"Recording started: {filename}")
 
@@ -1067,8 +1486,13 @@ def toggle_pause():
         print("Recording paused")
 
 
+saving_thread = None
+
+
 def stop_recording():
-    global recorder
+    """Stop recording, then save the video (and sound) in the background
+    so the window stays responsive."""
+    global recorder, saving_thread
 
     if recorder is None:
         return
@@ -1076,12 +1500,28 @@ def stop_recording():
     current = recorder
     recorder = None
 
-    rec_time_label.config(text="Saving...")
-    root.update_idletasks()
-
-    current.stop()
-
     exit_recording_mode()
+    set_record_buttons_state("disabled")
+    status_var.set("Saving recording... please wait")
+
+    def work():
+        current.stop()
+        current.finalize()
+
+    saving_thread = threading.Thread(target=work, daemon=True)
+    saving_thread.start()
+    root.after(200, lambda: check_saving_done(current))
+
+
+def check_saving_done(current):
+    global saving_thread
+
+    if saving_thread is not None and saving_thread.is_alive():
+        root.after(200, lambda: check_saving_done(current))
+        return
+
+    saving_thread = None
+    set_record_buttons_state("normal")
 
     if current.error:
         print(f"Error while recording: {current.error}")
@@ -1089,23 +1529,23 @@ def stop_recording():
         messagebox.showerror("Recording failed", current.error, parent=root)
         return
 
-    if current.frames_written == 0:
-        status_var.set("Recording failed: no frames were captured.")
-        messagebox.showerror(
-            "Recording failed",
-            "No frames were captured, so the video is empty.",
-            parent=root
-        )
-        return
-
-    duration = current.frames_written / current.fps
     print("Recording saved successfully:")
     print(current.filename)
-    message = f"Saved: {current.filename.name}  ({duration:.1f} s)"
+    message = f"Saved: {current.filename.name}  ({current.duration():.1f} s)"
+    audio = current.audio_summary()
+    if audio:
+        message += f" - {audio}"
     if not bar_excluded:
-        message += ("\nNote: the recording controls may be visible in the "
-                    "video (hiding them needs Windows 10 version 2004 or later).")
+        message += ("\nNote: the controls may appear in the video "
+                    "(hiding them needs Windows 10 version 2004 or later).")
     status_var.set(message)
+
+
+def set_record_buttons_state(state):
+    if not RECORDING_AVAILABLE:
+        state = "disabled"
+    record_button.config(state=state)
+    record_region_button.config(state=state)
 
 
 def update_recording_status():
@@ -1147,6 +1587,15 @@ def on_close():
         stop_recording()
         return
 
+    # Don't quit while a recording is still being saved
+    if saving_thread is not None and saving_thread.is_alive():
+        messagebox.showinfo(
+            "Still saving",
+            "The recording is still being saved. Please wait a moment.",
+            parent=root
+        )
+        return
+
     # Make sure every screenshot ends up in the Word document
     while pending_captures and not flush_pending(interactive=True):
         retry = messagebox.askretrycancel(
@@ -1185,197 +1634,617 @@ doc_var = tk.StringVar()
 keep_png_var = tk.BooleanVar(value=False)
 status_var = tk.StringVar(value="Choose a folder to save screenshots and recordings.")
 
+
+# ============================================================
+# Theme
+# ============================================================
+
+from PIL import Image, ImageDraw, ImageTk
+
+# Colours
+BG = "#E8EBF1"            # window background (darker so cards stand out)
+CARD = "#FFFFFF"          # card background
+CARD_HOVER = "#F4F4FF"    # tile hover
+BORDER = "#C9CED8"          # card / tile borders
+FIELD_BORDER = "#9AA3B2"    # text box borders
+FIELD_READONLY = "#F2F4F8"  # read-only text box background
+TEXT = "#1B1F2A"
+MUTED = "#4B5563"
+FAINT = "#7B8494"
+ACCENT = "#4F46E5"        # indigo
+ACCENT_HOVER = "#4338CA"
+ACCENT_SOFT = "#EEF0FF"
+RED = "#E5484D"
+RED_SOFT = "#FDEDEE"
+GREEN = "#16A34A"
+AMBER = "#D97706"
+HEADER_BG = "#141824"
+HEADER_SUB = "#C5CAD6"
+BAR_BG = "#141824"
+
+# Fonts (Segoe UI on Windows; Tk falls back elsewhere)
+F_TITLE = ("Segoe UI Semibold", 16)
+F_SUB = ("Segoe UI", 10)
+F_SECTION = ("Segoe UI Semibold", 9)
+F_BODY = ("Segoe UI", 10)
+F_BODY_BOLD = ("Segoe UI Semibold", 10)
+F_TILE = ("Segoe UI Semibold", 11)
+F_TILE_SUB = ("Segoe UI", 9)
+F_TIMER = ("Consolas", 13, "bold")
+
+# Scale pixel sizes with Windows display scaling (fonts scale by themselves)
+UI_SCALE = max(1.0, root.winfo_fpixels("1i") / 96.0)
+
+
+def S(pixels):
+    return int(round(pixels * UI_SCALE))
+
+
+root.configure(bg=BG)
+
+
+# ============================================================
+# Icons (drawn with Pillow, 4x supersampled for smooth edges)
+# ============================================================
+
+ICONS = {}   # keep references so Tk doesn't garbage-collect them
+
+
+def _canvas(size):
+    big = size * 4
+    return Image.new("RGBA", (big, big), (0, 0, 0, 0)), big
+
+
+def _finish(img, size):
+    return img.resize((size, size), Image.LANCZOS)
+
+
+def draw_icon(kind, color, size, accent=RED):
+    img, n = _canvas(size)
+    d = ImageDraw.Draw(img)
+    w = max(4, n // 14)                      # stroke width
+    u = n / 24.0                             # 24-unit grid
+
+    def box(x0, y0, x1, y1):
+        return [x0 * u, y0 * u, x1 * u, y1 * u]
+
+    if kind in ("screen", "record"):
+        d.rounded_rectangle(box(2, 4, 22, 17), radius=2 * u, outline=color, width=w)
+        d.line(box(12, 17, 12, 20), fill=color, width=w)
+        d.line(box(8, 20.5, 16, 20.5), fill=color, width=w)
+        if kind == "record":
+            d.ellipse(box(9, 7.5, 15, 13.5), fill=accent)
+
+    elif kind in ("region", "record_region"):
+        L = 5
+        for (x, y, dx, dy) in [(3, 3, 1, 1), (21, 3, -1, 1), (3, 21, 1, -1), (21, 21, -1, -1)]:
+            d.line([x * u, y * u, (x + dx * L) * u, y * u], fill=color, width=w)
+            d.line([x * u, y * u, x * u, (y + dy * L) * u], fill=color, width=w)
+        if kind == "record_region":
+            d.ellipse(box(8.5, 8.5, 15.5, 15.5), fill=accent)
+        else:
+            d.rounded_rectangle(box(8, 8, 16, 16), radius=1.2 * u, fill=color)
+
+    elif kind == "folder":
+        d.rounded_rectangle(box(2, 5, 11, 9), radius=1.5 * u, fill=color)
+        d.rounded_rectangle(box(2, 7, 22, 19), radius=2 * u, fill=color)
+
+    elif kind == "doc":
+        d.rounded_rectangle(box(5, 2, 19, 22), radius=2 * u, outline=color, width=w)
+        for y in (8, 12, 16):
+            d.line(box(8.5, y, 15.5, y), fill=color, width=w)
+
+    elif kind == "mic":
+        d.rounded_rectangle(box(9, 2, 15, 14), radius=3 * u, fill=color)
+        d.arc(box(5.5, 7, 18.5, 18), start=0, end=180, fill=color, width=w)
+        d.line(box(12, 18, 12, 21.5), fill=color, width=w)
+
+    elif kind == "speaker":
+        d.polygon([(3 * u, 9 * u), (7 * u, 9 * u), (12 * u, 4.5 * u),
+                   (12 * u, 19.5 * u), (7 * u, 15 * u), (3 * u, 15 * u)], fill=color)
+        d.arc(box(10, 8, 17, 16), start=-60, end=60, fill=color, width=w)
+        d.arc(box(10, 4.5, 21, 19.5), start=-60, end=60, fill=color, width=w)
+
+    elif kind == "pause":
+        d.rounded_rectangle(box(6, 5, 10, 19), radius=u, fill=color)
+        d.rounded_rectangle(box(14, 5, 18, 19), radius=u, fill=color)
+
+    elif kind == "play":
+        d.polygon([(7 * u, 4.5 * u), (19.5 * u, 12 * u), (7 * u, 19.5 * u)], fill=color)
+
+    elif kind == "stop":
+        d.rounded_rectangle(box(6, 6, 18, 18), radius=2 * u, fill=color)
+
+    elif kind == "dot":
+        d.ellipse(box(4, 4, 20, 20), fill=color)
+
+    elif kind == "logo":
+        d.rounded_rectangle(box(1, 1, 23, 23), radius=6 * u, fill=ACCENT)
+        d.rounded_rectangle(box(5, 8, 19, 18.5), radius=2.5 * u, fill="white")
+        d.rounded_rectangle(box(8.5, 6, 13, 9), radius=1 * u, fill="white")
+        d.ellipse(box(9, 10, 15, 16), fill=ACCENT)
+        d.ellipse(box(10.8, 11.8, 13.2, 14.2), fill="white")
+        d.ellipse(box(16, 9.3, 18, 11.3), fill=RED)
+
+    return ImageTk.PhotoImage(_finish(img, size))
+
+
+def icon(kind, color=TEXT, size=20, accent=RED):
+    key = (kind, color, size, accent)
+    if key not in ICONS:
+        ICONS[key] = draw_icon(kind, color, S(size), accent)
+    return ICONS[key]
+
+
+def switch_image(on, enabled=True):
+    """Pill-shaped on/off switch."""
+    key = ("switch", on, enabled)
+    if key not in ICONS:
+        w, h = S(34) * 4, S(18) * 4
+        img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        d = ImageDraw.Draw(img)
+        track = (ACCENT if on else "#9AA3B2") if enabled else ("#B9BCF0" if on else "#D5D9E0")
+        d.rounded_rectangle([0, 0, w - 1, h - 1], radius=h // 2, fill=track)
+        pad = h // 7
+        knob = h - 2 * pad
+        x = w - pad - knob if on else pad
+        d.ellipse([x, pad, x + knob, pad + knob], fill="white")
+        ICONS[key] = ImageTk.PhotoImage(img.resize((w // 4, h // 4), Image.LANCZOS))
+    return ICONS[key]
+
+
+# ============================================================
+# Styled Widgets
+# ============================================================
+
+class FlatButton(tk.Button):
+    """Flat button with hover colour. style: primary | secondary | danger | dark"""
+
+    STYLES = {
+        "primary":   dict(bg=ACCENT, fg="white", hover=ACCENT_HOVER, border=ACCENT),
+        "secondary": dict(bg=CARD, fg=TEXT, hover="#EEF0F4", border=FIELD_BORDER),
+        "danger":    dict(bg=RED, fg="white", hover="#D13438", border=RED),
+        "dark":      dict(bg="#2A3040", fg="white", hover="#394157", border="#2A3040"),
+    }
+
+    def __init__(self, parent, text, command, style="secondary", icons=None, **kw):
+        st = self.STYLES[style]
+        self._bg, self._hover = st["bg"], st["hover"]
+        self._icons = icons or {}
+        options = dict(
+            text=text, command=command, bg=st["bg"], fg=st["fg"],
+            activebackground=st["hover"], activeforeground=st["fg"],
+            disabledforeground=FAINT, relief="flat", bd=0, cursor="hand2",
+            highlightthickness=1, highlightbackground=st["border"],
+            highlightcolor=st["border"], font=F_BODY_BOLD,
+            padx=S(14), pady=S(6),
+        )
+        if text in self._icons:
+            options.update(image=self._icons[text], compound="left")
+        options.update(kw)
+        super().__init__(parent, **options)
+        self.bind("<Enter>", lambda e: self._hover_on(True))
+        self.bind("<Leave>", lambda e: self._hover_on(False))
+
+    def _hover_on(self, on):
+        if str(self["state"]) != "disabled":
+            tk.Button.configure(self, bg=self._hover if on else self._bg)
+
+    def configure(self, cnf=None, **kw):
+        # Swap the icon together with the text (e.g. Pause <-> Resume)
+        if "text" in kw and kw["text"] in self._icons:
+            kw["image"] = self._icons[kw["text"]]
+        if kw.get("state") == "disabled":
+            kw.setdefault("cursor", "arrow")
+            kw.setdefault("bg", self._bg)
+        elif kw.get("state") == "normal":
+            kw.setdefault("cursor", "hand2")
+        return tk.Button.configure(self, cnf, **kw)
+
+    config = configure
+
+
+class Tile(tk.Frame):
+    """Large clickable action card: icon, title and a short description."""
+
+    def __init__(self, parent, image, title, subtitle, command, hover_border=ACCENT):
+        super().__init__(parent, bg=CARD, highlightthickness=1,
+                         highlightbackground=BORDER, cursor="hand2")
+        self._command = command
+        self._state = "normal"
+        self._hover_border = hover_border
+
+        self.icon_box = tk.Label(self, image=image, bg=ACCENT_SOFT if hover_border == ACCENT else RED_SOFT,
+                                 width=S(44), height=S(44))
+        self.icon_box.grid(row=0, column=0, rowspan=2, padx=(S(14), S(12)), pady=S(11))
+
+        self.title = tk.Label(self, text=title, font=F_TILE, fg=TEXT, bg=CARD, anchor="w")
+        self.title.grid(row=0, column=1, sticky="sw", pady=(S(11), 0), padx=(0, S(14)))
+        self.sub = tk.Label(self, text=subtitle, font=F_TILE_SUB, fg=MUTED, bg=CARD, anchor="w")
+        self.sub.grid(row=1, column=1, sticky="nw", pady=(S(1), S(11)), padx=(0, S(14)))
+
+        for widget in (self, self.icon_box, self.title, self.sub):
+            widget.bind("<Enter>", lambda e: self._hover(True))
+            widget.bind("<Leave>", lambda e: self._hover(False))
+            widget.bind("<Button-1>", self._click)
+
+    def _hover(self, on):
+        if self._state == "disabled":
+            return
+        bg = CARD_HOVER if on else CARD
+        tk.Frame.configure(self, bg=bg,
+                           highlightbackground=self._hover_border if on else BORDER)
+        for widget in (self.title, self.sub):
+            widget.configure(bg=bg)
+
+    def _click(self, event=None):
+        if self._state != "disabled" and self._command:
+            self._hover(False)
+            self._command()
+
+    def configure(self, cnf=None, **kw):
+        state = kw.pop("state", None)
+        if state is not None:
+            self._state = state
+            disabled = state == "disabled"
+            self.title.configure(fg=FAINT if disabled else TEXT)
+            self.sub.configure(fg=FAINT if disabled else MUTED)
+            for widget in (self, self.icon_box, self.title, self.sub):
+                widget.configure(cursor="arrow" if disabled else "hand2")
+            self._hover(False)
+        if kw or cnf:
+            return tk.Frame.configure(self, cnf, **kw)
+
+    config = configure
+
+
+class Toggle(tk.Frame):
+    """On/off switch bound to a BooleanVar, with an icon and a label."""
+
+    def __init__(self, parent, text, variable, image=None, bg=CARD):
+        super().__init__(parent, bg=bg, cursor="hand2")
+        self.var = variable
+        self._state = "normal"
+        self.switch = tk.Label(self, bg=bg)
+        self.switch.pack(side="left")
+        parts = [self.switch]
+        if image is not None:
+            self.img = tk.Label(self, image=image, bg=bg)
+            self.img.pack(side="left", padx=(S(8), 0))
+            parts.append(self.img)
+        self.label = tk.Label(self, text=text, font=F_BODY, fg=TEXT, bg=bg)
+        self.label.pack(side="left", padx=(S(5), 0))
+        parts.append(self.label)
+        for widget in [self] + parts:
+            widget.bind("<Button-1>", self._toggle)
+        variable.trace_add("write", lambda *a: self._draw())
+        self._draw()
+
+    def _toggle(self, event=None):
+        if self._state != "disabled":
+            self.var.set(not self.var.get())
+
+    def _draw(self):
+        enabled = self._state != "disabled"
+        self.switch.configure(image=switch_image(bool(self.var.get()), enabled))
+        self.label.configure(fg=TEXT if enabled else FAINT)
+
+    def configure(self, cnf=None, **kw):
+        state = kw.pop("state", None)
+        if state is not None:
+            self._state = state
+            self._draw()
+            for widget in self.winfo_children() + [self]:
+                widget.configure(cursor="arrow" if state == "disabled" else "hand2")
+        if kw or cnf:
+            return tk.Frame.configure(self, cnf, **kw)
+
+    config = configure
+
+
+class Card(tk.Frame):
+    """White section card with a clear heading and optional badge."""
+
+    def __init__(self, parent, title, badge=None):
+        super().__init__(parent, bg=CARD, highlightthickness=1, highlightbackground=BORDER)
+        head = tk.Frame(self, bg=CARD)
+        head.pack(fill="x", padx=S(20), pady=(S(11), S(8)))
+        tk.Frame(head, bg=ACCENT, width=S(4), height=S(16)).pack(side="left", padx=(0, S(8)))
+        tk.Label(head, text=title.upper(), font=F_SECTION, fg=TEXT, bg=CARD).pack(side="left")
+        self.badge = tk.Label(head, font=F_SECTION, bg=ACCENT_SOFT, fg=ACCENT, padx=S(8), pady=S(1))
+        if badge:
+            self.set_badge(badge)
+        # divider between heading and content
+        tk.Frame(self, bg="#E3E6EC", height=1).pack(fill="x", padx=S(20))
+        self.body = tk.Frame(self, bg=CARD)
+        self.body.pack(fill="x", padx=S(20), pady=(S(11), S(14)))
+
+    def set_badge(self, text, warn=False):
+        self.badge.configure(text=text, bg=RED_SOFT if warn else ACCENT_SOFT,
+                             fg=RED if warn else ACCENT)
+        self.badge.pack(side="right")
+
+
+def styled_entry(parent, variable, readonly=False):
+    entry = tk.Entry(parent, textvariable=variable, font=F_BODY, fg=TEXT, bg=CARD,
+                     relief="flat", bd=0, highlightthickness=S(2) if S(2) > 1 else 1,
+                     highlightbackground=FIELD_BORDER, highlightcolor=ACCENT,
+                     insertbackground=TEXT, readonlybackground=FIELD_READONLY,
+                     disabledforeground=MUTED)
+    if readonly:
+        entry.configure(state="readonly")
+    return entry
+
+
+# Window icon (title bar / taskbar when running as a script)
+try:
+    root.iconphoto(True, icon("logo", size=32))
+except Exception:
+    pass
+
+
 # Everything in the normal window lives in main_frame, so it can be
 # swapped for the small control bar while recording.
-main_frame = tk.Frame(root)
+main_frame = tk.Frame(root, bg=BG)
 main_frame.pack()
+
+
+# ============================================================
+# Header
+# ============================================================
+
+header = tk.Frame(main_frame, bg=HEADER_BG)
+header.pack(fill="x")
+
+header_inner = tk.Frame(header, bg=HEADER_BG)
+header_inner.pack(fill="x", padx=S(24), pady=S(14))
+
+tk.Label(header_inner, image=icon("logo", size=40), bg=HEADER_BG).pack(side="left")
+
+header_text = tk.Frame(header_inner, bg=HEADER_BG)
+header_text.pack(side="left", padx=(S(12), 0))
+tk.Label(header_text, text="Screen Capture Utility", font=F_TITLE,
+         fg="white", bg=HEADER_BG).pack(anchor="w")
+header_subtitle = tk.Label(header_text,
+                           text="Screenshots, recordings with sound, and Word reports",
+                           font=F_SUB, fg=HEADER_SUB, bg=HEADER_BG)
+header_subtitle.pack(anchor="w")
+
+# thin accent line under the header
+tk.Frame(main_frame, bg=ACCENT, height=S(3)).pack(fill="x")
+
+content = tk.Frame(main_frame, bg=BG)
+content.pack(fill="both", padx=S(24), pady=(S(16), S(4)))
+
+
+# ============================================================
+# Save Location Card
+# ============================================================
+
+folder_card = Card(content, "Save location")
+folder_card.pack(fill="x", pady=(0, S(12)))
+
+entry_row = tk.Frame(folder_card.body, bg=CARD)
+entry_row.pack(fill="x")
+
+tk.Label(entry_row, image=icon("folder", ACCENT, 18), bg=CARD).pack(side="left", padx=(0, S(8)))
+
+folder_entry = styled_entry(entry_row, folder_var)
+folder_entry.configure(width=64)
+folder_entry.pack(side="left", fill="x", expand=True, ipady=S(5), ipadx=S(4))
+
+browse_button = FlatButton(entry_row, "Browse", browse_folder, style="primary")
+browse_button.pack(side="left", padx=(S(8), 0))
+
+
+# ============================================================
+# Word Document Card
+# ============================================================
+
+word_frame = Card(content, "Word document", badge="Optional")
+word_frame.pack(fill="x", pady=(0, S(12)))
+
+word_hint_label = tk.Label(
+    word_frame.body,
+    text="Screenshots are added to this document in the order you take them.",
+    font=F_TILE_SUB, fg=MUTED, bg=CARD)
+word_hint_label.pack(anchor="w", pady=(0, S(6)))
+
+doc_row = tk.Frame(word_frame.body, bg=CARD)
+doc_row.pack(fill="x")
+
+tk.Label(doc_row, image=icon("doc", ACCENT, 18), bg=CARD).pack(side="left", padx=(0, S(8)))
+
+doc_entry = styled_entry(doc_row, doc_var, readonly=True)
+doc_entry.pack(side="left", fill="x", expand=True, ipady=S(5), ipadx=S(4))
+
+select_doc_button = FlatButton(doc_row, "Select", select_word_document)
+select_doc_button.pack(side="left", padx=(S(8), 0))
+
+new_doc_button = FlatButton(doc_row, "New", new_word_document)
+new_doc_button.pack(side="left", padx=(S(6), 0))
+
+clear_doc_button = FlatButton(doc_row, "Clear", clear_word_document)
+clear_doc_button.pack(side="left", padx=(S(6), 0))
+
+doc_options_row = tk.Frame(word_frame.body, bg=CARD)
+doc_options_row.pack(fill="x", pady=(S(8), 0))
+
+keep_png_check = Toggle(doc_options_row, "Also save separate .png files", keep_png_var)
+keep_png_check.pack(side="left")
+
+open_doc_button = FlatButton(doc_options_row, "Open Document", open_word_document)
+open_doc_button.pack(side="right")
+
+save_pending_button = FlatButton(doc_options_row, "Save to Word now",
+                                 lambda: flush_pending(interactive=True))
+save_pending_button.pack(side="right", padx=(0, S(6)))
+
+if not DOCX_AVAILABLE:
+    for widget in (select_doc_button, new_doc_button):
+        widget.config(state="disabled")
+    word_frame.set_badge("Unavailable - python-docx not installed", warn=True)
+
+
+# ============================================================
+# Screenshot Card
+# ============================================================
+
+shot_card = Card(content, "Screenshot", badge="PNG / Word")
+shot_card.pack(fill="x", pady=(0, S(12)))
+
+shot_tiles = tk.Frame(shot_card.body, bg=CARD)
+shot_tiles.pack(fill="x")
+shot_tiles.columnconfigure((0, 1), weight=1, uniform="tiles")
+
+capture_button = Tile(shot_tiles, icon("screen", ACCENT, 24), "Capture Screen",
+                      "Entire desktop  ·  Ctrl+Shift+F", capture_screen)
+capture_button.grid(row=0, column=0, sticky="nsew", padx=(0, S(8)))
+
+region_button = Tile(shot_tiles, icon("region", ACCENT, 24), "Capture Region",
+                     "Drag to select  ·  Ctrl+Shift+R", select_region)
+region_button.grid(row=0, column=1, sticky="nsew", padx=(S(8), 0))
+
+
+# ============================================================
+# Recording Card
+# ============================================================
+
+record_frame = Card(content, "Screen recording", badge="MP4")
+record_frame.pack(fill="x", pady=(0, S(12)))
+
+record_tiles = tk.Frame(record_frame.body, bg=CARD)
+record_tiles.pack(fill="x")
+record_tiles.columnconfigure((0, 1), weight=1, uniform="tiles")
+
+record_button = Tile(record_tiles, icon("record", TEXT, 24), "Record Screen",
+                     "Full screen  ·  Ctrl+Shift+V", toggle_screen_recording,
+                     hover_border=RED)
+record_button.grid(row=0, column=0, sticky="nsew", padx=(0, S(6)))
+
+record_region_button = Tile(record_tiles, icon("record_region", TEXT, 24), "Record Region",
+                            "Drag to select an area", record_region,
+                            hover_border=RED)
+record_region_button.grid(row=0, column=1, sticky="nsew", padx=(S(6), 0))
+
+# Sound options
+mic_var = tk.BooleanVar(value=AUDIO_AVAILABLE)
+system_audio_var = tk.BooleanVar(value=AUDIO_AVAILABLE)
+
+audio_row = tk.Frame(record_frame.body, bg=CARD)
+audio_row.pack(fill="x", pady=(S(10), 0))
+
+tk.Label(audio_row, text="Sound", font=F_BODY_BOLD, fg=TEXT, bg=CARD).pack(side="left", padx=(0, S(12)))
+
+mic_check = Toggle(audio_row, "Microphone", mic_var, image=icon("mic", MUTED, 16))
+mic_check.pack(side="left", padx=(0, S(16)))
+
+system_audio_check = Toggle(audio_row, "Computer sound", system_audio_var,
+                            image=icon("speaker", MUTED, 16))
+system_audio_check.pack(side="left")
+
+if not AUDIO_AVAILABLE:
+    mic_check.config(state="disabled")
+    system_audio_check.config(state="disabled")
+    tk.Label(audio_row, text="unavailable", font=F_TILE_SUB, fg=FAINT, bg=CARD).pack(side="left", padx=(S(10), 0))
+
+if not RECORDING_AVAILABLE:
+    record_button.config(state="disabled")
+    record_region_button.config(state="disabled")
+    record_frame.set_badge("Unavailable - see console", warn=True)
+
+
+# ============================================================
+# Status Bar
+# ============================================================
+
+status_bar = tk.Frame(main_frame, bg=CARD, highlightthickness=1, highlightbackground=BORDER)
+status_bar.pack(fill="x", side="bottom")
+
+status_dot = tk.Label(status_bar, bg=CARD)
+status_dot.pack(side="left", anchor="n", padx=(S(16), S(8)), pady=(S(13), 0))
+
+status_label = tk.Label(
+    status_bar,
+    textvariable=status_var,
+    font=F_BODY,
+    fg=TEXT,
+    bg=CARD,
+    height=3,
+    justify="left",
+    anchor="w"
+)
+status_label.pack(side="left", fill="x", expand=True, padx=(0, S(16)), pady=S(6))
+
+
+def update_status_dot(*args):
+    """Colour the status dot by message type: green = done,
+    amber = busy or needs attention, red = problem, indigo = info."""
+    text = status_var.get().strip().lower()
+    if (text.startswith(("recording failed", "could not", "error"))
+            or "cancelled" in text or "too small" in text):
+        color = RED
+    elif text.startswith(("saving recording", "finishing")) or "waiting" in text:
+        color = AMBER
+    elif text.startswith(("saved:", "added ")):
+        color = GREEN
+    else:
+        color = ACCENT
+    status_dot.configure(image=icon("dot", color, 10))
+
+
+status_var.trace_add("write", update_status_dot)
+update_status_dot()
+
+
+def fit_status_wrap(event=None):
+    status_label.config(wraplength=max(S(200), root.winfo_width() - S(70)))
+
+
+root.after(100, fit_status_wrap)
+
+
+def fit_to_screen():
+    """On small or highly scaled screens, drop two decorative lines so the
+    whole window fits above the taskbar."""
+    root.update_idletasks()
+    available = root.winfo_screenheight() - S(90)   # taskbar + title bar
+    if root.winfo_reqheight() > available:
+        word_hint_label.pack_forget()
+        header_subtitle.pack_forget()
+
+
+fit_to_screen()
 
 
 # ============================================================
 # Recording Control Bar (shown only while recording)
 # ============================================================
 
-rec_bar = tk.Frame(root, bg=BAR_BG, padx=10, pady=8)
+rec_bar = tk.Frame(root, bg=BAR_BG, padx=S(12), pady=S(10))
 
-rec_dot = tk.Canvas(rec_bar, width=14, height=14, bg=BAR_BG,
+rec_dot = tk.Canvas(rec_bar, width=S(14), height=S(14), bg=BAR_BG,
                     highlightthickness=0)
-rec_dot_id = rec_dot.create_oval(2, 2, 13, 13, fill=DOT_ON, outline="")
-rec_dot.pack(side="left", padx=(0, 6))
+rec_dot_id = rec_dot.create_oval(S(2), S(2), S(13), S(13), fill=DOT_ON, outline="")
+rec_dot.pack(side="left", padx=(0, S(8)))
 
 rec_time_label = tk.Label(rec_bar, text="00:00", fg="white", bg=BAR_BG,
-                          font=("Segoe UI", 11, "bold"), width=7, anchor="w")
-rec_time_label.pack(side="left", padx=(0, 8))
+                          font=F_TIMER, width=8, anchor="w")
+rec_time_label.pack(side="left", padx=(0, S(10)))
 
-rec_pause_button = tk.Button(
-    rec_bar, text="Pause", command=toggle_pause,
-    bg="#3c4043", fg="white", activebackground="#5f6368",
-    activeforeground="white", relief="flat", bd=0, padx=10, pady=3,
-    font=("Segoe UI", 9, "bold"), cursor="hand2", width=9
+rec_pause_button = FlatButton(
+    rec_bar, "Pause", toggle_pause, style="dark",
+    icons={"Pause": icon("pause", "white", 14), "Resume": icon("play", "white", 14)},
+    width=S(88), padx=S(10), pady=S(5),
 )
-rec_pause_button.pack(side="left", padx=(0, 6))
+rec_pause_button.pack(side="left", padx=(0, S(8)))
 
-rec_stop_button = tk.Button(
-    rec_bar, text="Stop", command=stop_recording,
-    bg="#d93025", fg="white", activebackground="#b3261e",
-    activeforeground="white", relief="flat", bd=0, padx=10, pady=3,
-    font=("Segoe UI", 9, "bold"), cursor="hand2", width=7
+rec_stop_button = FlatButton(
+    rec_bar, "Stop", stop_recording, style="danger",
+    icons={"Stop": icon("stop", "white", 14)},
+    width=S(76), padx=S(10), pady=S(5),
 )
 rec_stop_button.pack(side="left")
-
-
-# ============================================================
-# Save Folder Row
-# ============================================================
-
-folder_frame = tk.Frame(main_frame)
-folder_frame.pack(pady=(15, 5), padx=15, fill="x")
-
-tk.Label(folder_frame, text="Save folder:").pack(anchor="w")
-
-entry_row = tk.Frame(folder_frame)
-entry_row.pack(fill="x")
-
-folder_entry = tk.Entry(entry_row, textvariable=folder_var, width=50)
-folder_entry.pack(side="left", fill="x", expand=True, ipady=3)
-
-browse_button = tk.Button(
-    entry_row,
-    text="Browse...",
-    command=browse_folder
-)
-browse_button.pack(side="left", padx=(5, 0))
-
-
-# ============================================================
-# Word Document Row
-# ============================================================
-
-word_frame = tk.LabelFrame(
-    main_frame,
-    text="Word document (optional) - screenshots are added in capture order",
-    padx=10,
-    pady=8
-)
-word_frame.pack(pady=(10, 5), padx=15, fill="x")
-
-doc_row = tk.Frame(word_frame)
-doc_row.pack(fill="x")
-
-doc_entry = tk.Entry(doc_row, textvariable=doc_var, state="readonly")
-doc_entry.pack(side="left", fill="x", expand=True, ipady=3)
-
-select_doc_button = tk.Button(doc_row, text="Select...",
-                              command=select_word_document)
-select_doc_button.pack(side="left", padx=(5, 0))
-
-new_doc_button = tk.Button(doc_row, text="New...",
-                           command=new_word_document)
-new_doc_button.pack(side="left", padx=(5, 0))
-
-clear_doc_button = tk.Button(doc_row, text="Clear",
-                             command=clear_word_document)
-clear_doc_button.pack(side="left", padx=(5, 0))
-
-doc_options_row = tk.Frame(word_frame)
-doc_options_row.pack(fill="x", pady=(6, 0))
-
-keep_png_check = tk.Checkbutton(
-    doc_options_row,
-    text="Also save separate .png files",
-    variable=keep_png_var
-)
-keep_png_check.pack(side="left")
-
-open_doc_button = tk.Button(doc_options_row, text="Open Document",
-                            command=open_word_document)
-open_doc_button.pack(side="right")
-
-save_pending_button = tk.Button(doc_options_row, text="Save to Word now",
-                                command=lambda: flush_pending(interactive=True))
-save_pending_button.pack(side="right", padx=(0, 5))
-
-if not DOCX_AVAILABLE:
-    for widget in (select_doc_button, new_doc_button):
-        widget.config(state="disabled")
-    word_frame.config(text="Word document - unavailable (python-docx not installed)")
-
-
-# ============================================================
-# Screenshot Buttons
-# ============================================================
-
-screenshot_frame = tk.LabelFrame(main_frame, text="Screenshot", padx=10, pady=8)
-screenshot_frame.pack(pady=5, padx=15, fill="x")
-
-capture_button = tk.Button(
-    screenshot_frame,
-    text="Capture Screen",
-    command=capture_screen,
-    width=18,
-    height=2
-)
-capture_button.pack(side="left", expand=True)
-
-region_button = tk.Button(
-    screenshot_frame,
-    text="Capture Region",
-    command=select_region,
-    width=18,
-    height=2
-)
-region_button.pack(side="left", expand=True)
-
-
-# ============================================================
-# Recording Buttons
-# ============================================================
-
-record_frame = tk.LabelFrame(main_frame, text="Screen Recording (.mp4)", padx=10, pady=8)
-record_frame.pack(pady=5, padx=15, fill="x")
-
-record_button = tk.Button(
-    record_frame,
-    text="Record Screen",
-    command=toggle_screen_recording,
-    width=18,
-    height=2
-)
-record_button.pack(side="left", expand=True)
-
-record_region_button = tk.Button(
-    record_frame,
-    text="Record Region",
-    command=record_region,
-    width=18,
-    height=2
-)
-record_region_button.pack(side="left", expand=True)
-
-if not RECORDING_AVAILABLE:
-    record_button.config(state="disabled")
-    record_region_button.config(state="disabled")
-    record_frame.config(text="Screen Recording (.mp4) - unavailable, see console")
-
-
-# ============================================================
-# Status Line
-# ============================================================
-
-status_label = tk.Label(
-    main_frame,
-    textvariable=status_var,
-    fg="gray25",
-    height=3,
-    justify="center"
-)
-status_label.pack(pady=(5, 10), padx=15, fill="x")
-
-
-def fit_status_wrap(event=None):
-    status_label.config(wraplength=max(200, root.winfo_width() - 40))
-
-
-root.after(100, fit_status_wrap)
 
 update_word_controls()
 
