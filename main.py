@@ -1,6 +1,6 @@
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
-from PIL import Image, ImageGrab, ImageOps, ImageFilter
+from PIL import Image, ImageGrab, ImageOps, ImageFilter, ImageDraw, ImageChops
 from datetime import datetime
 from pathlib import Path
 from dataclasses import dataclass
@@ -48,8 +48,17 @@ def ensure_package(import_name, pip_name):
             return None
 
 
-np = ensure_package("numpy", "numpy")
-cv2 = ensure_package("cv2", "opencv-python")
+def optional_import(import_name):
+    """Import a package if it happens to be installed (never installs it)."""
+    try:
+        return importlib.import_module(import_name)
+    except ImportError:
+        return None
+
+
+# Only used as a fallback for recording when ffmpeg is missing - optional.
+np = optional_import("numpy")
+cv2 = optional_import("cv2")
 docx = ensure_package("docx", "python-docx")
 
 # ffmpeg (bundled with imageio-ffmpeg) encodes the video as H.264 and
@@ -378,7 +387,22 @@ def append_captures_to_docx(path, captures):
         # proportions, but never enlarge it beyond its real size.
         w_px, h_px = capture.size
         width = min(usable_w, w_px * EMU_PER_PIXEL)
-        if width * h_px / w_px > max_h:
+        fitted_h = width * h_px / w_px
+
+        if fitted_h > max_h and max_h / fitted_h < 0.6:
+            # Very tall (e.g. a full-page capture): keep it readable by
+            # splitting it into page-sized slices at full width
+            slice_px = max(1, int(max_h * w_px / width))
+            with Image.open(BytesIO(capture.png)) as tall:
+                for top_px in range(0, h_px, slice_px):
+                    part = tall.crop((0, top_px, w_px, min(h_px, top_px + slice_px)))
+                    buffer = BytesIO()
+                    part.save(buffer, format="PNG")
+                    buffer.seek(0)
+                    doc.add_picture(buffer, width=Emu(int(width)))
+            continue
+
+        if fitted_h > max_h:
             width = max_h * w_px / h_px
 
         doc.add_picture(BytesIO(capture.png), width=Emu(int(width)))
@@ -1024,11 +1048,11 @@ def deliver_capture(image, kind, taken_at):
         # open after the main window has been restored, so the editor is on top
         root.after(50, lambda: BlurEditor(
             image,
-            on_save=lambda result: handle_capture(result, kind, taken_at),
+            on_save=lambda result: annotate_then_save(result, kind, taken_at),
             title=f"{kind} capture",
         ))
     else:
-        handle_capture(image, kind, taken_at)
+        annotate_then_save(image, kind, taken_at)
 
 
 def blur_existing_image():
@@ -1112,15 +1136,28 @@ class BlurEditor:
         left, top, width, height = screen_work_area()
         max_w, max_h = int(width * 0.82), int(height * 0.62)
         iw, ih = self.original.size
-        self.scale = min(1.0, max_w / iw, max_h / ih)
+        width_scale = min(1.0, max_w / iw)
+        # Tall images (full-page captures) are shown at a readable width
+        # with a scrollbar instead of being squeezed to fit the screen
+        self.tall = ih * width_scale > max_h * 1.3
+        self.scale = width_scale if self.tall else min(1.0, max_w / iw, max_h / ih)
         self.view_w = max(1, int(iw * self.scale))
         self.view_h = max(1, int(ih * self.scale))
 
         frame = tk.Frame(body, bg=CARD, highlightthickness=1, highlightbackground=FIELD_BORDER)
         frame.pack()
-        self.canvas = tk.Canvas(frame, width=self.view_w, height=self.view_h,
-                                bg="#2A2F3A", highlightthickness=0, cursor="crosshair")
-        self.canvas.pack()
+        self.canvas = tk.Canvas(frame, width=self.view_w, height=min(self.view_h, max_h),
+                                bg="#2A2F3A", highlightthickness=0, cursor="crosshair",
+                                scrollregion=(0, 0, self.view_w, self.view_h))
+        if self.tall:
+            scroll = tk.Scrollbar(frame, orient="vertical", command=self.canvas.yview)
+            self.canvas.configure(yscrollcommand=scroll.set)
+            scroll.pack(side="right", fill="y")
+            self.canvas.bind("<MouseWheel>", lambda e: self.canvas.yview_scroll(
+                int(-e.delta / 120) * 3, "units"))
+            self.canvas.bind("<Button-4>", lambda e: self.canvas.yview_scroll(-3, "units"))
+            self.canvas.bind("<Button-5>", lambda e: self.canvas.yview_scroll(3, "units"))
+        self.canvas.pack(side="left")
         self.image_item = self.canvas.create_image(0, 0, anchor="nw")
 
         self.canvas.bind("<ButtonPress-1>", self._press)
@@ -1183,7 +1220,8 @@ class BlurEditor:
     def redraw(self):
         view = self.working
         if self.scale < 1.0:
-            view = view.resize((self.view_w, self.view_h), Image.LANCZOS)
+            view = view.resize((self.view_w, self.view_h),
+                               Image.BILINEAR if self.tall else Image.LANCZOS)
         self.photo = ImageTk.PhotoImage(view)
         self.canvas.itemconfigure(self.image_item, image=self.photo)
 
@@ -1205,14 +1243,24 @@ class BlurEditor:
     def _clamp(self, x, y):
         return (min(max(x, 0), self.view_w), min(max(y, 0), self.view_h))
 
+    def _point(self, event):
+        """Mouse position in image-view coordinates (accounts for scrolling)."""
+        return self._clamp(self.canvas.canvasx(event.x), self.canvas.canvasy(event.y))
+
     def _press(self, event):
-        self.drag_start = self._clamp(event.x, event.y)
+        self.drag_start = self._point(event)
         self.drag_rect = self.canvas.create_rectangle(
             *self.drag_start, *self.drag_start, outline=RED, width=2, dash=(5, 3))
 
     def _drag(self, event):
         if self.drag_rect is not None:
-            x, y = self._clamp(event.x, event.y)
+            # scroll while dragging near the top/bottom edge of a tall image
+            if self.tall:
+                if event.y < S(24):
+                    self.canvas.yview_scroll(-1, "units")
+                elif event.y > self.canvas.winfo_height() - S(24):
+                    self.canvas.yview_scroll(1, "units")
+            x, y = self._point(event)
             self.canvas.coords(self.drag_rect, *self.drag_start, x, y)
 
     def _release(self, event):
@@ -1221,7 +1269,7 @@ class BlurEditor:
         self.canvas.delete(self.drag_rect)
         self.drag_rect = None
         x0, y0 = self.drag_start
-        x1, y1 = self._clamp(event.x, event.y)
+        x1, y1 = self._point(event)
 
         # canvas -> image coordinates
         iw, ih = self.original.size
@@ -1287,6 +1335,997 @@ class BlurEditor:
 
 
 # ============================================================
+# Annotate (Highlighter, Pen, Shapes)
+# ============================================================
+# A separate step from Blur. When "Annotate before saving" is on, each
+# screenshot opens in the Annotate window (after the Blur window, if that
+# is on too): highlight text, write or draw with a pen, and add
+# rectangles, rounded rectangles and circles in any colour / thickness.
+
+def annotate_then_save(image, kind, taken_at):
+    """Open the Annotate window if switched on, then save."""
+    if annotate_review_var.get():
+        root.after(50, lambda: AnnotateEditor(
+            image,
+            on_save=lambda result: handle_capture(result, kind, taken_at),
+            title=f"{kind} capture",
+        ))
+    else:
+        handle_capture(image, kind, taken_at)
+
+
+def annotate_existing_image():
+    """Pick a saved image, annotate it and save a copy."""
+    folder = save_folder or (word_doc_path.parent if word_doc_path else Path.home())
+    path = filedialog.askopenfilename(
+        parent=root,
+        title="Choose an image to annotate",
+        initialdir=str(folder),
+        filetypes=[("Images", "*.png *.jpg *.jpeg *.bmp *.gif *.tif *.tiff *.webp"),
+                   ("All files", "*.*")])
+    if not path:
+        return
+    path = Path(path)
+    try:
+        with Image.open(path) as img:
+            image = img.convert("RGB")
+    except Exception as e:
+        messagebox.showerror("Could not open image", str(e), parent=root)
+        return
+
+    def save_copy(result):
+        target = filedialog.asksaveasfilename(
+            parent=root,
+            title="Save annotated image",
+            initialdir=str(path.parent),
+            initialfile=f"{path.stem}_annotated.png",
+            defaultextension=".png",
+            filetypes=[("PNG image", "*.png"), ("JPEG image", "*.jpg *.jpeg")])
+        if not target:
+            return False
+        try:
+            result.save(target)
+            status_var.set(f"Saved: {Path(target).name}")
+            return True
+        except Exception as e:
+            messagebox.showerror("Could not save", str(e), parent=root)
+            return False
+
+    AnnotateEditor(image, on_save=save_copy, title=path.name, save_label="Save copy")
+
+
+class AnnotateEditor:
+    """Annotation editor: highlighter, pen and shapes.
+
+    Tools (keyboard shortcut):
+      Highlighter (H)  Pen (P)  Rectangle (R)
+      Rounded rectangle (U)  Circle / ellipse (E)
+    Hold Shift while drawing a shape for a perfect square / circle.
+    Ctrl+Z undoes the last change, Enter saves, Esc cancels.
+    """
+
+    TOOLS = [
+        ("highlight", "Highlighter", "H"),
+        ("pen", "Pen", "P"),
+        ("rect", "Rectangle", "R"),
+        ("roundrect", "Rounded", "U"),
+        ("ellipse", "Circle", "E"),
+    ]
+    COLORS = ["#E5484D", "#F97316", "#FACC15", "#22C55E", "#3B82F6",
+              "#8B5CF6", "#EC4899", "#111827", "#FFFFFF"]
+    # thickness choices in screen pixels (what you see while drawing)
+    SIZES = {"highlight": [10, 16, 24, 34, 46], "default": [2, 3, 5, 8, 12]}
+
+    def __init__(self, image, on_save, title="", save_label="Save"):
+        self.original = image.convert("RGB")
+        self.on_save = on_save
+        self.ops = []                    # everything drawn, in order (for undo)
+        self.drag_start = None
+        self.preview = []                # canvas items while drawing
+        self.stroke = []                 # points of the current pen/highlighter stroke
+        self.photo = None
+        self.tool = "highlight"
+        self.settings = {                # colour / size remembered per tool
+            "highlight": {"color": "#FACC15", "size": 1},
+            "pen": {"color": "#E5484D", "size": 1},
+            "rect": {"color": "#E5484D", "size": 1},
+            "roundrect": {"color": "#3B82F6", "size": 1},
+            "ellipse": {"color": "#E5484D", "size": 1},
+        }
+
+        self.win = tk.Toplevel(root)
+        self.win.title("Annotate screenshot")
+        self.win.configure(bg=BG)
+        self.win.transient(root)
+        self.win.protocol("WM_DELETE_WINDOW", self.cancel)
+
+        # --- header ---------------------------------------------------
+        head = tk.Frame(self.win, bg=HEADER_BG)
+        head.pack(fill="x")
+        inner = tk.Frame(head, bg=HEADER_BG)
+        inner.pack(fill="x", padx=S(20), pady=S(10))
+        tk.Label(inner, image=icon("pen", "white", 22), bg=HEADER_BG).pack(side="left")
+        titles = tk.Frame(inner, bg=HEADER_BG)
+        titles.pack(side="left", padx=(S(10), 0))
+        tk.Label(titles, text="Annotate" + (f"  ·  {title}" if title else ""),
+                 font=F_TILE, fg="white", bg=HEADER_BG).pack(anchor="w")
+        tk.Label(titles,
+                 text="Highlight, draw and add shapes.  Shift = square/circle.  "
+                      "Ctrl+Z = undo.",
+                 font=F_TILE_SUB, fg=HEADER_SUB, bg=HEADER_BG).pack(anchor="w")
+        self.info = tk.Label(inner, text="", font=F_TILE_SUB, fg=HEADER_SUB, bg=HEADER_BG)
+        self.info.pack(side="right")
+        tk.Frame(self.win, bg=ACCENT, height=S(3)).pack(fill="x")
+
+        body = tk.Frame(self.win, bg=BG)
+        body.pack(fill="both", expand=True, padx=S(16), pady=S(10))
+
+        # --- toolbar row 1: tools + undo/clear ------------------------
+        bar1 = tk.Frame(body, bg=CARD, highlightthickness=1, highlightbackground=BORDER)
+        bar1.pack(fill="x")
+        tools = tk.Frame(bar1, bg=CARD)
+        tools.pack(side="left", padx=S(8), pady=S(6))
+        self.tool_buttons = {}
+        for key, label, shortcut in self.TOOLS:
+            b = tk.Label(tools, image=icon(key, TEXT, 18),
+                         text=f" {label}", compound="left", font=F_BODY_BOLD,
+                         bg=CARD, fg=TEXT, padx=S(9), pady=S(5), cursor="hand2",
+                         highlightthickness=1, highlightbackground=CARD)
+            b.pack(side="left", padx=S(2))
+            b.bind("<Button-1>", lambda e, k=key: self.select_tool(k))
+            b.bind("<Enter>", lambda e, k=key: self._tool_hover(k, True))
+            b.bind("<Leave>", lambda e, k=key: self._tool_hover(k, False))
+            self.tool_buttons[key] = b
+            self.win.bind(f"<KeyPress-{shortcut.lower()}>", lambda e, k=key: self.select_tool(k))
+
+        self.clear_button = FlatButton(bar1, "Clear all", self.clear)
+        self.clear_button.pack(side="right", padx=(S(4), S(8)))
+        self.undo_button = FlatButton(bar1, "Undo", self.undo)
+        self.undo_button.pack(side="right")
+
+        # --- toolbar row 2: colour and thickness -----------------------
+        bar2 = tk.Frame(body, bg=CARD, highlightthickness=1, highlightbackground=BORDER)
+        bar2.pack(fill="x", pady=(S(6), 0))
+
+        self.color_frame = tk.Frame(bar2, bg=CARD)
+        self.color_frame.pack(side="left", padx=S(10), pady=S(7))
+        tk.Label(self.color_frame, text="Colour", font=F_BODY_BOLD, fg=TEXT,
+                 bg=CARD).pack(side="left", padx=(0, S(8)))
+        self.swatches = {}
+        for color in self.COLORS:
+            sw = tk.Frame(self.color_frame, bg=color, width=S(20), height=S(20),
+                          highlightthickness=2, highlightbackground=CARD,
+                          cursor="hand2")
+            sw.pack(side="left", padx=S(2))
+            sw.bind("<Button-1>", lambda e, c=color: self.set_color(c))
+            self.swatches[color] = sw
+        self.custom_swatch = tk.Label(self.color_frame, text="+", font=F_BODY_BOLD,
+                                      bg=CARD, fg=TEXT, width=2, cursor="hand2",
+                                      highlightthickness=2, highlightbackground=FIELD_BORDER)
+        self.custom_swatch.pack(side="left", padx=(S(4), 0))
+        self.custom_swatch.bind("<Button-1>", lambda e: self.pick_custom_color())
+
+        self.size_frame = tk.Frame(bar2, bg=CARD)
+        self.size_frame.pack(side="left", padx=S(14), pady=S(7))
+        tk.Label(self.size_frame, text="Thickness", font=F_BODY_BOLD, fg=TEXT,
+                 bg=CARD).pack(side="left", padx=(0, S(8)))
+        self.size_buttons = []
+        for i in range(5):
+            b = tk.Label(self.size_frame, image=size_dot_image(i, False), bg=CARD,
+                         cursor="hand2")
+            b.pack(side="left", padx=S(1))
+            b.bind("<Button-1>", lambda e, i=i: self.set_size(i))
+            self.size_buttons.append(b)
+
+        # --- image canvas -------------------------------------------
+        left, top, width, height = screen_work_area()
+        max_w, max_h = int(width * 0.82), int(height * 0.56)
+        iw, ih = self.original.size
+        width_scale = min(1.0, max_w / iw)
+        # Tall images (full-page captures) are shown at a readable width
+        # with a scrollbar instead of being squeezed to fit the screen
+        self.tall = ih * width_scale > max_h * 1.3
+        self.scale = width_scale if self.tall else min(1.0, max_w / iw, max_h / ih)
+        self.view_w = max(1, int(iw * self.scale))
+        self.view_h = max(1, int(ih * self.scale))
+
+        frame = tk.Frame(body, bg=CARD, highlightthickness=1, highlightbackground=FIELD_BORDER)
+        frame.pack(pady=(S(10), 0))
+        self.canvas = tk.Canvas(frame, width=self.view_w, height=min(self.view_h, max_h),
+                                bg="#2A2F3A", highlightthickness=0, cursor="crosshair",
+                                scrollregion=(0, 0, self.view_w, self.view_h))
+        if self.tall:
+            scroll = tk.Scrollbar(frame, orient="vertical", command=self.canvas.yview)
+            self.canvas.configure(yscrollcommand=scroll.set)
+            scroll.pack(side="right", fill="y")
+            self.canvas.bind("<MouseWheel>", lambda e: self.canvas.yview_scroll(
+                int(-e.delta / 120) * 3, "units"))
+            self.canvas.bind("<Button-4>", lambda e: self.canvas.yview_scroll(-3, "units"))
+            self.canvas.bind("<Button-5>", lambda e: self.canvas.yview_scroll(3, "units"))
+        self.canvas.pack(side="left")
+        self.image_item = self.canvas.create_image(0, 0, anchor="nw")
+
+        self.canvas.bind("<ButtonPress-1>", self._press)
+        self.canvas.bind("<B1-Motion>", self._drag)
+        self.canvas.bind("<ButtonRelease-1>", self._release)
+
+        # --- bottom buttons -----------------------------------------
+        bottom = tk.Frame(body, bg=BG)
+        bottom.pack(fill="x", pady=(S(10), 0))
+        FlatButton(bottom, save_label, self.save, style="primary").pack(side="right")
+        FlatButton(bottom, "Cancel", self.cancel).pack(side="right", padx=(0, S(6)))
+
+        self.win.bind("<Control-z>", lambda e: self.undo())
+        self.win.bind("<Control-Z>", lambda e: self.undo())
+        self.win.bind("<Return>", lambda e: self.save())
+        self.win.bind("<Escape>", lambda e: self.cancel())
+
+        self.working = self.original.copy()
+        self.select_tool("highlight")
+        self.redraw()
+
+        self.win.update_idletasks()
+        w = self.win.winfo_reqwidth()
+        h = self.win.winfo_reqheight() + S(39)
+        self.win.geometry(f"+{left + max(0, (width - w) // 2)}+{top + max(0, (height - h) // 2)}")
+        self.win.lift()
+        self.win.focus_force()
+        self.win.grab_set()   # finish (save/cancel) before doing anything else
+
+    # ---- toolbar ----------------------------------------------------
+
+    def _tool_hover(self, key, on):
+        if key != self.tool:
+            self.tool_buttons[key].configure(bg="#EEF0F4" if on else CARD)
+
+    def select_tool(self, key):
+        self.tool = key
+        for k, b in self.tool_buttons.items():
+            selected = k == key
+            b.configure(bg=ACCENT_SOFT if selected else CARD,
+                        fg=ACCENT if selected else TEXT,
+                        image=icon(k, ACCENT if selected else TEXT, 18),
+                        highlightbackground=ACCENT if selected else CARD)
+        self._show_color_and_size()
+
+    def _show_color_and_size(self):
+        current = self.settings[self.tool]
+        for color, sw in self.swatches.items():
+            sw.configure(highlightbackground=TEXT if color == current["color"] else
+                         (FIELD_BORDER if color == "#FFFFFF" else CARD))
+        custom = current["color"] not in self.swatches
+        self.custom_swatch.configure(
+            bg=current["color"] if custom else CARD,
+            highlightbackground=TEXT if custom else FIELD_BORDER)
+        for i, b in enumerate(self.size_buttons):
+            b.configure(image=size_dot_image(i, i == current["size"]))
+
+    def set_color(self, color):
+        if self.tool in self.settings:
+            self.settings[self.tool]["color"] = color
+            self._show_color_and_size()
+
+    def pick_custom_color(self):
+        from tkinter import colorchooser
+        current = self.settings.get(self.tool, {}).get("color", "#E5484D")
+        result = colorchooser.askcolor(color=current, parent=self.win, title="Choose a colour")
+        if result and result[1]:
+            self.set_color(result[1].upper())
+
+    def set_size(self, index):
+        if self.tool in self.settings:
+            self.settings[self.tool]["size"] = index
+            self._show_color_and_size()
+
+    def _screen_width(self):
+        """Selected thickness in screen pixels."""
+        sizes = self.SIZES["highlight"] if self.tool == "highlight" else self.SIZES["default"]
+        return sizes[self.settings[self.tool]["size"]]
+
+    # ---- drawing ----------------------------------------------------
+
+    def rebuild(self):
+        """Re-apply every change to a fresh copy of the original."""
+        self.working = self.original.copy()
+        for op in self.ops:
+            self._apply(self.working, op)
+
+    def _apply(self, image, op):
+        kind = op["type"]
+        if kind == "highlight":
+            draw_highlight(image, op["points"], op["color"], op["width"])
+        elif kind == "pen":
+            draw_stroke(image, op["points"], op["color"], op["width"])
+        else:
+            draw_shape(image, kind, op["box"], op["color"], op["width"])
+
+    def redraw(self):
+        view = self.working
+        if self.scale < 1.0:
+            view = view.resize((self.view_w, self.view_h),
+                               Image.BILINEAR if self.tall else Image.LANCZOS)
+        self.photo = ImageTk.PhotoImage(view)
+        self.canvas.itemconfigure(self.image_item, image=self.photo)
+
+        n = len(self.ops)
+        self.info.configure(text=f"{n} change{'s' if n != 1 else ''}")
+        state = "normal" if n else "disabled"
+        self.undo_button.config(state=state)
+        self.clear_button.config(state=state)
+
+    # ---- mouse ------------------------------------------------------
+
+    def _clamp(self, x, y):
+        return (min(max(x, 0), self.view_w), min(max(y, 0), self.view_h))
+
+    def _point(self, event):
+        """Mouse position in view coordinates (accounts for scrolling)."""
+        return self._clamp(self.canvas.canvasx(event.x), self.canvas.canvasy(event.y))
+
+    def _shape_end(self, event):
+        """End point of a shape; Shift makes it a square / circle."""
+        x, y = self._point(event)
+        if event.state & 0x0001 and self.tool in ("rect", "roundrect", "ellipse"):
+            x0, y0 = self.drag_start
+            side = max(abs(x - x0), abs(y - y0))
+            x = x0 + side * (1 if x >= x0 else -1)
+            y = y0 + side * (1 if y >= y0 else -1)
+            x, y = self._clamp(x, y)
+        return x, y
+
+    def _clear_preview(self):
+        for item in self.preview:
+            self.canvas.delete(item)
+        self.preview = []
+
+    def _press(self, event):
+        self.drag_start = self._point(event)
+        self.stroke = [self.drag_start]
+        self._clear_preview()
+
+    def _drag(self, event):
+        if self.drag_start is None:
+            return
+        if self.tall:   # scroll while dragging near the top/bottom edge
+            if event.y < S(24):
+                self.canvas.yview_scroll(-1, "units")
+            elif event.y > self.canvas.winfo_height() - S(24):
+                self.canvas.yview_scroll(1, "units")
+
+        tool = self.tool
+        if tool in ("pen", "highlight"):
+            p = self._point(event)
+            last = self.stroke[-1]
+            if abs(p[0] - last[0]) + abs(p[1] - last[1]) < 2:
+                return
+            self.stroke.append(p)
+            setting = self.settings[tool]
+            item = self.canvas.create_line(
+                *last, *p, fill=setting["color"], width=self._screen_width(),
+                capstyle="round", joinstyle="round",
+                stipple="gray50" if tool == "highlight" else "")
+            self.preview.append(item)
+            return
+
+        x0, y0 = self.drag_start
+        x1, y1 = self._shape_end(event)
+        self._clear_preview()
+        setting = self.settings[tool]
+        width = self._screen_width()
+        if tool == "rect":
+            item = self.canvas.create_rectangle(x0, y0, x1, y1, outline=setting["color"], width=width)
+        elif tool == "ellipse":
+            item = self.canvas.create_oval(x0, y0, x1, y1, outline=setting["color"], width=width)
+        else:
+            item = self.canvas.create_polygon(
+                rounded_rect_points(x0, y0, x1, y1, self._corner_radius(x0, y0, x1, y1, width)),
+                smooth=True, fill="", outline=setting["color"], width=width)
+        self.preview.append(item)
+
+    @staticmethod
+    def _corner_radius(x0, y0, x1, y1, width):
+        return min(max(10, width * 3), abs(x1 - x0) / 3, abs(y1 - y0) / 3)
+
+    def _release(self, event):
+        if self.drag_start is None:
+            return
+        tool = self.tool
+        s = self.scale
+        self._clear_preview()
+
+        if tool in ("pen", "highlight"):
+            p = self._point(event)
+            if p != self.stroke[-1]:
+                self.stroke.append(p)
+            setting = self.settings[tool]
+            op = {"type": tool, "color": setting["color"],
+                  "width": max(1, round(self._screen_width() / s)),
+                  "points": [(x / s, y / s) for x, y in self.stroke]}
+        else:
+            x0, y0 = self.drag_start
+            x1, y1 = self._shape_end(event)
+            iw, ih = self.original.size
+            box = (int(min(x0, x1) / s), int(min(y0, y1) / s),
+                   int(round(max(x0, x1) / s)), int(round(max(y0, y1) / s)))
+            box = (max(0, box[0]), max(0, box[1]), min(iw, box[2]), min(ih, box[3]))
+            self.drag_start = None
+            if box[2] - box[0] < 3 or box[3] - box[1] < 3:
+                return
+            setting = self.settings[tool]
+            op = {"type": tool, "box": box, "color": setting["color"],
+                  "width": max(1, round(self._screen_width() / s))}
+
+        self.drag_start = None
+        self.stroke = []
+        self.ops.append(op)
+        self._apply(self.working, op)
+        self.redraw()
+
+    # ---- undo / save ------------------------------------------------
+
+    def undo(self):
+        if self.ops:
+            self.ops.pop()
+            self.rebuild()
+            self.redraw()
+
+    def clear(self):
+        if self.ops:
+            self.ops.clear()
+            self.rebuild()
+            self.redraw()
+
+    def save(self):
+        result = self.working.copy()
+        self.win.grab_release()
+        if self.on_save(result) is False:     # e.g. user cancelled "Save as"
+            self.win.grab_set()
+            return
+        print(f"Saved with {len(self.ops)} annotation(s)")
+        self.win.destroy()
+
+    def cancel(self):
+        if self.ops and not messagebox.askyesno(
+                "Discard screenshot?",
+                "Close without saving? The screenshot will be discarded.",
+                parent=self.win):
+            return
+        self.win.grab_release()
+        self.win.destroy()
+        status_var.set("Screenshot discarded")
+
+
+def rounded_rect_points(x0, y0, x1, y1, r):
+    """Points for a smoothed Tk polygon that looks like a rounded rectangle."""
+    x0, x1 = min(x0, x1), max(x0, x1)
+    y0, y1 = min(y0, y1), max(y0, y1)
+    return [x0 + r, y0, x1 - r, y0, x1, y0, x1, y0 + r, x1, y1 - r, x1, y1,
+            x1 - r, y1, x0 + r, y1, x0, y1, x0, y1 - r, x0, y0 + r, x0, y0]
+
+
+def _hex_rgb(color):
+    color = color.lstrip("#")
+    return tuple(int(color[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def draw_stroke(image, points, color, width):
+    """Freehand pen stroke with round ends and joins."""
+    d = ImageDraw.Draw(image)
+    rgb = _hex_rgb(color)
+    if len(points) > 1:
+        d.line(points, fill=rgb, width=width, joint="curve")
+    r = width / 2
+    for x, y in (points[0], points[-1]) if len(points) > 1 else points:
+        d.ellipse([x - r, y - r, x + r, y + r], fill=rgb)
+
+
+def draw_highlight(image, points, color, width):
+    """Highlighter: colours the background like a real marker while the
+    text underneath stays dark and readable (multiply blend)."""
+    pad = width
+    xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
+    box = (max(0, int(min(xs) - pad)), max(0, int(min(ys) - pad)),
+           min(image.width, int(max(xs) + pad) + 1), min(image.height, int(max(ys) + pad) + 1))
+    if box[2] <= box[0] or box[3] <= box[1]:
+        return
+    region = image.crop(box)
+    mask = Image.new("L", region.size, 0)
+    md = ImageDraw.Draw(mask)
+    local = [(x - box[0], y - box[1]) for x, y in points]
+    if len(local) > 1:
+        md.line(local, fill=255, width=width, joint="curve")
+    r = width / 2
+    for x, y in (local[0], local[-1]) if len(local) > 1 else local:
+        md.ellipse([x - r, y - r, x + r, y + r], fill=255)
+    tint = Image.new("RGB", region.size, _hex_rgb(color))
+    marked = ImageChops.multiply(region, tint)
+    region.paste(marked, (0, 0), mask)
+    image.paste(region, box)
+
+
+def draw_shape(image, kind, box, color, width):
+    d = ImageDraw.Draw(image)
+    rgb = _hex_rgb(color)
+    x0, y0, x1, y1 = box
+    if kind == "rect":
+        d.rectangle(box, outline=rgb, width=width)
+    elif kind == "ellipse":
+        d.ellipse(box, outline=rgb, width=width)
+    elif kind == "roundrect":
+        radius = int(AnnotateEditor._corner_radius(x0, y0, x1, y1, width))
+        d.rounded_rectangle(box, radius=max(1, radius), outline=rgb, width=width)
+
+
+SIZE_DOT_CACHE = {}
+
+
+def size_dot_image(index, selected):
+    """Thickness choice: a dot that grows with the size."""
+    key = (index, selected)
+    if key not in SIZE_DOT_CACHE:
+        n = S(26) * 4
+        img = Image.new("RGBA", (n, n), (0, 0, 0, 0))
+        d = ImageDraw.Draw(img)
+        if selected:
+            d.rounded_rectangle([0, 0, n - 1, n - 1], radius=n // 5,
+                                fill=_hex_rgb(ACCENT_SOFT), outline=_hex_rgb(ACCENT), width=6)
+        r = n * (0.08 + 0.065 * index)
+        c = n / 2
+        d.ellipse([c - r, c - r, c + r, c + r], fill=_hex_rgb(ACCENT if selected else TEXT))
+        SIZE_DOT_CACHE[key] = ImageTk.PhotoImage(img.resize((n // 4, n // 4), Image.LANCZOS))
+    return SIZE_DOT_CACHE[key]
+
+
+# ============================================================
+# Full-Page (Scrolling) Capture
+# ============================================================
+# For long pages and single-page applications that don't fit on screen:
+# the user selects the area that scrolls (e.g. the web page inside the
+# browser). The app scrolls it to the top, then scrolls down step by
+# step with the mouse wheel, grabbing the area each time, and stitches
+# the grabs into one tall image. Fixed headers/footers (common in
+# single-page apps) are detected so they appear only once.
+# While it runs, the main window becomes a small progress bar with a
+# Stop button (Esc also stops); what was captured so far is kept.
+
+SCROLL_MAX_STEPS = 80          # safety limit (infinite-scroll pages)
+SCROLL_MAX_HEIGHT = 20000      # pixels
+SCROLL_MAX_SECONDS = 180       # overall time limit
+SCROLL_SETTLE_MS = 350         # wait for smooth scrolling / lazy content
+
+
+def _row_signatures(image):
+    """One small byte string per pixel row (rows are compared exactly)."""
+    gray = image.convert("L")
+    width = max(1, gray.width // 4)
+    small = gray.resize((width, gray.height), Image.BOX)
+    data = small.tobytes()
+    return [data[i * width:(i + 1) * width] for i in range(small.height)]
+
+
+def _is_plain(row):
+    return max(row) - min(row) < 12
+
+
+def _rows_similar(x, y):
+    """Two pixel rows are 'similar' if they match except for a small part
+    of their width - e.g. a blinking cursor, spinner or clock."""
+    if x == y:
+        return True
+    limit = max(2, len(x) // 8)             # up to ~12% of the row width
+    different = 0
+    for p, q in zip(x, y):
+        if p - q > 24 or q - p > 24:
+            different += 1
+            if different > limit:
+                return False
+    return True
+
+
+def _nearly_same(a, b):
+    """True if two grabs are the same apart from small animations."""
+    if len(a) != len(b):
+        return False
+    allowed = max(2, len(a) // 60)          # up to ~1.7% of the rows
+    different = 0
+    for x, y in zip(a, b):
+        if not _rows_similar(x, y):
+            different += 1
+            if different > allowed:
+                return False
+    return True
+
+
+def _fixed_band(a, b, indexes):
+    """Rows that didn't move between two grabs, scanning from one edge
+    (a fixed header or footer). Short runs of changed rows - e.g. an
+    animated icon in the header - are tolerated."""
+    band = 0
+    misses = 0
+    for count, i in enumerate(indexes, start=1):
+        if _rows_similar(a[i], b[i]):
+            band = count
+            misses = 0
+        else:
+            misses += 1
+            if misses > 4:
+                break
+    return band
+
+
+def _fixed_bands(a, b):
+    height = len(a)
+    limit = int(height * 0.35)
+    top = _fixed_band(a, b, range(limit))
+    bottom = _fixed_band(a, b, range(height - 1, height - 1 - limit, -1))
+    return top, bottom
+
+
+def _find_scroll_shift(a_rows, b_rows, top, bottom, expected=None):
+    """How many pixels the content moved up between grab a and grab b,
+    looking only at the scrolling middle band. None if it can't be found."""
+    height = len(a_rows)
+    a = a_rows[top:height - bottom]
+    b = b_rows[top:height - bottom]
+    m = len(a)
+    if m < 20:
+        return None
+
+    index = {}
+    for i, row in enumerate(a):
+        index.setdefault(row, []).append(i)
+
+    # distinctive rows near the top of b, looked up in a
+    candidates, seen = set(), set()
+    for j, row in enumerate(b[:max(1, int(m * 0.7))]):
+        if _is_plain(row) or row in seen or len(index.get(row, ())) > 3:
+            continue
+        seen.add(row)
+        for i in index.get(row, ()):
+            if 0 < i - j < m:
+                candidates.add(i - j)
+        if len(seen) >= 24:
+            break
+
+    best = None
+    min_overlap = max(10, int(m * 0.06))
+    for shift in candidates:
+        overlap = m - shift
+        if overlap < min_overlap:
+            continue
+        allowed = max(2, int(overlap * 0.05))
+        bad = 0
+        for k in range(overlap):
+            if not _rows_similar(a[shift + k], b[k]):   # tolerate small animations
+                bad += 1
+                if bad > allowed:
+                    break
+        else:
+            score = (bad, abs(shift - expected) if expected else 0, shift)
+            if best is None or score < best[0]:
+                best = (score, shift)
+    return best[1] if best else None
+
+
+class ScrollingCapture:
+    """Scrolls a screen area and stitches the grabs (runs on Tk timers)."""
+
+    active = None
+
+    def __init__(self, bbox, on_done, on_progress=None):
+        self.bbox = bbox
+        self.on_done = on_done            # on_done(image or None, message)
+        self.on_progress = on_progress or (lambda text: None)
+        x1, y1, x2, y2 = bbox
+        # wheel over the right edge of the area (usually the scrollbar),
+        # so hover effects on the page don't change what is captured
+        self.mouse_at = (max(x1, x2 - 12), (y1 + y2) // 2)
+        self.saved_cursor = None
+        self.taken_at = datetime.now()
+        self.started = time.monotonic()
+        self.first = None
+        self.prev_rows = None
+        self.pieces = []
+        self.last = None
+        self.top = self.bottom = None
+        self.height = 0
+        self.steps = 0
+        self.notches = 1
+        self.px_per_notch = None
+        self.top_tries = 0
+        self.stop_requested = False
+        self.stopped_early = False
+        self.finished = False
+        self.method = "message"          # "message" (pointer stays free) or "cursor"
+        self.scroll_seen = False         # has scrolling visibly worked yet?
+
+    # ---- Windows input (overridable for testing) -----------------------
+
+    def _wheel(self, notches):
+        """Scroll the page. Positive = down."""
+        if self.method == "message":
+            self._wheel_message(notches)
+        else:
+            self._wheel_cursor(notches)
+
+    def _wheel_message(self, notches):
+        """Send mouse-wheel messages straight to the window under the
+        scroll point. The mouse pointer is NOT moved, so the user can
+        still click Stop."""
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+        user32.WindowFromPoint.argtypes = [wintypes.POINT]
+        user32.WindowFromPoint.restype = wintypes.HWND
+        user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT,
+                                        wintypes.WPARAM, wintypes.LPARAM]
+        x, y = int(self.mouse_at[0]), int(self.mouse_at[1])
+        hwnd = user32.WindowFromPoint(wintypes.POINT(x, y))
+        if not hwnd:
+            return
+        lparam = ((y & 0xFFFF) << 16) | (x & 0xFFFF)          # screen position
+        remaining = int(-120 * notches)
+        while remaining:
+            delta = max(-1200, min(1200, remaining))           # 10 notches per message
+            remaining -= delta
+            wparam = (delta & 0xFFFF) << 16
+            user32.PostMessageW(hwnd, 0x020A, wparam, lparam)  # WM_MOUSEWHEEL
+
+    def _wheel_cursor(self, notches):
+        """Fallback for apps that ignore wheel messages: move the pointer
+        there and turn the wheel (Esc stops, since the pointer is busy)."""
+        user32 = ctypes.windll.user32
+        user32.SetCursorPos(int(self.mouse_at[0]), int(self.mouse_at[1]))
+        user32.mouse_event(0x0800, 0, 0, int(-120 * notches), 0)   # MOUSEEVENTF_WHEEL
+
+    def _grab(self):
+        return ImageGrab.grab(bbox=self.bbox, all_screens=True).convert("RGB")
+
+    def _escape_pressed(self):
+        """Esc is down now, or was pressed since the last check (works
+        whichever window has the focus)."""
+        try:
+            return bool(ctypes.windll.user32.GetAsyncKeyState(0x1B) & 0x8001)
+        except Exception:
+            return False
+
+    def _watch_escape(self):
+        """Check for Esc every 50 ms for the whole capture."""
+        if self.finished:
+            return
+        if self._escape_pressed():
+            self.stop()
+        root.after(50, self._watch_escape)
+
+    def _save_cursor(self):
+        try:
+            from ctypes import wintypes
+            point = wintypes.POINT()
+            ctypes.windll.user32.GetCursorPos(ctypes.byref(point))
+            self.saved_cursor = (point.x, point.y)
+        except Exception:
+            self.saved_cursor = None
+
+    def _restore_cursor(self):
+        try:
+            if self.saved_cursor:
+                ctypes.windll.user32.SetCursorPos(*self.saved_cursor)
+        except Exception:
+            pass
+
+    # ---- helpers -----------------------------------------------------------
+
+    def _later(self, ms, func, *args):
+        """Run func after ms; any error ends the capture with a message
+        instead of silently stopping."""
+        def run():
+            if self.finished:
+                return
+            try:
+                func(*args)
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                self._finish(error=f"Full-page capture failed: {e}")
+        root.after(ms, run)
+
+    def _should_stop(self):
+        if self.stop_requested:
+            return True
+        if time.monotonic() - self.started > SCROLL_MAX_SECONDS:
+            return True
+        return False
+
+    def stop(self):
+        """Stop button / Esc: finish now and save what has been captured."""
+        if not self.stop_requested and not self.finished:
+            self.stop_requested = True
+            self.on_progress("Stopping - saving...")
+
+    # ---- flow ------------------------------------------------------------
+
+    def start(self):
+        ScrollingCapture.active = self
+        self._escape_pressed()        # clear an Esc press from before the capture
+        self._watch_escape()
+        self._save_cursor()
+        self.top_tries = 0
+        self.on_progress("Scrolling to the top...")
+        self._later(0, self._begin)
+
+    def _begin(self):
+        self.prev_rows = _row_signatures(self._grab())
+        self._to_top()
+
+    def _stable_grab(self, then, tries=0, previous=None):
+        """Grab until the picture stops changing (scrolling has settled)."""
+        image = self._grab()
+        rows = _row_signatures(image)
+        if previous is not None and (_nearly_same(rows, previous[1]) or tries >= 5):
+            then(image, rows)
+            return
+        self._later(120, self._stable_grab, then, tries + 1, (image, rows))
+
+    def _to_top(self):
+        """Scroll up until nothing changes any more."""
+        if self._should_stop():
+            # stopped before scrolling down: save what's on screen now
+            self.stopped_early = True
+            self.first = self.last = self._grab()
+            return self._finish()
+        self._wheel(-25)
+        self._later(SCROLL_SETTLE_MS, self._stable_grab, self._after_up)
+
+    def _after_up(self, image, rows):
+        self.top_tries += 1
+        if not _nearly_same(rows, self.prev_rows):
+            self.scroll_seen = True
+        if _nearly_same(rows, self.prev_rows) or self.top_tries >= 20:
+            self.first = image
+            self.last = image
+            self.prev_rows = rows
+            self.height = image.height
+            self.on_progress("Capturing...  screen 1")
+            self._step_down()
+        else:
+            self.prev_rows = rows
+            self._to_top()
+
+    def _step_down(self):
+        if self._should_stop():
+            self.stopped_early = True
+            return self._finish()
+        if self.steps >= SCROLL_MAX_STEPS or self.height >= SCROLL_MAX_HEIGHT:
+            self.stopped_early = True
+            return self._finish()
+        self._wheel(self.notches)
+        self._later(SCROLL_SETTLE_MS, self._stable_grab, self._after_down)
+
+    def _after_down(self, image, rows):
+        if _nearly_same(rows, self.prev_rows):
+            if self.steps == 0 and not self.scroll_seen and self.method == "message":
+                # this app ignored the wheel messages: start over, moving the
+                # pointer to scroll instead (Esc still stops)
+                print("Full-page capture: switching to pointer scrolling")
+                self.method = "cursor"
+                self.top_tries = 0
+                self.on_progress("Scrolling to the top...")
+                self.prev_rows = rows
+                return self._to_top()
+            return self._finish()                        # reached the end
+        self.scroll_seen = True
+
+        if self.top is None:
+            self.top, self.bottom = _fixed_bands(self.prev_rows, rows)
+
+        expected = self.px_per_notch * self.notches if self.px_per_notch else None
+        shift = _find_scroll_shift(self.prev_rows, rows, self.top, self.bottom, expected)
+        if shift is None:
+            if self.steps == 0:
+                return self._finish(error=(
+                    "The selected area didn't scroll in a way that could be stitched.\n"
+                    "Select only the scrolling page content (not the whole browser), "
+                    "and make sure the page itself scrolls with the mouse wheel."))
+            self.stopped_early = True
+            return self._finish()
+
+        # keep the newly revealed rows at the bottom of the scrolling band
+        h = image.height
+        self.pieces.append(image.crop((0, h - self.bottom - shift, image.width, h - self.bottom)))
+        self.height += shift
+        self.last = image
+        self.prev_rows = rows
+        self.steps += 1
+        self.on_progress(f"Capturing...  screen {self.steps + 1}  ·  {self.height} px")
+
+        # after the first step: scroll ~65% of the visible band each time
+        if self.px_per_notch is None:
+            self.px_per_notch = max(1, shift / self.notches)
+            band = h - self.top - self.bottom
+            self.notches = max(1, int(band * 0.65 / self.px_per_notch))
+        self._step_down()
+
+    def _finish(self, cancelled=False, error=None):
+        if self.finished:
+            return
+        self.finished = True
+        ScrollingCapture.active = None
+        self._restore_cursor()
+        if error:
+            self.on_done(None, error)
+            return
+        if cancelled or self.first is None:
+            self.on_done(None, "Full-page capture cancelled")
+            return
+
+        w, h = self.first.size
+        bottom = self.bottom or 0
+        head = self.first.crop((0, 0, w, h - bottom))
+        total = head.height + sum(p.height for p in self.pieces) + bottom
+        result = Image.new("RGB", (w, total), "white")
+        result.paste(head, (0, 0))
+        y = head.height
+        for piece in self.pieces:
+            result.paste(piece, (0, y))
+            y += piece.height
+        if bottom:
+            result.paste(self.last.crop((0, h - bottom, w, h)), (0, y))
+
+        screens = self.steps + 1
+        note = " (stopped early)" if self.stopped_early else ""
+        self.on_done(result, f"{screens} screen{'s' if screens != 1 else ''} stitched, "
+                             f"{w} x {total} px{note}")
+
+
+def full_page_capture():
+    """Button: select the scrolling area, then capture the whole page."""
+    if recorder is not None or ScrollingCapture.active is not None:
+        return
+    if sys.platform != "win32":
+        messagebox.showinfo("Not available", "Full-page capture needs Windows.", parent=root)
+        return
+    if not ensure_save_folder():
+        status_var.set("No save folder selected - capture cancelled")
+        return
+    start_region_selection(
+        start_scrolling_capture,
+        hint="Drag over the page content that scrolls (not the address bar or tabs)  "
+             "·  then don't touch the mouse  ·  Esc cancels")
+
+
+def start_scrolling_capture(x1, y1, x2, y2):
+    if y2 - y1 < 60 or x2 - x1 < 60:
+        root.deiconify()
+        status_var.set("Selection too small for a full-page capture")
+        return
+
+    area = {"left": x1, "top": y1, "width": x2 - x1, "height": y2 - y1}
+
+    def progress(text):
+        scroll_label.config(text=text)
+
+    def done(image, message):
+        root.unbind("<Escape>")
+        exit_compact_mode(scroll_bar)
+        if image is None:
+            status_var.set(message)
+            if "failed" in message or "couldn't" in message or "didn't" in message:
+                messagebox.showwarning("Full-page capture", message, parent=root)
+            return
+        print(f"Full-page capture: {message}")
+        deliver_capture(image, "Full page", capture.taken_at)
+        if not blur_review_var.get():
+            root.after(300, lambda: status_var.set(
+                f"{status_var.get()}\nFull page: {message}"))
+
+    capture = ScrollingCapture((x1, y1, x2, y2), done, progress)
+    scroll_stop_button.config(command=capture.stop, state="normal")
+    root.bind("<Escape>", lambda e: capture.stop())
+    enter_compact_mode(scroll_bar, area, "Capturing full page")
+    capture.start()
+
+
+# ============================================================
 # Capture Full Screen
 # ============================================================
 
@@ -1320,17 +2359,17 @@ def perform_full_screen_capture():
 # Region Selection Overlay (shared by screenshot and recording)
 # ============================================================
 
-def start_region_selection(on_selected):
+def start_region_selection(on_selected, hint=None):
     """
     Hide the main window and show the selection overlay.
     on_selected(left, top, right, bottom) is called with screen
     coordinates after the user drags out a rectangle.
     """
     root.withdraw()
-    root.after(200, lambda: create_selection_overlay(on_selected))
+    root.after(200, lambda: create_selection_overlay(on_selected, hint))
 
 
-def create_selection_overlay(on_selected):
+def create_selection_overlay(on_selected, hint=None):
     overlay = tk.Toplevel(root)
     overlay.attributes("-fullscreen", True)
     overlay.attributes("-topmost", True)
@@ -1344,6 +2383,11 @@ def create_selection_overlay(on_selected):
         highlightthickness=0
     )
     canvas.pack(fill="both", expand=True)
+
+    if hint:
+        overlay.update_idletasks()
+        canvas.create_text(overlay.winfo_width() // 2, S(40), text=hint,
+                           fill="white", font=("Segoe UI Semibold", 14))
 
     start_x = 0
     start_y = 0
@@ -1988,12 +3032,13 @@ bar_excluded = False
 dot_visible = True
 
 
-def bar_position_for(area):
+def bar_position_for(area, bar=None):
     """Top-left corner for the control bar: just below the recorded
     area, else just above it, else inside its top edge."""
+    bar = bar or rec_bar
     root.update_idletasks()
-    w = rec_bar.winfo_reqwidth() + 20      # + window border
-    h = rec_bar.winfo_reqheight() + 45     # + title bar
+    w = bar.winfo_reqwidth() + 20          # + window border
+    h = bar.winfo_reqheight() + 45         # + title bar
     vx, vy, vw, vh = virtual_screen_bounds()
 
     left, top = area["left"], area["top"]
@@ -2041,6 +3086,36 @@ def enter_recording_mode(area):
     else:
         print("Note: this version of Windows can't hide the recording "
               "controls from capture.")
+
+
+def enter_compact_mode(bar, area, title):
+    """Show only a small bar (e.g. full-page capture progress) instead of
+    the main window, placed outside the captured area and hidden from
+    screen capture where Windows supports it."""
+    global saved_main_position
+    saved_main_position = (root.winfo_x(), root.winfo_y())
+    main_frame.pack_forget()
+    bar.pack()
+    root.title(title)
+    root.attributes("-topmost", True)
+    x, y = bar_position_for(area, bar)
+    root.geometry(f"+{x}+{y}")
+    root.deiconify()
+    root.lift()
+    root.update()
+    set_capture_excluded(root, True)
+
+
+def exit_compact_mode(bar):
+    set_capture_excluded(root, False)
+    bar.pack_forget()
+    main_frame.pack()
+    root.title("Screen Capture Utility")
+    root.attributes("-topmost", False)
+    if saved_main_position is not None:
+        root.geometry(f"+{saved_main_position[0]}+{saved_main_position[1]}")
+    root.deiconify()
+    root.lift()
 
 
 def exit_recording_mode():
@@ -2262,6 +3337,11 @@ def on_close():
         stop_recording()
         return
 
+    # During a full-page capture, the X button stops it (keeps what's captured)
+    if ScrollingCapture.active is not None:
+        ScrollingCapture.active.stop()
+        return
+
     # Don't quit while a recording is still being saved
     if saving_thread is not None and saving_thread.is_alive():
         messagebox.showinfo(
@@ -2400,6 +3480,30 @@ def draw_icon(kind, color, size, accent=RED):
             d.ellipse(box(8.5, 8.5, 15.5, 15.5), fill=accent)
         else:
             d.rounded_rectangle(box(8, 8, 16, 16), radius=1.2 * u, fill=color)
+
+    elif kind == "highlight":
+        d.polygon([(14 * u, 3 * u), (21 * u, 10 * u), (12 * u, 19 * u), (5 * u, 12 * u)], fill=color)
+        d.polygon([(5 * u, 12 * u), (12 * u, 19 * u), (9 * u, 21 * u), (3 * u, 15 * u)], fill=color)
+        d.line(box(2, 22, 13, 22), fill=color, width=w)
+
+    elif kind == "pen":
+        d.line([(5 * u, 19 * u), (18 * u, 6 * u)], fill=color, width=int(w * 2.2))
+        d.polygon([(3 * u, 21 * u), (4 * u, 16.5 * u), (7.5 * u, 20 * u)], fill=color)
+        d.line([(16 * u, 4 * u), (20 * u, 8 * u)], fill=color, width=int(w * 1.2))
+
+    elif kind == "rect":
+        d.rectangle(box(3, 5, 21, 19), outline=color, width=w)
+
+    elif kind == "roundrect":
+        d.rounded_rectangle(box(3, 5, 21, 19), radius=4.5 * u, outline=color, width=w)
+
+    elif kind == "ellipse":
+        d.ellipse(box(3, 4, 21, 20), outline=color, width=w)
+
+    elif kind == "fullpage":
+        d.rounded_rectangle(box(5, 2, 19, 22), radius=2 * u, outline=color, width=w)
+        d.line(box(12, 6.5, 12, 15.5), fill=color, width=w)
+        d.polygon([(8.2 * u, 13 * u), (15.8 * u, 13 * u), (12 * u, 18 * u)], fill=color)
 
     elif kind == "ocr":
         L = 5
@@ -2788,19 +3892,23 @@ shot_card.pack(fill="x", pady=(0, S(12)))
 
 shot_tiles = tk.Frame(shot_card.body, bg=CARD)
 shot_tiles.pack(fill="x")
-shot_tiles.columnconfigure((0, 1, 2), weight=1, uniform="tiles")
+shot_tiles.columnconfigure((0, 1, 2, 3), weight=1, uniform="tiles")
 
 capture_button = Tile(shot_tiles, icon("screen", ACCENT, 24), "Capture Screen",
                       "Entire desktop\nCtrl+Shift+F", capture_screen)
-capture_button.grid(row=0, column=0, sticky="nsew", padx=(0, S(6)))
+capture_button.grid(row=0, column=0, sticky="nsew", padx=(0, S(5)))
 
 region_button = Tile(shot_tiles, icon("region", ACCENT, 24), "Capture Region",
                      "Drag to select\nCtrl+Shift+R", select_region)
-region_button.grid(row=0, column=1, sticky="nsew", padx=(S(6), S(6)))
+region_button.grid(row=0, column=1, sticky="nsew", padx=(S(5), S(5)))
+
+fullpage_button = Tile(shot_tiles, icon("fullpage", ACCENT, 24), "Full Page",
+                       "Scrolls long pages\nCtrl+Shift+S", full_page_capture)
+fullpage_button.grid(row=0, column=2, sticky="nsew", padx=(S(5), S(5)))
 
 ocr_button = Tile(shot_tiles, icon("ocr", ACCENT, 24), "Extract Text",
-                  "Copy text from screen\nCtrl+Shift+T", extract_text_region)
-ocr_button.grid(row=0, column=2, sticky="nsew", padx=(S(6), 0))
+                  "Copy text (OCR)\nCtrl+Shift+T", extract_text_region)
+ocr_button.grid(row=0, column=3, sticky="nsew", padx=(S(5), 0))
 
 if not OCR_AVAILABLE:
     ocr_button.sub.configure(text="Needs Windows OCR\n(see console)")
@@ -2816,6 +3924,32 @@ blur_toggle.pack(side="left")
 
 blur_file_button = FlatButton(blur_row, "Blur an image...", blur_existing_image)
 blur_file_button.pack(side="right")
+
+
+# ============================================================
+# Annotate Card (Highlighter, Pen, Shapes)
+# ============================================================
+
+annotate_card = Card(content, "Annotate", badge="Highlighter / Pen / Shapes")
+annotate_card.pack(fill="x", pady=(0, S(12)))
+
+annotate_row = tk.Frame(annotate_card.body, bg=CARD)
+annotate_row.pack(fill="x")
+
+annotate_review_var = tk.BooleanVar(value=False)
+annotate_toggle = Toggle(annotate_row, "Annotate before saving", annotate_review_var,
+                         image=icon("pen", MUTED, 16))
+annotate_toggle.pack(side="left")
+
+annotate_tools_hint = tk.Frame(annotate_row, bg=CARD)
+annotate_tools_hint.pack(side="left", padx=(S(18), 0))
+for _kind, _label in (("highlight", "Highlighter"), ("pen", "Pen"), ("rect", "Rectangle"),
+                      ("roundrect", "Rounded"), ("ellipse", "Circle")):
+    tk.Label(annotate_tools_hint, image=icon(_kind, MUTED, 15), text=f" {_label}",
+             compound="left", font=F_TILE_SUB, fg=MUTED, bg=CARD).pack(side="left", padx=(0, S(10)))
+
+annotate_file_button = FlatButton(annotate_row, "Annotate an image...", annotate_existing_image)
+annotate_file_button.pack(side="right")
 
 
 # ============================================================
@@ -3029,6 +4163,20 @@ rec_stop_button = FlatButton(
 )
 rec_stop_button.pack(side="left")
 
+
+# Full-page capture progress bar (shown only while scrolling/capturing)
+scroll_bar = tk.Frame(root, bg=BAR_BG, padx=S(12), pady=S(10))
+tk.Label(scroll_bar, image=icon("fullpage", "white", 18), bg=BAR_BG).pack(side="left", padx=(0, S(8)))
+scroll_label = tk.Label(scroll_bar, text="Scrolling to the top...", fg="white", bg=BAR_BG,
+                        font=F_BODY_BOLD, width=38, anchor="w")
+scroll_label.pack(side="left", padx=(0, S(8)))
+tk.Label(scroll_bar, text="Esc also stops", fg=HEADER_SUB, bg=BAR_BG,
+         font=F_TILE_SUB).pack(side="left", padx=(0, S(10)))
+scroll_stop_button = FlatButton(scroll_bar, "Stop & Save", lambda: None, style="danger",
+                                icons={"Stop & Save": icon("stop", "white", 14)},
+                                padx=S(10), pady=S(5))
+scroll_stop_button.pack(side="left")
+
 update_word_controls()
 
 
@@ -3040,6 +4188,8 @@ root.bind("<Control-Shift-F>",
           lambda event: capture_screen() if recorder is None else None)
 root.bind("<Control-Shift-R>",
           lambda event: select_region() if recorder is None else None)
+root.bind("<Control-Shift-S>",
+          lambda event: full_page_capture() if recorder is None else None)
 root.bind("<Control-Shift-T>",
           lambda event: extract_text_region() if recorder is None else None)
 root.bind("<Control-Shift-V>", lambda event: toggle_screen_recording())
