@@ -1335,67 +1335,87 @@ class BlurEditor:
 
 
 # ============================================================
-# Annotate (Highlighter, Pen, Shapes)
+# Review & Annotate window (opens after every capture)
 # ============================================================
-# A separate step from Blur. When "Annotate before saving" is on, each
-# screenshot opens in the Annotate window (after the Blur window, if that
-# is on too): highlight text, write or draw with a pen, and add
-# rectangles, rounded rectangles and circles in any colour / thickness.
+# After each screenshot (Capture Screen, Capture Region, Full Page) the
+# captured image is shown in the Review window - after the Blur window, if
+# "Review & blur before saving" is on. There the user can highlight, draw
+# and add shapes, then:
+#   Copy   - put the image on the clipboard (paste into Teams, Outlook ...)
+#   Save   - save it to the folder / Word document
+#   Cancel - discard it
 
 def annotate_then_save(image, kind, taken_at):
-    """Open the Annotate window if switched on, then save."""
-    if annotate_review_var.get():
-        root.after(50, lambda: AnnotateEditor(
-            image,
-            on_save=lambda result: handle_capture(result, kind, taken_at),
-            title=f"{kind} capture",
-        ))
+    """Show the captured image in the Review window; save only on Save."""
+    root.after(50, lambda: AnnotateEditor(
+        image,
+        on_save=lambda result: handle_capture(result, kind, taken_at),
+        title=f"{kind} capture",
+        save_label="Save to Word" if word_doc_path is not None else "Save",
+    ))
+
+
+# ---- copy an image to the Windows clipboard ---------------------------
+
+def image_to_dib(image):
+    """The image as a Windows device-independent bitmap (BMP without its
+    14-byte file header) - the format the clipboard uses."""
+    buffer = BytesIO()
+    image.convert("RGB").save(buffer, format="BMP")
+    return buffer.getvalue()[14:]
+
+
+def copy_image_to_clipboard(image):
+    """Put an image on the clipboard (as a bitmap and as PNG), so it can be
+    pasted into Teams, Outlook, Word, Paint, etc. Returns True on success."""
+    from ctypes import wintypes
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+    kernel32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
+    kernel32.GlobalAlloc.restype = ctypes.c_void_p
+    kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+    kernel32.GlobalLock.restype = ctypes.c_void_p
+    kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+    kernel32.GlobalFree.argtypes = [ctypes.c_void_p]
+    user32.OpenClipboard.argtypes = [ctypes.c_void_p]
+    user32.SetClipboardData.argtypes = [wintypes.UINT, ctypes.c_void_p]
+    user32.SetClipboardData.restype = ctypes.c_void_p
+    user32.RegisterClipboardFormatW.argtypes = [wintypes.LPCWSTR]
+    user32.RegisterClipboardFormatW.restype = wintypes.UINT
+
+    png = BytesIO()
+    image.convert("RGB").save(png, format="PNG")
+    formats = [(8, image_to_dib(image)),                                   # CF_DIB
+               (user32.RegisterClipboardFormatW("PNG"), png.getvalue())]   # PNG (keeps quality)
+
+    for _ in range(10):                      # the clipboard may be busy for a moment
+        if user32.OpenClipboard(None):
+            break
+        time.sleep(0.05)
     else:
-        handle_capture(image, kind, taken_at)
-
-
-def annotate_existing_image():
-    """Pick a saved image, annotate it and save a copy."""
-    folder = save_folder or (word_doc_path.parent if word_doc_path else Path.home())
-    path = filedialog.askopenfilename(
-        parent=root,
-        title="Choose an image to annotate",
-        initialdir=str(folder),
-        filetypes=[("Images", "*.png *.jpg *.jpeg *.bmp *.gif *.tif *.tiff *.webp"),
-                   ("All files", "*.*")])
-    if not path:
-        return
-    path = Path(path)
+        return False
     try:
-        with Image.open(path) as img:
-            image = img.convert("RGB")
-    except Exception as e:
-        messagebox.showerror("Could not open image", str(e), parent=root)
-        return
-
-    def save_copy(result):
-        target = filedialog.asksaveasfilename(
-            parent=root,
-            title="Save annotated image",
-            initialdir=str(path.parent),
-            initialfile=f"{path.stem}_annotated.png",
-            defaultextension=".png",
-            filetypes=[("PNG image", "*.png"), ("JPEG image", "*.jpg *.jpeg")])
-        if not target:
-            return False
-        try:
-            result.save(target)
-            status_var.set(f"Saved: {Path(target).name}")
-            return True
-        except Exception as e:
-            messagebox.showerror("Could not save", str(e), parent=root)
-            return False
-
-    AnnotateEditor(image, on_save=save_copy, title=path.name, save_label="Save copy")
+        user32.EmptyClipboard()
+        ok = False
+        for fmt, data in formats:
+            handle = kernel32.GlobalAlloc(0x0002, len(data))          # GMEM_MOVEABLE
+            if not handle:
+                continue
+            pointer = kernel32.GlobalLock(handle)
+            ctypes.memmove(pointer, data, len(data))
+            kernel32.GlobalUnlock(handle)
+            if user32.SetClipboardData(fmt, handle):
+                ok = True                     # the clipboard owns the memory now
+            else:
+                kernel32.GlobalFree(handle)
+        return ok
+    finally:
+        user32.CloseClipboard()
 
 
 class AnnotateEditor:
-    """Annotation editor: highlighter, pen and shapes.
+    """Review window shown after each capture: annotate the screenshot with
+    highlighter, pen and shapes, then Copy (clipboard), Save or Cancel.
 
     Tools (keyboard shortcut):
       Highlighter (H)  Pen (P)  Rectangle (R)
@@ -1407,6 +1427,7 @@ class AnnotateEditor:
     TOOLS = [
         ("highlight", "Highlighter", "H"),
         ("pen", "Pen", "P"),
+        ("eraser", "Eraser", "X"),
         ("rect", "Rectangle", "R"),
         ("roundrect", "Rounded", "U"),
         ("ellipse", "Circle", "E"),
@@ -1428,13 +1449,14 @@ class AnnotateEditor:
         self.settings = {                # colour / size remembered per tool
             "highlight": {"color": "#FACC15", "size": 1},
             "pen": {"color": "#E5484D", "size": 1},
+            "eraser": {"color": None, "size": 2},
             "rect": {"color": "#E5484D", "size": 1},
             "roundrect": {"color": "#3B82F6", "size": 1},
             "ellipse": {"color": "#E5484D", "size": 1},
         }
 
         self.win = tk.Toplevel(root)
-        self.win.title("Annotate screenshot")
+        self.win.title("Review screenshot")
         self.win.configure(bg=BG)
         self.win.transient(root)
         self.win.protocol("WM_DELETE_WINDOW", self.cancel)
@@ -1447,11 +1469,10 @@ class AnnotateEditor:
         tk.Label(inner, image=icon("pen", "white", 22), bg=HEADER_BG).pack(side="left")
         titles = tk.Frame(inner, bg=HEADER_BG)
         titles.pack(side="left", padx=(S(10), 0))
-        tk.Label(titles, text="Annotate" + (f"  ·  {title}" if title else ""),
+        tk.Label(titles, text="Review & annotate" + (f"  ·  {title}" if title else ""),
                  font=F_TILE, fg="white", bg=HEADER_BG).pack(anchor="w")
         tk.Label(titles,
-                 text="Highlight, draw and add shapes.  Shift = square/circle.  "
-                      "Ctrl+Z = undo.",
+                 text="Annotate if you like, then Copy, Save or Cancel.  Ctrl+C copy, Ctrl+Z undo",
                  font=F_TILE_SUB, fg=HEADER_SUB, bg=HEADER_BG).pack(anchor="w")
         self.info = tk.Label(inner, text="", font=F_TILE_SUB, fg=HEADER_SUB, bg=HEADER_BG)
         self.info.pack(side="right")
@@ -1552,14 +1573,22 @@ class AnnotateEditor:
         # --- bottom buttons -----------------------------------------
         bottom = tk.Frame(body, bg=BG)
         bottom.pack(fill="x", pady=(S(10), 0))
+        self.copied = False
+        self.copy_button = FlatButton(bottom, "Copy", self.copy,
+                                      icons={"Copy": icon("copy", TEXT, 15),
+                                             "Copied": icon("check", GREEN, 15)})
+        self.copy_button.pack(side="left")
         FlatButton(bottom, save_label, self.save, style="primary").pack(side="right")
         FlatButton(bottom, "Cancel", self.cancel).pack(side="right", padx=(0, S(6)))
 
+        self.win.bind("<Control-c>", lambda e: self.copy())
+        self.win.bind("<Control-C>", lambda e: self.copy())
         self.win.bind("<Control-z>", lambda e: self.undo())
         self.win.bind("<Control-Z>", lambda e: self.undo())
         self.win.bind("<Return>", lambda e: self.save())
         self.win.bind("<Escape>", lambda e: self.cancel())
 
+        self._reset_layers()
         self.working = self.original.copy()
         self.select_tool("highlight")
         self.redraw()
@@ -1586,6 +1615,12 @@ class AnnotateEditor:
                         fg=ACCENT if selected else TEXT,
                         image=icon(k, ACCENT if selected else TEXT, 18),
                         highlightbackground=ACCENT if selected else CARD)
+        # the eraser has no colour - hide the colour row for it
+        if key == "eraser":
+            self.color_frame.pack_forget()
+        elif not self.color_frame.winfo_ismapped():
+            self.color_frame.pack(side="left", padx=S(10), pady=S(7), before=self.size_frame)
+        self.canvas.configure(cursor="circle" if key == "eraser" else "crosshair")
         self._show_color_and_size()
 
     def _show_color_and_size(self):
@@ -1619,25 +1654,59 @@ class AnnotateEditor:
 
     def _screen_width(self):
         """Selected thickness in screen pixels."""
-        sizes = self.SIZES["highlight"] if self.tool == "highlight" else self.SIZES["default"]
+        sizes = (self.SIZES["highlight"] if self.tool in ("highlight", "eraser")
+                 else self.SIZES["default"])
         return sizes[self.settings[self.tool]["size"]]
 
     # ---- drawing ----------------------------------------------------
 
+    # Annotations are kept on transparent layers over the screenshot:
+    #   highlight layer (multiplied onto the image, like a real marker),
+    #   ink layer (pen), shape layer (rectangles / circles, always on top).
+    # The eraser clears pixels on the highlight and ink layers only, so it
+    # removes pen and highlighter marks but never shapes or the screenshot.
+
+    def _reset_layers(self):
+        size = self.original.size
+        self.hl_layer = Image.new("RGBA", size, (0, 0, 0, 0))
+        self.ink_layer = Image.new("RGBA", size, (0, 0, 0, 0))
+        self.shape_layer = Image.new("RGBA", size, (0, 0, 0, 0))
+
     def rebuild(self):
         """Re-apply every change to a fresh copy of the original."""
-        self.working = self.original.copy()
+        self._reset_layers()
         for op in self.ops:
-            self._apply(self.working, op)
+            self._apply(op)
+        self._compose()
 
-    def _apply(self, image, op):
+    def _apply(self, op):
         kind = op["type"]
         if kind == "highlight":
-            draw_highlight(image, op["points"], op["color"], op["width"])
+            draw_path(self.hl_layer, op["points"], _hex_rgb(op["color"]) + (255,), op["width"])
         elif kind == "pen":
-            draw_stroke(image, op["points"], op["color"], op["width"])
+            draw_path(self.ink_layer, op["points"], _hex_rgb(op["color"]) + (255,), op["width"])
+        elif kind == "eraser":
+            for layer in (self.hl_layer, self.ink_layer):
+                draw_path(layer, op["points"], (0, 0, 0, 0), op["width"])
         else:
-            draw_shape(image, kind, op["box"], op["color"], op["width"])
+            draw_shape(self.shape_layer, kind, op["box"], op["color"], op["width"])
+
+    def _compose(self):
+        """Screenshot + highlight (multiply) + ink + shapes -> self.working."""
+        image = self.original.copy()
+        box = self.hl_layer.getbbox()
+        if box:
+            region = image.crop(box)
+            layer = self.hl_layer.crop(box)
+            marked = ImageChops.multiply(region, layer.convert("RGB"))
+            region.paste(marked, (0, 0), layer.getchannel("A"))
+            image.paste(region, box)
+        for layer in (self.ink_layer, self.shape_layer):
+            box = layer.getbbox()
+            if box:
+                part = layer.crop(box)
+                image.paste(part.convert("RGB"), box, part.getchannel("A"))
+        self.working = image
 
     def redraw(self):
         view = self.working
@@ -1693,17 +1762,23 @@ class AnnotateEditor:
                 self.canvas.yview_scroll(1, "units")
 
         tool = self.tool
-        if tool in ("pen", "highlight"):
+        if tool in ("pen", "highlight", "eraser"):
             p = self._point(event)
             last = self.stroke[-1]
             if abs(p[0] - last[0]) + abs(p[1] - last[1]) < 2:
                 return
             self.stroke.append(p)
-            setting = self.settings[tool]
-            item = self.canvas.create_line(
-                *last, *p, fill=setting["color"], width=self._screen_width(),
-                capstyle="round", joinstyle="round",
-                stipple="gray50" if tool == "highlight" else "")
+            if tool == "eraser":
+                # show the eraser's path; marks under it disappear on release
+                item = self.canvas.create_line(
+                    *last, *p, fill="#FFFFFF", width=self._screen_width(),
+                    capstyle="round", joinstyle="round", stipple="gray50")
+            else:
+                setting = self.settings[tool]
+                item = self.canvas.create_line(
+                    *last, *p, fill=setting["color"], width=self._screen_width(),
+                    capstyle="round", joinstyle="round",
+                    stipple="gray50" if tool == "highlight" else "")
             self.preview.append(item)
             return
 
@@ -1733,7 +1808,7 @@ class AnnotateEditor:
         s = self.scale
         self._clear_preview()
 
-        if tool in ("pen", "highlight"):
+        if tool in ("pen", "highlight", "eraser"):
             p = self._point(event)
             if p != self.stroke[-1]:
                 self.stroke.append(p)
@@ -1741,6 +1816,11 @@ class AnnotateEditor:
             op = {"type": tool, "color": setting["color"],
                   "width": max(1, round(self._screen_width() / s)),
                   "points": [(x / s, y / s) for x, y in self.stroke]}
+            if tool == "eraser" and not (self.ink_layer.getbbox() or self.hl_layer.getbbox()):
+                # nothing to erase
+                self.drag_start = None
+                self.stroke = []
+                return
         else:
             x0, y0 = self.drag_start
             x1, y1 = self._shape_end(event)
@@ -1758,7 +1838,8 @@ class AnnotateEditor:
         self.drag_start = None
         self.stroke = []
         self.ops.append(op)
-        self._apply(self.working, op)
+        self._apply(op)
+        self._compose()
         self.redraw()
 
     # ---- undo / save ------------------------------------------------
@@ -1784,15 +1865,38 @@ class AnnotateEditor:
         print(f"Saved with {len(self.ops)} annotation(s)")
         self.win.destroy()
 
+    def copy(self):
+        """Copy the screenshot (with annotations) to the clipboard. The
+        window stays open, so it can still be saved afterwards."""
+        try:
+            ok = copy_image_to_clipboard(self.working)
+        except Exception as e:
+            print(f"Copy failed: {e}")
+            ok = False
+        if not ok:
+            messagebox.showerror("Copy failed",
+                                 "Could not copy the image to the clipboard. Please try again.",
+                                 parent=self.win)
+            return
+        self.copied = True
+        self.copied_ops = len(self.ops)
+        self.copy_button.config(text="Copied")
+        self.win.after(1500, lambda: self.copy_button.winfo_exists()
+                       and self.copy_button.config(text="Copy"))
+        status_var.set("Screenshot copied to the clipboard - paste it with Ctrl+V")
+
     def cancel(self):
-        if self.ops and not messagebox.askyesno(
+        # nothing to lose if it was copied after the last change
+        copied_latest = self.copied and getattr(self, "copied_ops", -1) == len(self.ops)
+        if self.ops and not copied_latest and not messagebox.askyesno(
                 "Discard screenshot?",
                 "Close without saving? The screenshot will be discarded.",
                 parent=self.win):
             return
         self.win.grab_release()
         self.win.destroy()
-        status_var.set("Screenshot discarded")
+        status_var.set("Copied to the clipboard - not saved to the folder"
+                       if self.copied else "Screenshot discarded")
 
 
 def rounded_rect_points(x0, y0, x1, y1, r):
@@ -1806,6 +1910,21 @@ def rounded_rect_points(x0, y0, x1, y1, r):
 def _hex_rgb(color):
     color = color.lstrip("#")
     return tuple(int(color[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def draw_path(layer, points, rgba, width):
+    """Stroke a freehand path with round ends onto an RGBA layer. With a
+    fully transparent colour it erases (pixels are replaced, not blended)."""
+    d = ImageDraw.Draw(layer)
+    if len(points) > 1:
+        d.line(points, fill=rgba, width=width, joint="curve")
+    r = width / 2
+    for x, y in (points if len(points) <= 2 else (points[0], points[-1])):
+        d.ellipse([x - r, y - r, x + r, y + r], fill=rgba)
+    if rgba[3] == 0 and len(points) > 2:
+        # round joints along the eraser path so it leaves no gaps
+        for x, y in points[1:-1]:
+            d.ellipse([x - r, y - r, x + r, y + r], fill=rgba)
 
 
 def draw_stroke(image, points, color, width):
@@ -1846,7 +1965,7 @@ def draw_highlight(image, points, color, width):
 
 def draw_shape(image, kind, box, color, width):
     d = ImageDraw.Draw(image)
-    rgb = _hex_rgb(color)
+    rgb = _hex_rgb(color) + ((255,) if image.mode == "RGBA" else ())
     x0, y0, x1, y1 = box
     if kind == "rect":
         d.rectangle(box, outline=rgb, width=width)
@@ -3481,6 +3600,22 @@ def draw_icon(kind, color, size, accent=RED):
         else:
             d.rounded_rectangle(box(8, 8, 16, 16), radius=1.2 * u, fill=color)
 
+    elif kind == "eraser":
+        d.polygon([(13 * u, 3.5 * u), (21 * u, 11.5 * u), (12.5 * u, 20 * u), (4.5 * u, 12 * u)],
+                  outline=color, width=w)
+        d.polygon([(4.5 * u, 12 * u), (8.5 * u, 8 * u), (16.5 * u, 16 * u), (12.5 * u, 20 * u)], fill=color)
+        d.line(box(9, 21, 21, 21), fill=color, width=w)
+
+    elif kind == "copy":
+        d.rounded_rectangle(box(8, 8, 21, 21), radius=2 * u, outline=color, width=w)
+        d.line([(4 * u, 16 * u), (4 * u, 5 * u)], fill=color, width=w)
+        d.line([(4 * u, 4 * u), (15 * u, 4 * u)], fill=color, width=w)
+        d.arc(box(3, 3, 7, 7), start=180, end=270, fill=color, width=w)
+
+    elif kind == "check":
+        d.line([(4 * u, 12.5 * u), (9.5 * u, 18 * u), (20 * u, 6.5 * u)], fill=color, width=int(w * 1.4),
+               joint="curve")
+
     elif kind == "highlight":
         d.polygon([(14 * u, 3 * u), (21 * u, 10 * u), (12 * u, 19 * u), (5 * u, 12 * u)], fill=color)
         d.polygon([(5 * u, 12 * u), (12 * u, 19 * u), (9 * u, 21 * u), (3 * u, 15 * u)], fill=color)
@@ -3924,32 +4059,6 @@ blur_toggle.pack(side="left")
 
 blur_file_button = FlatButton(blur_row, "Blur an image...", blur_existing_image)
 blur_file_button.pack(side="right")
-
-
-# ============================================================
-# Annotate Card (Highlighter, Pen, Shapes)
-# ============================================================
-
-annotate_card = Card(content, "Annotate", badge="Highlighter / Pen / Shapes")
-annotate_card.pack(fill="x", pady=(0, S(12)))
-
-annotate_row = tk.Frame(annotate_card.body, bg=CARD)
-annotate_row.pack(fill="x")
-
-annotate_review_var = tk.BooleanVar(value=False)
-annotate_toggle = Toggle(annotate_row, "Annotate before saving", annotate_review_var,
-                         image=icon("pen", MUTED, 16))
-annotate_toggle.pack(side="left")
-
-annotate_tools_hint = tk.Frame(annotate_row, bg=CARD)
-annotate_tools_hint.pack(side="left", padx=(S(18), 0))
-for _kind, _label in (("highlight", "Highlighter"), ("pen", "Pen"), ("rect", "Rectangle"),
-                      ("roundrect", "Rounded"), ("ellipse", "Circle")):
-    tk.Label(annotate_tools_hint, image=icon(_kind, MUTED, 15), text=f" {_label}",
-             compound="left", font=F_TILE_SUB, fg=MUTED, bg=CARD).pack(side="left", padx=(0, S(10)))
-
-annotate_file_button = FlatButton(annotate_row, "Annotate an image...", annotate_existing_image)
-annotate_file_button.pack(side="right")
 
 
 # ============================================================

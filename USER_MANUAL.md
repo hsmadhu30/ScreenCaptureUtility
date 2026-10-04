@@ -1,6 +1,6 @@
 # Screen Capture Utility — User Manual
 
-A Windows desktop tool for taking screenshots (whole screen, a region, or a full scrolling page), recording the screen with sound, extracting text from the screen, blurring sensitive information, annotating screenshots, and collecting everything into a Word document.
+A Windows desktop tool for taking screenshots (whole screen, a region, or a full scrolling page), annotating and copying them, recording the screen with sound, extracting text from the screen, blurring sensitive information, and collecting everything into a Word document.
 
 > Screenshots in this manual were taken on a test machine, so fonts look slightly different from Windows, where the app uses Segoe UI. Layout and buttons are the same.
 
@@ -19,7 +19,7 @@ A Windows desktop tool for taking screenshots (whole screen, a region, or a full
    - [Full Page (scrolling capture)](#full-page-scrolling-capture)
    - [Extract Text (OCR)](#extract-text-ocr)
 7. [Blur sensitive information](#7-blur-sensitive-information)
-8. [Annotate (highlighter, pen, shapes)](#8-annotate-highlighter-pen-shapes)
+8. [Review window: annotate, copy, save](#8-review-window-annotate-copy-save)
 9. [Screen recording](#9-screen-recording)
 10. [Keyboard shortcuts](#10-keyboard-shortcuts)
 11. [File names](#11-file-names)
@@ -97,7 +97,6 @@ The window opens in the middle of the screen you're working on, and is made up o
 | **Save location** | The folder where screenshots, recordings and text files are saved |
 | **Word document** *(optional)* | A `.docx` that screenshots are added to automatically |
 | **Screenshot & text** | Capture Screen, Capture Region, Full Page, Extract Text, and the blur option |
-| **Annotate** | Highlighter, pen and shapes for screenshots |
 | **Screen recording** | Record the whole screen or a region, with sound |
 | **Status bar** (bottom) | What just happened |
 
@@ -149,14 +148,14 @@ Collect screenshots straight into a Word document, in the order you take them.
 ### Capture Screen
 *Shortcut: **Ctrl+Shift+F***
 
-Click **Capture Screen**. The app hides itself, captures the entire desktop (all monitors), and saves the screenshot.
+Click **Capture Screen**. The app hides itself and captures the entire desktop (all monitors). The screenshot then opens in the [Review window](#8-review-window-annotate-copy-save), where you can annotate it, copy it or save it.
 
 ### Capture Region
 *Shortcut: **Ctrl+Shift+R***
 
 1. Click **Capture Region**. The screen dims.
 2. **Drag** a rectangle around the area you want, then let go.
-3. The area is saved.
+3. The area opens in the [Review window](#8-review-window-annotate-copy-save).
 
 Press **Esc** to cancel.
 
@@ -169,13 +168,13 @@ Captures a page that's longer than the screen, such as a long web page or a sing
 2. Click **Full Page**. The screen dims and shows a hint at the top.
 3. **Drag over only the part that scrolls**, for example the web page content, starting below the browser's address bar and tabs. Including the scrollbar is fine.
 4. Let go. The app scrolls the page **to the top**, then scrolls down step by step and stitches the screens together.
-5. When it reaches the bottom, the image is saved to PNG or Word like any other screenshot.
+5. When it reaches the bottom, the tall image opens in the [Review window](#8-review-window-annotate-copy-save), like any other screenshot.
 
 While it works, the app shrinks to a small progress bar:
 
 ![Full page progress bar](docs/images/full-page-bar.png)
 
-- **Stop & Save**, or **Esc**, stops at any time and **saves what has been captured so far**.
+- **Stop & Save**, or **Esc**, stops at any time and **keeps what has been captured so far**. It opens in the Review window.
 - **Fixed headers and footers**, common in single-page apps, are detected and appear only once.
 - **Small animations**, such as blinking cursors, spinners or clocks, are tolerated.
 - **Safety limits:** 20,000 pixels tall, 80 scroll steps, or 3 minutes.
@@ -219,7 +218,7 @@ Hide passwords, account numbers, names and other sensitive details before a scre
 1. Turn on **Review & blur before saving**, in the Screenshot & text section.
 2. Take a screenshot. The **Blur sensitive information** window opens.
 3. **Drag a box** over each thing you want to hide. It is blurred immediately.
-4. Click **Save**. The blurred screenshot goes to PNG or Word as usual.
+4. Click **Save**. The blurred screenshot then opens in the [Review window](#8-review-window-annotate-copy-save).
 
 ![Blur window](docs/images/blur-window.png)
 
@@ -239,39 +238,44 @@ The dashed outlines only show you what's blurred. They are **not** saved in the 
 
 ---
 
-## 8. Annotate (highlighter, pen, shapes)
+## 8. Review window: annotate, copy, save
 
-Mark up screenshots: highlight text, write or draw freehand, and add rectangles or circles.
+After **every** capture (Capture Screen, Capture Region and Full Page), the screenshot opens in the **Review & annotate** window. Nothing is saved until you choose to. If **Review & blur before saving** is on, the Blur window comes first.
 
-**Annotate every screenshot before saving:**
-1. Turn on **Annotate before saving**, in the Annotate section.
-2. Take a screenshot. The **Annotate** window opens.
-3. Pick a tool, colour and thickness, then draw on the image.
-4. Click **Save**.
+![Review window](docs/images/review-window.png)
 
-![Annotate window](docs/images/annotate-window.png)
+**What you can do:**
 
-**Tools:**
+| Button | What it does |
+|---|---|
+| **Copy** (or **Ctrl+C**) | Copies the screenshot, including your annotations, to the clipboard, so you can **paste it into Teams, Outlook, Word, Paint, etc.** with **Ctrl+V**. The window stays open, so you can still save afterwards. |
+| **Save** / **Save to Word** (or **Enter**) | Saves to your folder, or adds it to your Word document if one is selected |
+| **Cancel** (or **Esc**) | Closes without saving. If you copied first, the image stays on the clipboard. |
+
+Annotating is optional; you can just click Copy or Save straight away.
+
+**Annotation tools:**
 
 | Tool | Key | How to use |
 |---|---|---|
 | **Highlighter** | H | Drag over text, like a real marker. The text stays dark and readable. |
 | **Pen** | P | Draw or write freehand |
+| **Eraser** | X | Drag over pen or highlighter marks to rub them out, fully or partly. Rectangles, circles and the screenshot itself are never erased. |
 | **Rectangle** | R | Drag to draw a box |
 | **Rounded** | U | Drag to draw a box with rounded corners |
 | **Circle** | E | Drag to draw a circle or ellipse |
 
 **Options:**
 - **Colour:** nine preset colours, or **+** for any colour.
-- **Thickness:** five sizes, shown as dots. The highlighter has its own, wider set of sizes.
+- **Thickness:** five sizes, shown as dots. The highlighter and eraser have their own, wider set of sizes. The eraser has no colour, so the colour row is hidden while it's selected.
 - **Remembered settings:** each tool remembers its own colour and thickness, so the highlighter can stay yellow while the pen stays red.
 - **Shift:** hold it while drawing a rectangle or circle for a **perfect square or circle**.
 - **Undo / Clear:** **Undo** (Ctrl+Z) removes the last change, and **Clear all** removes everything.
-- **Save / Cancel:** **Save** (Enter) saves, and **Cancel** (Esc) discards.
 
-**Annotate an existing image:** click **Annotate an image...**. A copy named `<name>_annotated.png` is saved.
-
-**Using Blur and Annotate together:** turn on both. Each screenshot opens in the **Blur** window first, then in the **Annotate** window, and is then saved.
+**Quick recipes:**
+- **Share in Teams or email without saving:** capture, then **Copy**, then **Cancel**. Paste it into the chat or email with **Ctrl+V**.
+- **Save and share:** capture, then **Copy**, then **Save**.
+- **Blur and annotate:** turn on **Review & blur before saving**. Each screenshot goes Blur window, then Review window, then Save.
 
 ---
 
@@ -328,14 +332,15 @@ These work while the Screen Capture Utility window is active.
 | **Ctrl+Shift+P** | Pause / resume recording |
 | **Esc** | Cancel a selection, or stop a Full Page capture (saves what was captured) |
 
-In the **Blur** and **Annotate** windows:
+In the **Blur** and **Review** windows:
 
 | Shortcut | Action |
 |---|---|
+| **Ctrl+C** | Copy the screenshot to the clipboard (Review window) |
 | **Ctrl+Z** | Undo |
 | **Enter** | Save |
 | **Esc** | Cancel |
-| **H / P / R / U / E** | Annotate tools: Highlighter / Pen / Rectangle / Rounded / Circle |
+| **H / P / X / R / U / E** | Review window tools: Highlighter / Pen / Eraser / Rectangle / Rounded / Circle |
 | **Shift** (while drawing) | Perfect square / circle |
 
 ---
@@ -350,7 +355,6 @@ Files are saved in the **Save location** folder. If two files would get the same
 | Recording | `Recording_YYYY-MM-DD_HH-MM-SS.mp4` |
 | Extracted text | `Text_YYYY-MM-DD_HH-MM-SS.txt` (you can rename it when saving) |
 | Blurred copy of an image | `<original name>_blurred.png` |
-| Annotated copy of an image | `<original name>_annotated.png` |
 
 ---
 
@@ -384,6 +388,7 @@ That single `.exe` contains everything, including ffmpeg, the Word library, soun
 | **"Can't use this document"** | Only `.docx` files work. Re-save `.doc` files as `.docx` in Word. |
 | **Full Page doesn't scroll** | Select only the scrolling content (not the address bar, tabs or side menus). Check with your mouse wheel which part scrolls. |
 | **Full Page shows a seam or repeated part** | Moving content (video, carousel) changed between steps. Pause it and try again. |
+| **Copied image doesn't paste** | Click **Copy** again just before pasting (another app may have replaced the clipboard), then press **Ctrl+V** in Teams / Outlook. |
 | **Full Page won't finish** | Click **Stop & Save** or press **Esc**. What was captured is saved. |
 | **"No OCR language is installed"** | Add a language in **Settings → Time & language → Language & region**. |
 | **Recording has no microphone sound** | Turn on **Settings → Privacy & security → Microphone → Let desktop apps access your microphone**, and check the **Microphone** switch. |
