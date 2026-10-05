@@ -94,7 +94,7 @@ The window opens in the middle of the screen you're working on, and is made up o
 
 | Section | What it's for |
 |---|---|
-| **Save location** | The folder where screenshots, recordings and text files are saved |
+| **Save location** <span style="color:#E5484D">\*</span> *(required)* | The folder where screenshots, recordings and text files are saved. The red asterisk means you must choose one before capturing or recording. |
 | **Word document** *(optional)* | A `.docx` that screenshots are added to automatically |
 | **Screenshot & text** | Capture Screen, Capture Region, Full Page, Extract Text, and the blur option |
 | **Screen recording** | Record the whole screen or a region, with sound |
@@ -109,6 +109,8 @@ The window opens in the middle of the screen you're working on, and is made up o
 ---
 
 ## 4. Save location
+
+This is the only **required** setting, marked with a red asterisk (**\***). Until a folder is chosen, the status bar also shows a red asterisk next to "Choose a folder to save screenshots and recordings."
 
 1. Click **Browse** and choose a folder, or type a path into the box.
 2. If the folder doesn't exist, the app offers to create it.
@@ -260,16 +262,15 @@ Annotating is optional; you can just click Copy or Save straight away.
 |---|---|---|
 | **Highlighter** | H | Drag over text, like a real marker. The text stays dark and readable. |
 | **Pen** | P | Draw or write freehand |
-| **Eraser** | X | Drag over pen or highlighter marks to rub them out, fully or partly. Rectangles, circles and the screenshot itself are never erased. |
+| **Eraser** | X | Drag over pen or highlighter marks to rub them out, fully or partly. Rectangles, lines and the screenshot itself are never erased. |
 | **Rectangle** | R | Drag to draw a box |
-| **Rounded** | U | Drag to draw a box with rounded corners |
-| **Circle** | E | Drag to draw a circle or ellipse |
+| **Line** | L | Drag from one end to the other to draw a straight line. Pick the thickness from the five sizes. |
 
 **Options:**
 - **Colour:** nine preset colours, or **+** for any colour.
 - **Thickness:** five sizes, shown as dots. The highlighter and eraser have their own, wider set of sizes. The eraser has no colour, so the colour row is hidden while it's selected.
 - **Remembered settings:** each tool remembers its own colour and thickness, so the highlighter can stay yellow while the pen stays red.
-- **Shift:** hold it while drawing a rectangle or circle for a **perfect square or circle**.
+- **Shift:** hold it while drawing a rectangle for a **perfect square**, or while drawing a line to keep it **perfectly horizontal, vertical or at 45°**.
 - **Undo / Clear:** **Undo** (Ctrl+Z) removes the last change, and **Clear all** removes everything.
 
 **Quick recipes:**
@@ -340,8 +341,8 @@ In the **Blur** and **Review** windows:
 | **Ctrl+Z** | Undo |
 | **Enter** | Save |
 | **Esc** | Cancel |
-| **H / P / X / R / U / E** | Review window tools: Highlighter / Pen / Eraser / Rectangle / Rounded / Circle |
-| **Shift** (while drawing) | Perfect square / circle |
+| **H / P / X / R / L** | Review window tools: Highlighter / Pen / Eraser / Rectangle / Line |
+| **Shift** (while drawing) | Perfect square, or a straight horizontal / vertical / 45° line |
 
 ---
 

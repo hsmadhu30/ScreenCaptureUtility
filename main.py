@@ -1415,12 +1415,13 @@ def copy_image_to_clipboard(image):
 
 class AnnotateEditor:
     """Review window shown after each capture: annotate the screenshot with
-    highlighter, pen and shapes, then Copy (clipboard), Save or Cancel.
+    highlighter, pen, rectangles and straight lines, then Copy (clipboard),
+    Save or Cancel.
 
     Tools (keyboard shortcut):
-      Highlighter (H)  Pen (P)  Rectangle (R)
-      Rounded rectangle (U)  Circle / ellipse (E)
-    Hold Shift while drawing a shape for a perfect square / circle.
+      Highlighter (H)  Pen (P)  Eraser (X)  Rectangle (R)  Line (L)
+    Hold Shift while drawing for a perfect square, or a line snapped to
+    horizontal / vertical / 45 degrees.
     Ctrl+Z undoes the last change, Enter saves, Esc cancels.
     """
 
@@ -1429,8 +1430,7 @@ class AnnotateEditor:
         ("pen", "Pen", "P"),
         ("eraser", "Eraser", "X"),
         ("rect", "Rectangle", "R"),
-        ("roundrect", "Rounded", "U"),
-        ("ellipse", "Circle", "E"),
+        ("line", "Line", "L"),
     ]
     COLORS = ["#E5484D", "#F97316", "#FACC15", "#22C55E", "#3B82F6",
               "#8B5CF6", "#EC4899", "#111827", "#FFFFFF"]
@@ -1451,8 +1451,7 @@ class AnnotateEditor:
             "pen": {"color": "#E5484D", "size": 1},
             "eraser": {"color": None, "size": 2},
             "rect": {"color": "#E5484D", "size": 1},
-            "roundrect": {"color": "#3B82F6", "size": 1},
-            "ellipse": {"color": "#E5484D", "size": 1},
+            "line": {"color": "#E5484D", "size": 1},
         }
 
         self.win = tk.Toplevel(root)
@@ -1662,7 +1661,7 @@ class AnnotateEditor:
 
     # Annotations are kept on transparent layers over the screenshot:
     #   highlight layer (multiplied onto the image, like a real marker),
-    #   ink layer (pen), shape layer (rectangles / circles, always on top).
+    #   ink layer (pen), shape layer (rectangles / lines, always on top).
     # The eraser clears pixels on the highlight and ink layers only, so it
     # removes pen and highlighter marks but never shapes or the screenshot.
 
@@ -1688,6 +1687,8 @@ class AnnotateEditor:
         elif kind == "eraser":
             for layer in (self.hl_layer, self.ink_layer):
                 draw_path(layer, op["points"], (0, 0, 0, 0), op["width"])
+        elif kind == "line":
+            draw_line(self.shape_layer, op["points"], op["color"], op["width"])
         else:
             draw_shape(self.shape_layer, kind, op["box"], op["color"], op["width"])
 
@@ -1732,9 +1733,22 @@ class AnnotateEditor:
         return self._clamp(self.canvas.canvasx(event.x), self.canvas.canvasy(event.y))
 
     def _shape_end(self, event):
-        """End point of a shape; Shift makes it a square / circle."""
+        """End point of a shape; Shift makes a square, or snaps a line
+        to horizontal / vertical / 45 degrees."""
         x, y = self._point(event)
-        if event.state & 0x0001 and self.tool in ("rect", "roundrect", "ellipse"):
+        if event.state & 0x0001 and self.tool == "line":
+            x0, y0 = self.drag_start
+            dx, dy = x - x0, y - y0
+            if abs(dx) > 2.414 * abs(dy):        # within 22.5 deg of horizontal
+                y = y0
+            elif abs(dy) > 2.414 * abs(dx):      # within 22.5 deg of vertical
+                x = x0
+            else:                                # diagonal
+                side = max(abs(dx), abs(dy))
+                x = x0 + side * (1 if dx >= 0 else -1)
+                y = y0 + side * (1 if dy >= 0 else -1)
+            x, y = self._clamp(x, y)
+        elif event.state & 0x0001 and self.tool == "rect":
             x0, y0 = self.drag_start
             side = max(abs(x - x0), abs(y - y0))
             x = x0 + side * (1 if x >= x0 else -1)
@@ -1787,19 +1801,12 @@ class AnnotateEditor:
         self._clear_preview()
         setting = self.settings[tool]
         width = self._screen_width()
-        if tool == "rect":
-            item = self.canvas.create_rectangle(x0, y0, x1, y1, outline=setting["color"], width=width)
-        elif tool == "ellipse":
-            item = self.canvas.create_oval(x0, y0, x1, y1, outline=setting["color"], width=width)
+        if tool == "line":
+            item = self.canvas.create_line(x0, y0, x1, y1, fill=setting["color"],
+                                           width=width, capstyle="round")
         else:
-            item = self.canvas.create_polygon(
-                rounded_rect_points(x0, y0, x1, y1, self._corner_radius(x0, y0, x1, y1, width)),
-                smooth=True, fill="", outline=setting["color"], width=width)
+            item = self.canvas.create_rectangle(x0, y0, x1, y1, outline=setting["color"], width=width)
         self.preview.append(item)
-
-    @staticmethod
-    def _corner_radius(x0, y0, x1, y1, width):
-        return min(max(10, width * 3), abs(x1 - x0) / 3, abs(y1 - y0) / 3)
 
     def _release(self, event):
         if self.drag_start is None:
@@ -1821,6 +1828,16 @@ class AnnotateEditor:
                 self.drag_start = None
                 self.stroke = []
                 return
+        elif tool == "line":
+            x0, y0 = self.drag_start
+            x1, y1 = self._shape_end(event)
+            self.drag_start = None
+            if abs(x1 - x0) + abs(y1 - y0) < 3:      # just a click
+                return
+            setting = self.settings[tool]
+            op = {"type": "line", "color": setting["color"],
+                  "width": max(1, round(self._screen_width() / s)),
+                  "points": [(x0 / s, y0 / s), (x1 / s, y1 / s)]}
         else:
             x0, y0 = self.drag_start
             x1, y1 = self._shape_end(event)
@@ -1899,14 +1916,6 @@ class AnnotateEditor:
                        if self.copied else "Screenshot discarded")
 
 
-def rounded_rect_points(x0, y0, x1, y1, r):
-    """Points for a smoothed Tk polygon that looks like a rounded rectangle."""
-    x0, x1 = min(x0, x1), max(x0, x1)
-    y0, y1 = min(y0, y1), max(y0, y1)
-    return [x0 + r, y0, x1 - r, y0, x1, y0, x1, y0 + r, x1, y1 - r, x1, y1,
-            x1 - r, y1, x0 + r, y1, x0, y1, x0, y1 - r, x0, y0 + r, x0, y0]
-
-
 def _hex_rgb(color):
     color = color.lstrip("#")
     return tuple(int(color[i:i + 2], 16) for i in (0, 2, 4))
@@ -1969,11 +1978,18 @@ def draw_shape(image, kind, box, color, width):
     x0, y0, x1, y1 = box
     if kind == "rect":
         d.rectangle(box, outline=rgb, width=width)
-    elif kind == "ellipse":
-        d.ellipse(box, outline=rgb, width=width)
-    elif kind == "roundrect":
-        radius = int(AnnotateEditor._corner_radius(x0, y0, x1, y1, width))
-        d.rounded_rectangle(box, radius=max(1, radius), outline=rgb, width=width)
+
+
+def draw_line(image, points, color, width):
+    """Straight line with round ends."""
+    d = ImageDraw.Draw(image)
+    rgb = _hex_rgb(color) + ((255,) if image.mode == "RGBA" else ())
+    (x0, y0), (x1, y1) = points
+    d.line([(x0, y0), (x1, y1)], fill=rgb, width=width)
+    if width > 2:
+        r = width / 2
+        for x, y in ((x0, y0), (x1, y1)):
+            d.ellipse([x - r, y - r, x + r, y + r], fill=rgb)
 
 
 SIZE_DOT_CACHE = {}
@@ -3629,11 +3645,11 @@ def draw_icon(kind, color, size, accent=RED):
     elif kind == "rect":
         d.rectangle(box(3, 5, 21, 19), outline=color, width=w)
 
-    elif kind == "roundrect":
-        d.rounded_rectangle(box(3, 5, 21, 19), radius=4.5 * u, outline=color, width=w)
-
-    elif kind == "ellipse":
-        d.ellipse(box(3, 4, 21, 20), outline=color, width=w)
+    elif kind == "line":
+        d.line([(4 * u, 20 * u), (20 * u, 4 * u)], fill=color, width=int(w * 1.3))
+        for x, y in ((4, 20), (20, 4)):
+            r = w * 0.65
+            d.ellipse([x * u - r, y * u - r, x * u + r, y * u + r], fill=color)
 
     elif kind == "fullpage":
         d.rounded_rectangle(box(5, 2, 19, 22), radius=2 * u, outline=color, width=w)
@@ -3877,12 +3893,15 @@ class Toggle(tk.Frame):
 class Card(tk.Frame):
     """White section card with a clear heading and optional badge."""
 
-    def __init__(self, parent, title, badge=None):
+    def __init__(self, parent, title, badge=None, required=False):
         super().__init__(parent, bg=CARD, highlightthickness=1, highlightbackground=BORDER)
         head = tk.Frame(self, bg=CARD)
         head.pack(fill="x", padx=S(20), pady=(S(11), S(8)))
         tk.Frame(head, bg=ACCENT, width=S(4), height=S(16)).pack(side="left", padx=(0, S(8)))
         tk.Label(head, text=title.upper(), font=F_SECTION, fg=TEXT, bg=CARD).pack(side="left")
+        if required:   # red asterisk = must be filled in
+            tk.Label(head, text="*", font=(F_SECTION[0], F_SECTION[1] + 3, "bold"),
+                     fg=RED, bg=CARD).pack(side="left", padx=(S(3), 0))
         self.badge = tk.Label(head, font=F_SECTION, bg=ACCENT_SOFT, fg=ACCENT, padx=S(8), pady=S(1))
         if badge:
             self.set_badge(badge)
@@ -3953,7 +3972,7 @@ content.pack(fill="both", padx=S(24), pady=(S(16), S(4)))
 # Save Location Card
 # ============================================================
 
-folder_card = Card(content, "Save location")
+folder_card = Card(content, "Save location", required=True)
 folder_card.pack(fill="x", pady=(0, S(12)))
 
 entry_row = tk.Frame(folder_card.body, bg=CARD)
@@ -4116,7 +4135,8 @@ if not RECORDING_AVAILABLE:
 status_bar = tk.Frame(main_frame, bg=CARD, highlightthickness=1, highlightbackground=BORDER)
 status_bar.pack(fill="x", side="bottom")
 
-status_dot = tk.Label(status_bar, bg=CARD)
+status_dot = tk.Label(status_bar, bg=CARD, fg=RED, bd=0, padx=0, pady=0,
+                      font=(F_BODY[0], F_BODY[1] + 3, "bold"))
 status_dot.pack(side="left", anchor="n", padx=(S(16), S(8)), pady=(S(13), 0))
 
 status_label = tk.Label(
@@ -4136,6 +4156,13 @@ def update_status_dot(*args):
     """Colour the status dot by message type: green = done,
     amber = busy or needs attention, red = problem, indigo = info."""
     text = status_var.get().strip().lower()
+    if text.startswith(("choose a folder", "no save folder")):
+        # the save folder is mandatory - mark it with a red asterisk
+        status_dot.configure(image="", text="*")
+        status_dot.pack_configure(anchor="center", pady=0)
+        return
+    status_dot.configure(text="")
+    status_dot.pack_configure(anchor="n", pady=(S(13), 0))
     if (text.startswith(("recording failed", "could not", "error"))
             or "cancelled" in text or "too small" in text):
         color = RED
