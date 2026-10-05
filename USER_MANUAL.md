@@ -256,15 +256,35 @@ After **every** capture (Capture Screen, Capture Region and Full Page), the scre
 
 Annotating is optional; you can just click Copy or Save straight away.
 
+**Window size:** the Review window has the usual **Minimize** and **Maximize** buttons, and you can drag its edges to resize it. The screenshot is scaled to fit the window; maximize it to see a large screenshot at full size. A minimized Review window can be brought back from its taskbar button. Very tall Full Page captures scroll with the mouse wheel. The top-right corner shows the image size in pixels and the number of changes.
+
 **Annotation tools:**
 
 | Tool | Key | How to use |
 |---|---|---|
 | **Highlighter** | H | Drag over text, like a real marker. The text stays dark and readable. |
 | **Pen** | P | Draw or write freehand |
-| **Eraser** | X | Drag over pen or highlighter marks to rub them out, fully or partly. Rectangles, lines and the screenshot itself are never erased. |
+| **Eraser** | X | Drag over pen or highlighter marks to rub them out, fully or partly. Rectangles, lines, text notes and the screenshot itself are never erased. |
 | **Rectangle** | R | Drag to draw a box |
 | **Line** | L | Drag from one end to the other to draw a straight line. Pick the thickness from the five sizes. |
+| **Text** | T | Click where the note should go and type. **Enter** finishes it, **Shift+Enter** starts a new line, and **Esc** removes the note you're typing. Clicking elsewhere on the screenshot also finishes it. |
+| **Crop** | C | Drag over the part you want to keep. The rest is dimmed and the selection size is shown. Click **Apply crop** (or press **Enter**) to cut the screenshot down to it. Drag again to change the selection, or click **Clear selection** (or press **Esc**). |
+
+**Text notes:**
+- **Colour:** pick it from the swatches, before or while typing.
+- **Size:** five letter sizes, from small to large.
+- **Background:** on by default. It puts the note on a white box with a thin outline in the text colour, so it stands out on busy screenshots. Turn it off for plain text. A light text colour, such as white or yellow, gets a dark box instead.
+- **Removing a note:** use **Undo**. The Eraser only rubs out pen and highlighter marks.
+- **While typing,** letters go into the note and don't switch tools. **Save** or **Copy** includes the note you're typing.
+
+**Cropping:**
+
+![Selecting an area to crop](docs/images/crop-selection.png)
+
+- After **Apply crop**, the window switches back to the tool you were using, so you can keep annotating the cropped image.
+- You can crop more than once to trim further.
+- **Undo** (Ctrl+Z) brings back the uncropped screenshot. Any marks you drew outside the cropped area come back too.
+- **Copy**, **Save** and **Save to Word** always use the cropped image.
 
 **Options:**
 - **Colour:** nine preset colours, or **+** for any colour.
@@ -339,9 +359,9 @@ In the **Blur** and **Review** windows:
 |---|---|
 | **Ctrl+C** | Copy the screenshot to the clipboard (Review window) |
 | **Ctrl+Z** | Undo |
-| **Enter** | Save |
-| **Esc** | Cancel |
-| **H / P / X / R / L** | Review window tools: Highlighter / Pen / Eraser / Rectangle / Line |
+| **Enter** | Save (in the Review window, applies the crop instead while a crop area is selected) |
+| **Esc** | Cancel (in the Review window, clears the crop selection instead while one is selected) |
+| **H / P / X / R / L / T / C** | Review window tools: Highlighter / Pen / Eraser / Rectangle / Line / Text / Crop |
 | **Shift** (while drawing) | Perfect square, or a straight horizontal / vertical / 45° line |
 
 ---

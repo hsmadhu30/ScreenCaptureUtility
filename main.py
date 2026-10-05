@@ -1420,8 +1420,14 @@ class AnnotateEditor:
 
     Tools (keyboard shortcut):
       Highlighter (H)  Pen (P)  Eraser (X)  Rectangle (R)  Line (L)
+      Text (T)  Crop (C)
+    Text: click where the note should go and type; Enter finishes,
+    Shift+Enter starts a new line, Esc removes the note being typed.
     Hold Shift while drawing for a perfect square, or a line snapped to
     horizontal / vertical / 45 degrees.
+    Crop: drag the area to keep, then Apply crop (or Enter). Undo reverts it.
+    The window can be minimized, maximized and resized; the screenshot
+    is scaled to fit.
     Ctrl+Z undoes the last change, Enter saves, Esc cancels.
     """
 
@@ -1431,11 +1437,14 @@ class AnnotateEditor:
         ("eraser", "Eraser", "X"),
         ("rect", "Rectangle", "R"),
         ("line", "Line", "L"),
+        ("text", "Text", "T"),
+        ("crop", "Crop", "C"),
     ]
     COLORS = ["#E5484D", "#F97316", "#FACC15", "#22C55E", "#3B82F6",
               "#8B5CF6", "#EC4899", "#111827", "#FFFFFF"]
     # thickness choices in screen pixels (what you see while drawing)
-    SIZES = {"highlight": [10, 16, 24, 34, 46], "default": [2, 3, 5, 8, 12]}
+    SIZES = {"highlight": [10, 16, 24, 34, 46], "default": [2, 3, 5, 8, 12],
+             "text": [14, 18, 24, 32, 44]}         # text: letter size in screen px
 
     def __init__(self, image, on_save, title="", save_label="Save"):
         self.original = image.convert("RGB")
@@ -1452,12 +1461,21 @@ class AnnotateEditor:
             "eraser": {"color": None, "size": 2},
             "rect": {"color": "#E5484D", "size": 1},
             "line": {"color": "#E5484D", "size": 1},
+            "text": {"color": "#E5484D", "size": 2},
+            "crop": {"color": None, "size": 0},
         }
+        self.text_edit = None            # note being typed: (widget, canvas item, image pos)
+        self.crop_sel = None             # pending crop selection (canvas coords)
+        self.prev_tool = "highlight"     # tool to return to after cropping
+        self._relayout_job = None
+        self._last_canvas_size = None
 
         self.win = tk.Toplevel(root)
         self.win.title("Review screenshot")
         self.win.configure(bg=BG)
-        self.win.transient(root)
+        # Not transient: a normal window gets Minimize / Maximize buttons
+        # and its own taskbar button, and can be resized.
+        self.win.resizable(True, True)
         self.win.protocol("WM_DELETE_WINDOW", self.cancel)
 
         # --- header ---------------------------------------------------
@@ -1527,8 +1545,9 @@ class AnnotateEditor:
 
         self.size_frame = tk.Frame(bar2, bg=CARD)
         self.size_frame.pack(side="left", padx=S(14), pady=S(7))
-        tk.Label(self.size_frame, text="Thickness", font=F_BODY_BOLD, fg=TEXT,
-                 bg=CARD).pack(side="left", padx=(0, S(8)))
+        self.size_label = tk.Label(self.size_frame, text="Thickness", font=F_BODY_BOLD,
+                                   fg=TEXT, bg=CARD)
+        self.size_label.pack(side="left", padx=(0, S(8)))
         self.size_buttons = []
         for i in range(5):
             b = tk.Label(self.size_frame, image=size_dot_image(i, False), bg=CARD,
@@ -1537,41 +1556,26 @@ class AnnotateEditor:
             b.bind("<Button-1>", lambda e, i=i: self.set_size(i))
             self.size_buttons.append(b)
 
-        # --- image canvas -------------------------------------------
-        left, top, width, height = screen_work_area()
-        max_w, max_h = int(width * 0.82), int(height * 0.56)
-        iw, ih = self.original.size
-        width_scale = min(1.0, max_w / iw)
-        # Tall images (full-page captures) are shown at a readable width
-        # with a scrollbar instead of being squeezed to fit the screen
-        self.tall = ih * width_scale > max_h * 1.3
-        self.scale = width_scale if self.tall else min(1.0, max_w / iw, max_h / ih)
-        self.view_w = max(1, int(iw * self.scale))
-        self.view_h = max(1, int(ih * self.scale))
+        # text option: white (or dark) box behind the note so it stands out
+        self.text_box_var = tk.BooleanVar(value=True)
+        self.text_box_toggle = Toggle(bar2, "Background", self.text_box_var)
+        self.text_box_var.trace_add("write", lambda *a: self._style_text_widget())
 
-        frame = tk.Frame(body, bg=CARD, highlightthickness=1, highlightbackground=FIELD_BORDER)
-        frame.pack(pady=(S(10), 0))
-        self.canvas = tk.Canvas(frame, width=self.view_w, height=min(self.view_h, max_h),
-                                bg="#2A2F3A", highlightthickness=0, cursor="crosshair",
-                                scrollregion=(0, 0, self.view_w, self.view_h))
-        if self.tall:
-            scroll = tk.Scrollbar(frame, orient="vertical", command=self.canvas.yview)
-            self.canvas.configure(yscrollcommand=scroll.set)
-            scroll.pack(side="right", fill="y")
-            self.canvas.bind("<MouseWheel>", lambda e: self.canvas.yview_scroll(
-                int(-e.delta / 120) * 3, "units"))
-            self.canvas.bind("<Button-4>", lambda e: self.canvas.yview_scroll(-3, "units"))
-            self.canvas.bind("<Button-5>", lambda e: self.canvas.yview_scroll(3, "units"))
-        self.canvas.pack(side="left")
-        self.image_item = self.canvas.create_image(0, 0, anchor="nw")
+        # crop controls (shown instead of colour / thickness for Crop)
+        self.crop_frame = tk.Frame(bar2, bg=CARD)
+        self.crop_hint = tk.Label(self.crop_frame, text="Drag over the part you want to keep",
+                                  font=F_BODY, fg=MUTED, bg=CARD)
+        self.crop_hint.pack(side="left", padx=(0, S(12)))
+        self.crop_apply = FlatButton(self.crop_frame, "Apply crop", self.apply_crop,
+                                     style="primary")
+        self.crop_apply.pack(side="left")
+        self.crop_cancel = FlatButton(self.crop_frame, "Clear selection", self.clear_crop_selection)
+        self.crop_cancel.pack(side="left", padx=(S(6), 0))
 
-        self.canvas.bind("<ButtonPress-1>", self._press)
-        self.canvas.bind("<B1-Motion>", self._drag)
-        self.canvas.bind("<ButtonRelease-1>", self._release)
-
-        # --- bottom buttons -----------------------------------------
+        # --- bottom buttons (packed first so they stay visible when the
+        #     window is made smaller) ---------------------------------
         bottom = tk.Frame(body, bg=BG)
-        bottom.pack(fill="x", pady=(S(10), 0))
+        bottom.pack(side="bottom", fill="x", pady=(S(10), 0))
         self.copied = False
         self.copy_button = FlatButton(bottom, "Copy", self.copy,
                                       icons={"Copy": icon("copy", TEXT, 15),
@@ -1580,12 +1584,40 @@ class AnnotateEditor:
         FlatButton(bottom, save_label, self.save, style="primary").pack(side="right")
         FlatButton(bottom, "Cancel", self.cancel).pack(side="right", padx=(0, S(6)))
 
+        # --- image canvas -------------------------------------------
+        left, top, width, height = screen_work_area()
+        max_w, max_h = int(width * 0.82), int(height * 0.56)
+        self.crop_box = (0, 0) + self.original.size
+
+        frame = tk.Frame(body, bg=CARD, highlightthickness=1, highlightbackground=FIELD_BORDER)
+        frame.pack(fill="both", expand=True, pady=(S(10), 0))
+        self.canvas = tk.Canvas(frame, bg="#2A2F3A", highlightthickness=0, cursor="crosshair")
+        self.scroll = tk.Scrollbar(frame, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=self.scroll.set)
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.image_item = self.canvas.create_image(0, 0, anchor="nw")
+        self.canvas.bind("<MouseWheel>", self._wheel)
+        self.canvas.bind("<Button-4>", lambda e: self.tall and self.canvas.yview_scroll(-3, "units"))
+        self.canvas.bind("<Button-5>", lambda e: self.tall and self.canvas.yview_scroll(3, "units"))
+
+        # initial size: fit the screenshot into most of the screen
+        self._layout(max_w, max_h)
+        canvas_w, canvas_h = self.view_w, min(self.view_h, max_h)
+        self.canvas.configure(width=canvas_w, height=canvas_h)
+        # lay out again for the canvas's actual size (centring, scroll area)
+        self._layout(canvas_w + (self.scroll.winfo_reqwidth() if self.tall else 0), canvas_h)
+
+        self.canvas.bind("<ButtonPress-1>", self._press)
+        self.canvas.bind("<B1-Motion>", self._drag)
+        self.canvas.bind("<ButtonRelease-1>", self._release)
+        self.canvas.bind("<Configure>", self._on_canvas_resize)
+
         self.win.bind("<Control-c>", lambda e: self.copy())
         self.win.bind("<Control-C>", lambda e: self.copy())
         self.win.bind("<Control-z>", lambda e: self.undo())
         self.win.bind("<Control-Z>", lambda e: self.undo())
-        self.win.bind("<Return>", lambda e: self.save())
-        self.win.bind("<Escape>", lambda e: self.cancel())
+        self.win.bind("<Return>", self._on_enter)
+        self.win.bind("<Escape>", self._on_escape)
 
         self._reset_layers()
         self.working = self.original.copy()
@@ -1595,6 +1627,8 @@ class AnnotateEditor:
         self.win.update_idletasks()
         w = self.win.winfo_reqwidth()
         h = self.win.winfo_reqheight() + S(39)
+        # can be made smaller, but not so small the toolbar is cut off
+        self.win.minsize(min(w, bar1.winfo_reqwidth() + S(40)), min(h, S(420)))
         self.win.geometry(f"+{left + max(0, (width - w) // 2)}+{top + max(0, (height - h) // 2)}")
         self.win.lift()
         self.win.focus_force()
@@ -1607,6 +1641,11 @@ class AnnotateEditor:
             self.tool_buttons[key].configure(bg="#EEF0F4" if on else CARD)
 
     def select_tool(self, key):
+        self._commit_text()
+        if key == "crop" and self.tool != "crop":
+            self.prev_tool = self.tool
+        if key != "crop":
+            self.clear_crop_selection()
         self.tool = key
         for k, b in self.tool_buttons.items():
             selected = k == key
@@ -1614,15 +1653,26 @@ class AnnotateEditor:
                         fg=ACCENT if selected else TEXT,
                         image=icon(k, ACCENT if selected else TEXT, 18),
                         highlightbackground=ACCENT if selected else CARD)
-        # the eraser has no colour - hide the colour row for it
-        if key == "eraser":
-            self.color_frame.pack_forget()
-        elif not self.color_frame.winfo_ismapped():
-            self.color_frame.pack(side="left", padx=S(10), pady=S(7), before=self.size_frame)
-        self.canvas.configure(cursor="circle" if key == "eraser" else "crosshair")
+        # Crop shows its own controls instead of colour / thickness;
+        # the eraser has no colour, so the colour row is hidden for it
+        for f in (self.color_frame, self.size_frame, self.crop_frame, self.text_box_toggle):
+            f.pack_forget()
+        if key == "crop":
+            self.crop_frame.pack(side="left", padx=S(10), pady=S(5))
+            self._update_crop_buttons()
+        else:
+            if key != "eraser":
+                self.color_frame.pack(side="left", padx=S(10), pady=S(7))
+            self.size_frame.pack(side="left", padx=S(14), pady=S(7))
+            if key == "text":
+                self.text_box_toggle.pack(side="left", padx=(S(4), S(10)), pady=S(7))
+        self.size_label.configure(text="Size" if key == "text" else "Thickness")
+        self.canvas.configure(cursor={"eraser": "circle", "text": "xterm"}.get(key, "crosshair"))
         self._show_color_and_size()
 
     def _show_color_and_size(self):
+        if self.tool == "crop":
+            return
         current = self.settings[self.tool]
         for color, sw in self.swatches.items():
             sw.configure(highlightbackground=TEXT if color == current["color"] else
@@ -1638,6 +1688,7 @@ class AnnotateEditor:
         if self.tool in self.settings:
             self.settings[self.tool]["color"] = color
             self._show_color_and_size()
+            self._style_text_widget()
 
     def pick_custom_color(self):
         from tkinter import colorchooser
@@ -1650,10 +1701,12 @@ class AnnotateEditor:
         if self.tool in self.settings:
             self.settings[self.tool]["size"] = index
             self._show_color_and_size()
+            self._style_text_widget()
 
     def _screen_width(self):
         """Selected thickness in screen pixels."""
         sizes = (self.SIZES["highlight"] if self.tool in ("highlight", "eraser")
+                 else self.SIZES["text"] if self.tool == "text"
                  else self.SIZES["default"])
         return sizes[self.settings[self.tool]["size"]]
 
@@ -1667,6 +1720,7 @@ class AnnotateEditor:
 
     def _reset_layers(self):
         size = self.original.size
+        self.crop_box = (0, 0) + size
         self.hl_layer = Image.new("RGBA", size, (0, 0, 0, 0))
         self.ink_layer = Image.new("RGBA", size, (0, 0, 0, 0))
         self.shape_layer = Image.new("RGBA", size, (0, 0, 0, 0))
@@ -1689,6 +1743,11 @@ class AnnotateEditor:
                 draw_path(layer, op["points"], (0, 0, 0, 0), op["width"])
         elif kind == "line":
             draw_line(self.shape_layer, op["points"], op["color"], op["width"])
+        elif kind == "crop":
+            self.crop_box = op["box"]     # annotations stay; only the view is cut
+        elif kind == "text":
+            draw_text(self.shape_layer, op["pos"], op["text"], op["color"],
+                      op["size"], op["box"])
         else:
             draw_shape(self.shape_layer, kind, op["box"], op["color"], op["width"])
 
@@ -1707,6 +1766,8 @@ class AnnotateEditor:
             if box:
                 part = layer.crop(box)
                 image.paste(part.convert("RGB"), box, part.getchannel("A"))
+        if self.crop_box != (0, 0) + image.size:
+            image = image.crop(self.crop_box)
         self.working = image
 
     def redraw(self):
@@ -1714,19 +1775,105 @@ class AnnotateEditor:
         if self.scale < 1.0:
             view = view.resize((self.view_w, self.view_h),
                                Image.BILINEAR if self.tall else Image.LANCZOS)
+        self.view_img = view              # what is on screen (for the crop overlay)
+        self._dim_img = None
         self.photo = ImageTk.PhotoImage(view)
         self.canvas.itemconfigure(self.image_item, image=self.photo)
+        self.canvas.coords(self.image_item, self.off_x, self.off_y)
 
         n = len(self.ops)
-        self.info.configure(text=f"{n} change{'s' if n != 1 else ''}")
+        w, h = self.working.size
+        self.info.configure(text=f"{w} \u00d7 {h} px   \u00b7   {n} change{'s' if n != 1 else ''}")
         state = "normal" if n else "disabled"
         self.undo_button.config(state=state)
         self.clear_button.config(state=state)
 
     # ---- mouse ------------------------------------------------------
 
+    # ---- layout (fits the screenshot to the window) -----------------
+
+    def _layout(self, avail_w, avail_h):
+        """Choose the display scale for the current (cropped) image so it
+        fits avail_w x avail_h. Tall images (full-page captures) are shown
+        at a readable width with a scrollbar instead."""
+        x0, y0, x1, y1 = self.crop_box
+        cw, ch = max(1, x1 - x0), max(1, y1 - y0)
+        sbw = self.scroll.winfo_reqwidth()
+        width_scale = min(1.0, avail_w / cw)
+        self.tall = ch * width_scale > avail_h * 1.3
+        if self.tall:
+            draw_w = max(1, avail_w - sbw)
+            self.scale = min(1.0, draw_w / cw)
+        else:
+            draw_w = avail_w
+            self.scale = min(1.0, avail_w / cw, avail_h / ch)
+        self.view_w = max(1, int(cw * self.scale))
+        self.view_h = max(1, int(ch * self.scale))
+        self.off_x = max(0, (draw_w - self.view_w) // 2)
+        self.off_y = 0 if self.tall else max(0, (avail_h - self.view_h) // 2)
+        if self.tall:
+            if not self.scroll.winfo_ismapped():
+                self.scroll.pack(side="right", fill="y", before=self.canvas)
+            self.canvas.configure(scrollregion=(0, 0, draw_w, self.view_h))
+        else:
+            self.scroll.pack_forget()
+            self.canvas.configure(scrollregion=(0, 0, avail_w, avail_h))
+            self.canvas.yview_moveto(0)
+
+    def _on_canvas_resize(self, event):
+        size = (event.width, event.height)
+        if size == self._last_canvas_size:
+            return
+        self._last_canvas_size = size
+        if self._relayout_job:
+            self.win.after_cancel(self._relayout_job)
+        self._relayout_job = self.win.after(60, self._relayout)
+
+    def _relayout(self):
+        """Re-fit after the window is resized / maximized or the image cropped."""
+        self._relayout_job = None
+        if not self.canvas.winfo_exists():
+            return
+        self._commit_text()
+        self.canvas.update_idletasks()
+        w, h = self.canvas.winfo_width(), self.canvas.winfo_height()
+        if w < 10 or h < 10:            # minimized
+            return
+        if self.scroll.winfo_ismapped():
+            w += self.scroll.winfo_width()
+        before = (self.scale, self.off_x, self.off_y, self.view_w, self.view_h,
+                  self.crop_box, getattr(self, "_shown_box", None))
+        self._layout(w, h)
+        self._shown_box = self.crop_box
+        if before == (self.scale, self.off_x, self.off_y, self.view_w, self.view_h,
+                      self.crop_box, self.crop_box):
+            return                       # nothing moved - keep any selection
+        self.clear_crop_selection()
+        self._clear_preview()
+        self.redraw()
+
+    def _wheel(self, event):
+        if self.tall:
+            self.canvas.yview_scroll(int(-event.delta / 120) * 3, "units")
+
     def _clamp(self, x, y):
-        return (min(max(x, 0), self.view_w), min(max(y, 0), self.view_h))
+        """Keep a canvas point on the image."""
+        return (min(max(x, self.off_x), self.off_x + self.view_w),
+                min(max(y, self.off_y), self.off_y + self.view_h))
+
+    def _img(self, x, y):
+        """Canvas point -> pixel position in the original screenshot."""
+        return ((x - self.off_x) / self.scale + self.crop_box[0],
+                (y - self.off_y) / self.scale + self.crop_box[1])
+
+    def _img_box(self, x0, y0, x1, y1):
+        """Canvas rectangle -> whole-pixel box in the original, kept inside
+        the current crop."""
+        ax, ay = self._img(min(x0, x1), min(y0, y1))
+        bx, by = self._img(max(x0, x1), max(y0, y1))
+        cx0, cy0, cx1, cy1 = self.crop_box
+        return (max(cx0, int(ax)), max(cy0, int(ay)),
+                min(cx1, int(round(bx))), min(cy1, int(round(by))))
 
     def _point(self, event):
         """Mouse position in view coordinates (accounts for scrolling)."""
@@ -1762,9 +1909,20 @@ class AnnotateEditor:
         self.preview = []
 
     def _press(self, event):
+        if self.text_edit is not None:       # click elsewhere = finish the note
+            self._commit_text()
+            self.drag_start = None
+            return
+        if self.tool == "text":
+            self.drag_start = None
+            self._start_text(*self._point(event))
+            return
         self.drag_start = self._point(event)
         self.stroke = [self.drag_start]
         self._clear_preview()
+        if self.tool == "crop":
+            self.crop_sel = None
+            self._update_crop_buttons()
 
     def _drag(self, event):
         if self.drag_start is None:
@@ -1799,6 +1957,9 @@ class AnnotateEditor:
         x0, y0 = self.drag_start
         x1, y1 = self._shape_end(event)
         self._clear_preview()
+        if tool == "crop":
+            self._draw_crop_selection(x0, y0, x1, y1)
+            return
         setting = self.settings[tool]
         width = self._screen_width()
         if tool == "line":
@@ -1813,6 +1974,16 @@ class AnnotateEditor:
             return
         tool = self.tool
         s = self.scale
+        if tool == "crop":
+            x0, y0 = self.drag_start
+            x1, y1 = self._point(event)
+            self.drag_start = None
+            self._clear_preview()
+            if abs(x1 - x0) >= 5 and abs(y1 - y0) >= 5:
+                self.crop_sel = (min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1))
+                self._draw_crop_selection(*self.crop_sel)
+            self._update_crop_buttons()
+            return
         self._clear_preview()
 
         if tool in ("pen", "highlight", "eraser"):
@@ -1822,7 +1993,7 @@ class AnnotateEditor:
             setting = self.settings[tool]
             op = {"type": tool, "color": setting["color"],
                   "width": max(1, round(self._screen_width() / s)),
-                  "points": [(x / s, y / s) for x, y in self.stroke]}
+                  "points": [self._img(x, y) for x, y in self.stroke]}
             if tool == "eraser" and not (self.ink_layer.getbbox() or self.hl_layer.getbbox()):
                 # nothing to erase
                 self.drag_start = None
@@ -1837,14 +2008,11 @@ class AnnotateEditor:
             setting = self.settings[tool]
             op = {"type": "line", "color": setting["color"],
                   "width": max(1, round(self._screen_width() / s)),
-                  "points": [(x0 / s, y0 / s), (x1 / s, y1 / s)]}
+                  "points": [self._img(x0, y0), self._img(x1, y1)]}
         else:
             x0, y0 = self.drag_start
             x1, y1 = self._shape_end(event)
-            iw, ih = self.original.size
-            box = (int(min(x0, x1) / s), int(min(y0, y1) / s),
-                   int(round(max(x0, x1) / s)), int(round(max(y0, y1) / s)))
-            box = (max(0, box[0]), max(0, box[1]), min(iw, box[2]), min(ih, box[3]))
+            box = self._img_box(x0, y0, x1, y1)
             self.drag_start = None
             if box[2] - box[0] < 3 or box[3] - box[1] < 3:
                 return
@@ -1859,21 +2027,180 @@ class AnnotateEditor:
         self._compose()
         self.redraw()
 
+    # ---- text -------------------------------------------------------
+
+    def _text_font(self):
+        return ("Segoe UI", -self._screen_width(), "bold")
+
+    def _start_text(self, x, y):
+        """Open a small typing box where the user clicked."""
+        box = tk.Text(self.canvas, width=10, height=1, wrap="none", undo=True,
+                      relief="solid", bd=1, padx=S(4), pady=S(2),
+                      highlightthickness=0, insertwidth=2)
+        # keep typed letters away from the window's shortcuts (H, P, Enter...)
+        box.bindtags((str(box), "Text", "all"))
+        box.bind("<Return>", lambda e: (self._commit_text(), "break")[1])
+        box.bind("<KP_Enter>", lambda e: (self._commit_text(), "break")[1])
+        box.bind("<Shift-Return>", lambda e: (box.insert("insert", "\n"), self._fit_text_widget(), "break")[2])
+        box.bind("<Escape>", lambda e: (self._discard_text(), "break")[1])
+        box.bind("<KeyPress>", lambda e: self.win.after_idle(self._fit_text_widget))
+        box.bind("<KeyRelease>", lambda e: self._fit_text_widget())
+        pad_x = int(box.cget("padx")) + 1
+        pad_y = int(box.cget("pady")) + 1
+        item = self.canvas.create_window(x - pad_x, y - pad_y, window=box, anchor="nw")
+        self.text_edit = (box, item, self._img(x, y))
+        self._style_text_widget()
+        box.focus_set()
+
+    def _style_text_widget(self):
+        if self.text_edit is None or self.tool != "text":
+            return
+        box = self.text_edit[0]
+        color = self.settings["text"]["color"]
+        light = sum(_hex_rgb(color)) > 600
+        bg = "#FFFFFF" if not light else "#1F2430"
+        if not self.text_box_var.get():
+            bg = "#F4F6F8" if not light else "#2A2F3A"
+        box.configure(font=self._text_font(), fg=color, bg=bg, insertbackground=color)
+        self._fit_text_widget()
+
+    def _fit_text_widget(self):
+        """Grow the typing box (in pixels) to fit what has been typed."""
+        if self.text_edit is None:
+            return
+        import tkinter.font as tkfont
+        box, item, _ = self.text_edit
+        font = tkfont.Font(font=box.cget("font"))
+        lines = box.get("1.0", "end-1c").split("\n")
+        extra = 2 * (int(box.cget("padx")) + int(box.cget("bd"))) + font.measure("MM")
+        width = max(font.measure("M" * 6), max(font.measure(l) for l in lines)) + extra
+        height = (font.metrics("linespace") * len(lines)
+                  + 2 * (int(box.cget("pady")) + int(box.cget("bd"))) + 2)
+        self.canvas.itemconfigure(item, width=width, height=height)
+        box.xview_moveto(0)
+
+    def _commit_text(self):
+        """Turn the note being typed into an annotation."""
+        if self.text_edit is None:
+            return
+        box, item, pos = self.text_edit
+        text = box.get("1.0", "end-1c").rstrip()
+        self.text_edit = None
+        self.canvas.delete(item)
+        box.destroy()
+        self.win.focus_set()
+        if not text.strip():
+            return
+        op = {"type": "text", "pos": pos, "text": text,
+              "color": self.settings["text"]["color"],
+              "size": max(6, round(self._screen_width() / self.scale))
+                      if self.tool == "text" else
+                      max(6, round(self.SIZES["text"][self.settings["text"]["size"]] / self.scale)),
+              "box": bool(self.text_box_var.get())}
+        self.ops.append(op)
+        self._apply(op)
+        self._compose()
+        self.redraw()
+
+    def _discard_text(self):
+        if self.text_edit is None:
+            return
+        box, item, _ = self.text_edit
+        self.text_edit = None
+        self.canvas.delete(item)
+        box.destroy()
+        self.win.focus_set()
+
+    # ---- crop -------------------------------------------------------
+
+    def _draw_crop_selection(self, x0, y0, x1, y1):
+        """Dim everything outside the selection and outline it."""
+        x0, x1 = sorted((x0, x1))
+        y0, y1 = sorted((y0, y1))
+        L, T = self.off_x, self.off_y
+        # darken the screenshot outside the selection (drawn as an image,
+        # so it looks the same on every system)
+        if self._dim_img is None:
+            self._dim_img = Image.blend(self.view_img.convert("RGB"),
+                                        Image.new("RGB", self.view_img.size, (0, 0, 0)), 0.55)
+        sel = (int(x0 - L), int(y0 - T), int(x1 - L), int(y1 - T))
+        shaded = self._dim_img.copy()
+        if sel[2] > sel[0] and sel[3] > sel[1]:
+            shaded.paste(self.view_img.crop(sel), sel[:2])
+        self._dim_photo = ImageTk.PhotoImage(shaded)
+        self.preview.append(self.canvas.create_image(L, T, anchor="nw", image=self._dim_photo))
+        self.preview.append(self.canvas.create_rectangle(
+            x0, y0, x1, y1, outline="#FFFFFF", width=2))
+        self.preview.append(self.canvas.create_rectangle(
+            x0, y0, x1, y1, outline=ACCENT, width=2, dash=(6, 4)))
+        ix0, iy0, ix1, iy1 = self._img_box(x0, y0, x1, y1)
+        self.crop_hint.configure(text=f"Selection: {ix1 - ix0} \u00d7 {iy1 - iy0} px", fg=TEXT)
+
+    def _update_crop_buttons(self):
+        state = "normal" if self.crop_sel else "disabled"
+        self.crop_apply.config(state=state)
+        self.crop_cancel.config(state=state)
+        if not self.crop_sel:
+            self.crop_hint.configure(text="Drag over the part you want to keep", fg=MUTED)
+
+    def clear_crop_selection(self):
+        if self.crop_sel is not None:
+            self.crop_sel = None
+            self._clear_preview()
+        if hasattr(self, "crop_apply"):
+            self._update_crop_buttons()
+
+    def apply_crop(self):
+        if not self.crop_sel:
+            return
+        box = self._img_box(*self.crop_sel)
+        self.clear_crop_selection()
+        if box[2] - box[0] < 2 or box[3] - box[1] < 2 or box == self.crop_box:
+            return
+        self.ops.append({"type": "crop", "box": box})
+        self.rebuild()
+        self.select_tool(self.prev_tool)    # back to drawing
+        self._relayout()
+
+    def _on_enter(self, event=None):
+        if self.crop_sel:
+            self.apply_crop()
+        else:
+            self.save()
+
+    def _on_escape(self, event=None):
+        if self.crop_sel:
+            self.clear_crop_selection()
+        else:
+            self.cancel()
+
     # ---- undo / save ------------------------------------------------
 
     def undo(self):
+        if self.text_edit is not None:       # undo while typing = drop that note
+            self._discard_text()
+            return
         if self.ops:
-            self.ops.pop()
+            was_crop = self.ops.pop()["type"] == "crop"
             self.rebuild()
-            self.redraw()
+            if was_crop:
+                self._relayout()
+            else:
+                self.redraw()
 
     def clear(self):
+        self._discard_text()
         if self.ops:
+            had_crop = any(op["type"] == "crop" for op in self.ops)
             self.ops.clear()
             self.rebuild()
-            self.redraw()
+            if had_crop:
+                self._relayout()
+            else:
+                self.redraw()
 
     def save(self):
+        self._commit_text()
         result = self.working.copy()
         self.win.grab_release()
         if self.on_save(result) is False:     # e.g. user cancelled "Save as"
@@ -1885,6 +2212,7 @@ class AnnotateEditor:
     def copy(self):
         """Copy the screenshot (with annotations) to the clipboard. The
         window stays open, so it can still be saved afterwards."""
+        self._commit_text()
         try:
             ok = copy_image_to_clipboard(self.working)
         except Exception as e:
@@ -1903,6 +2231,7 @@ class AnnotateEditor:
         status_var.set("Screenshot copied to the clipboard - paste it with Ctrl+V")
 
     def cancel(self):
+        self._commit_text()
         # nothing to lose if it was copied after the last change
         copied_latest = self.copied and getattr(self, "copied_ops", -1) == len(self.ops)
         if self.ops and not copied_latest and not messagebox.askyesno(
@@ -1978,6 +2307,51 @@ def draw_shape(image, kind, box, color, width):
     x0, y0, x1, y1 = box
     if kind == "rect":
         d.rectangle(box, outline=rgb, width=width)
+
+
+TEXT_FONT_FILES = ["segoeuib.ttf", "arialbd.ttf", "seguisb.ttf", "segoeui.ttf", "arial.ttf",
+                   "DejaVuSans-Bold.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"]
+_TEXT_FONT_CACHE = {}
+
+
+def text_font(size):
+    """Bold UI font at the given pixel size (Segoe UI on Windows)."""
+    size = max(6, int(size))
+    if size not in _TEXT_FONT_CACHE:
+        from PIL import ImageFont
+        font = None
+        for name in TEXT_FONT_FILES:
+            try:
+                font = ImageFont.truetype(name, size)
+                break
+            except OSError:
+                continue
+        if font is None:
+            try:
+                font = ImageFont.load_default(size=size)
+            except TypeError:                  # very old Pillow
+                font = ImageFont.load_default()
+        _TEXT_FONT_CACHE[size] = font
+    return _TEXT_FONT_CACHE[size]
+
+
+def draw_text(layer, pos, text, color, size, box=True):
+    """A text note. With box=True it sits on a rounded background in a
+    contrasting colour, with an outline in the text colour."""
+    d = ImageDraw.Draw(layer)
+    font = text_font(size)
+    rgb = _hex_rgb(color)
+    spacing = max(2, int(size * 0.25))
+    x, y = pos
+    bbox = d.multiline_textbbox((x, y), text, font=font, spacing=spacing)
+    if box:
+        pad = max(4, int(size * 0.35))
+        light = sum(rgb) > 600
+        fill = (31, 36, 48, 235) if light else (255, 255, 255, 235)
+        d.rounded_rectangle([bbox[0] - pad, bbox[1] - pad, bbox[2] + pad, bbox[3] + pad],
+                            radius=pad, fill=fill, outline=rgb + (255,),
+                            width=max(1, size // 14))
+    d.multiline_text((x, y), text, font=font, fill=rgb + (255,), spacing=spacing)
 
 
 def draw_line(image, points, color, width):
@@ -3644,6 +4018,15 @@ def draw_icon(kind, color, size, accent=RED):
 
     elif kind == "rect":
         d.rectangle(box(3, 5, 21, 19), outline=color, width=w)
+
+    elif kind == "text":
+        d.line([(4 * u, 5 * u), (20 * u, 5 * u)], fill=color, width=int(w * 1.2))
+        d.line([(12 * u, 5 * u), (12 * u, 20 * u)], fill=color, width=int(w * 1.2))
+        d.line([(9 * u, 20 * u), (15 * u, 20 * u)], fill=color, width=w)
+
+    elif kind == "crop":
+        d.line([(6 * u, 2 * u), (6 * u, 18 * u), (22 * u, 18 * u)], fill=color, width=w, joint="curve")
+        d.line([(2 * u, 6 * u), (18 * u, 6 * u), (18 * u, 22 * u)], fill=color, width=w, joint="curve")
 
     elif kind == "line":
         d.line([(4 * u, 20 * u), (20 * u, 4 * u)], fill=color, width=int(w * 1.3))
