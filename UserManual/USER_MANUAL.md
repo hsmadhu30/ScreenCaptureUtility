@@ -1,6 +1,6 @@
 # Screen Capture Utility — User Manual
 
-A Windows desktop tool for taking screenshots (whole screen, a region, or a full scrolling page), annotating and copying them, recording the screen with sound, extracting text from the screen, blurring sensitive information, and collecting everything into a Word document.
+A Windows desktop tool for taking screenshots (whole screen, a region, or a full scrolling page), annotating and copying them, recording the screen with sound, extracting text from the screen, blurring sensitive information, and collecting everything into a Word document, Excel workbook or PowerPoint presentation.
 
 > Screenshots in this manual were taken on a test machine, so fonts look slightly different from Windows, where the app uses Segoe UI. Layout and buttons are the same.
 
@@ -12,12 +12,13 @@ A Windows desktop tool for taking screenshots (whole screen, a region, or a full
 2. [Installing and starting the app](#2-installing-and-starting-the-app)
 3. [The main window](#3-the-main-window)
 4. [Save location](#4-save-location)
-5. [Word document](#5-word-document)
+5. [Document: Word, Excel or PowerPoint](#5-document-word-excel-or-powerpoint)
 6. [Screenshots](#6-screenshots)
    - [Capture Screen](#capture-screen)
    - [Capture Region](#capture-region)
    - [Full Page (scrolling capture)](#full-page-scrolling-capture)
    - [Extract Text (OCR)](#extract-text-ocr)
+   - [Compare Images](#compare-images)
 7. [Blur sensitive information](#7-blur-sensitive-information)
 8. [Review window: annotate, copy, save](#8-review-window-annotate-copy-save)
 9. [Screen recording](#9-screen-recording)
@@ -43,6 +44,8 @@ The Python packages the app needs are listed in `requirements.txt`:
 |---|---|
 | `pillow` | Taking and editing screenshots |
 | `python-docx` | Adding screenshots to Word documents |
+| `openpyxl` | Adding screenshots to Excel workbooks |
+| `python-pptx` | Adding screenshots to PowerPoint presentations |
 | `imageio-ffmpeg` | Encoding recordings to MP4 and adding sound |
 | `PyAudioWPatch` | Recording the microphone and the computer's sound |
 | `winrt-*` packages | Windows' built-in OCR for **Extract Text** |
@@ -95,14 +98,14 @@ The window opens in the middle of the screen you're working on, and is made up o
 | Section | What it's for |
 |---|---|
 | **Save location** <span style="color:#E5484D">\*</span> *(required)* | The folder where screenshots, recordings and text files are saved. The red asterisk means you must choose one before capturing or recording. |
-| **Word document** *(optional)* | A `.docx` that screenshots are added to automatically |
-| **Screenshot & text** | Capture Screen, Capture Region, Full Page, Extract Text, and the blur option |
+| **Document** *(optional)* | A Word `.docx`, Excel `.xlsx` or PowerPoint `.pptx` file that screenshots are added to automatically |
+| **Screenshot & text** | Capture Screen, Capture Region, Full Page, Extract Text, Compare Images, and the blur option |
 | **Screen recording** | Record the whole screen or a region, with sound |
 | **Status bar** (bottom) | What just happened |
 
 **Status bar colours:**
 - 🟢 **Green:** saved successfully.
-- 🟠 **Amber:** busy, or waiting (for example, the Word document is open in Word).
+- 🟠 **Amber:** busy, or waiting (for example, the selected document is open in Word, Excel or PowerPoint).
 - 🔴 **Red:** something went wrong or was cancelled.
 - 🔵 **Indigo:** information.
 
@@ -115,33 +118,41 @@ This is the only **required** setting, marked with a red asterisk (**\***). Unti
 1. Click **Browse** and choose a folder, or type a path into the box.
 2. If the folder doesn't exist, the app offers to create it.
 
-If you start a capture without choosing a folder, the app asks you to pick one first. If you select a Word document before choosing a folder, the document's folder is used.
+If you start a capture without choosing a folder, the app asks you to pick one first. If you select a document before choosing a folder, the document's folder is used.
 
 ---
 
-## 5. Word document
+## 5. Document: Word, Excel or PowerPoint
 
-Collect screenshots straight into a Word document, in the order you take them.
+Collect screenshots straight into a **Word document**, an **Excel workbook** or a **PowerPoint presentation**, in the order you take them.
 
 | Button | What it does |
 |---|---|
-| **Select** | Pick an existing `.docx`. New screenshots are added **at the end**, after any existing content. |
-| **New** | Create a new, empty `.docx`, with no heading, and use it. |
-| **Clear** | Stop using the document. Screenshots go back to being saved as `.png` files. |
+| **Select** | Pick an existing `.docx`, `.xlsx` or `.pptx` file. New screenshots are added **after** what's already there. |
+| **New...** | Choose **Word document**, **Excel workbook** or **PowerPoint presentation**, then name the new, empty file. |
+| **Clear** | Stop using the file. Screenshots go back to being saved as `.png` files. |
 | **Also save separate .png files** | Also keep each screenshot as a `.png` in the save folder. |
-| **Save to Word now** | Retry writing any screenshots that are waiting (see below). |
-| **Open Document** | Open the document in Word. |
+| **Save to Word / Excel / PowerPoint now** | Retry writing any screenshots that are waiting (see below). |
+| **Open Document** | Open the file in Word, Excel or PowerPoint. |
 
-**How images are placed:**
-- Screenshots are added oldest first, with **3 blank lines** between images.
-- Each image is sized to fit the page width, but small images are never enlarged beyond their real size.
-- Very tall images, such as full-page captures, are **split across pages** at full width so they stay readable.
-- Only `.docx` files are supported. For an old `.doc` file, open it in Word and use **Save As → Word Document (.docx)**.
+When a file is selected, the Review window's button reads **Save to Word**, **Save to Excel** or **Save to PowerPoint**.
 
-**If the document is open in Word:** Windows locks the file while Word has it open. Your screenshots are not lost:
+**How screenshots are placed** (always oldest first, in the order they were taken):
+
+| Format | Layout |
+|---|---|
+| **Word** (`.docx`) | One after another, with **3 blank lines** between images. Each image fits the page width; small images are never enlarged. Very tall images (full-page captures) are **split across pages** so they stay readable. |
+| **Excel** (`.xlsx`) | Stacked down a sheet named **Screenshots** in column A, with **3 empty rows** between images. Shown at real size; anything wider than 1600 pixels is scaled down to 1600. If the workbook has no Screenshots sheet, one is added, so your other sheets are left alone. |
+| **PowerPoint** (`.pptx`) | **One slide per screenshot**, centred and fitted to the slide; small images are never enlarged. Very tall images are **split over several slides**. New presentations are widescreen (16:9). Existing slides are kept. |
+
+**Supported files:** only `.docx`, `.xlsx` and `.pptx`. For an older `.doc`, `.xls` or `.ppt` file, open it in Word, Excel or PowerPoint and use **Save As** to save it in the newer format.
+
+**Excel tip:** use a workbook just for screenshots. When the app saves a workbook it keeps your sheets, values, formulas, formatting, charts and images, but some advanced Excel features (for example shapes, text boxes, slicers or form controls) may not survive.
+
+**If the file is open in Word, Excel or PowerPoint:** Windows locks the file while it's open there. Your screenshots are not lost:
 - They **wait in a queue**, and the status bar says how many are waiting.
-- They are added automatically, in order, a few seconds after you **close the document in Word**.
-- If you close the app while screenshots are still waiting, it asks you to close the document and click **Retry**. Or choose **Cancel** to save them as `.png` files instead.
+- They are added automatically, in order, a few seconds after you **close the file**.
+- If you close the app while screenshots are still waiting, it asks you to close the file and click **Retry**. Or choose **Cancel** to save them as `.png` files instead.
 
 ---
 
@@ -210,6 +221,59 @@ In the Extracted Text window:
 
 Small selections are enlarged automatically before reading, which improves accuracy, and paragraph breaks are kept.
 
+
+### Compare Images
+
+*Shortcut: **Ctrl+Shift+C***
+
+Find what changed between two screenshots, such as a screen before and after an update, two versions of a report, or a test run against the expected screen. Every difference is **highlighted in red**: changed text, recoloured or moved graphics, and added or removed items.
+
+![Compare Images window](docs/images/compare-window.png)
+
+1. Click **Compare Images**.
+2. Fill the **Image 1** and **Image 2** slots. Each slot has four ways to load an image:
+   - **Open...** an image file (PNG, JPG, BMP, GIF, TIFF, WebP).
+   - **Capture region**: drag over part of the screen. The Compare window hides while you drag; press **Esc** to cancel.
+   - **Full screen**: capture the whole screen.
+   - **Paste** an image you copied, for example with the Review window's **Copy**, or a file copied in File Explorer.
+3. Click **Compare**, or press **Enter**.
+
+**The result:**
+- **Spotlight:** everything that did *not* change is faded out, so the changed areas stand out in their true colours.
+- **Numbered red boxes** mark each difference. They stay thick and clear even when a large screenshot is shrunk to fit, and even a one-character change gets a box you can see.
+- The line above the result says how many differences were found and how much of the image changed. If nothing changed, it says **"No differences found - the images match."**
+
+**The Differences list** (right side) shows every difference as a **zoomed-in close-up of Image 1 next to Image 2**, so you can see exactly what changed. Each one is labelled:
+- **Changed:** something is different in both images, such as edited text, a new colour, or a moved item.
+- **Only in Image 2:** it was added.
+- **Only in Image 1:** it was removed.
+
+**Looking closer:**
+- **Click a difference** in the list, or click its box in the picture, to **zoom in** on it. **Previous** / **Next** (or the **Up** / **Down** arrow keys) step through them one by one.
+- **Show all**, **Esc** or double-clicking the picture zooms back out.
+- **Views:**
+  - **Image 1** shows what was there before each change; **Image 2** shows what is there now.
+  - **Side by side** shows both images. While zoomed, it shows the same close-up of each.
+  - **Blink** flips between the two images about every half second, so changes catch your eye as flicker.
+- **Fade unchanged areas** *(on)* can be turned off to see the images at full strength, still with the boxes.
+
+**Options:**
+
+| Option | What it does |
+|---|---|
+| **Tolerance** | How big a colour change must be to count. **30 (normal)** ignores tiny rendering differences. Use **0** for an exact pixel-by-pixel comparison. Raise it for JPEG photos, whose compression changes colours slightly. |
+| **Auto-align** *(on)* | Two separately captured regions are often a few pixels apart. The app finds the best match first, so the whole image isn't reported as changed. The result shows the shift it used, for example "aligned by +3, +2 px". |
+| **Swap images** | Exchange Image 1 and Image 2. |
+
+**Images of different sizes:**
+- If one image is just a zoomed copy of the other (same shape, different size), it is resized to match.
+- Otherwise, anything that exists in only one image is marked as a difference.
+
+**Keep or share the result:**
+- **Copy result** (or **Ctrl+C**) puts the current view, with its numbered boxes, on the clipboard, ready to paste into Teams, Outlook or Word.
+- **Save result...** opens it in the [Review window](#8-review-window-annotate-copy-save), where you can annotate it and then save it to your folder or your Word, Excel or PowerPoint file.
+
+
 ---
 
 ## 7. Blur sensitive information
@@ -251,7 +315,7 @@ After **every** capture (Capture Screen, Capture Region and Full Page), the scre
 | Button | What it does |
 |---|---|
 | **Copy** (or **Ctrl+C**) | Copies the screenshot, including your annotations, to the clipboard, so you can **paste it into Teams, Outlook, Word, Paint, etc.** with **Ctrl+V**. The window stays open, so you can still save afterwards. |
-| **Save** / **Save to Word** (or **Enter**) | Saves to your folder, or adds it to your Word document if one is selected |
+| **Save** / **Save to Word / Excel / PowerPoint** (or **Enter**) | Saves to your folder, or adds it to your Word, Excel or PowerPoint file if one is selected |
 | **Cancel** (or **Esc**) | Closes without saving. If you copied first, the image stays on the clipboard. |
 
 Annotating is optional; you can just click Copy or Save straight away.
@@ -284,7 +348,7 @@ Annotating is optional; you can just click Copy or Save straight away.
 - After **Apply crop**, the window switches back to the tool you were using, so you can keep annotating the cropped image.
 - You can crop more than once to trim further.
 - **Undo** (Ctrl+Z) brings back the uncropped screenshot. Any marks you drew outside the cropped area come back too.
-- **Copy**, **Save** and **Save to Word** always use the cropped image.
+- **Copy**, **Save** and **Save to Word / Excel / PowerPoint** always use the cropped image.
 
 **Options:**
 - **Colour:** nine preset colours, or **+** for any colour.
@@ -349,6 +413,7 @@ These work while the Screen Capture Utility window is active.
 | **Ctrl+Shift+R** | Capture Region |
 | **Ctrl+Shift+S** | Full Page (scrolling capture) |
 | **Ctrl+Shift+T** | Extract Text (OCR) |
+| **Ctrl+Shift+C** | Compare Images |
 | **Ctrl+Shift+V** | Start / stop full-screen recording |
 | **Ctrl+Shift+P** | Pause / resume recording |
 | **Esc** | Cancel a selection, or stop a Full Page capture (saves what was captured) |
@@ -391,7 +456,7 @@ Files are saved in the **Save location** folder. If two files would get the same
    dist\ScreenCaptureUtility.exe
    ```
 
-That single `.exe` contains everything, including ffmpeg, the Word library, sound recording and OCR support, so you can copy it to any Windows 10/11 PC.
+That single `.exe` contains everything, including ffmpeg, the Word, Excel and PowerPoint libraries, sound recording and OCR support, so you can copy it to any Windows 10/11 PC.
 
 **Notes:**
 - **Size and start time:** the .exe is fairly large (about 100 MB) and takes a few seconds to start, because it unpacks itself each time.
@@ -405,8 +470,8 @@ That single `.exe` contains everything, including ffmpeg, the Word library, soun
 | Problem | What to do |
 |---|---|
 | **A feature button is greyed out / "unavailable"** | A package is missing. Run `python -m pip install -r requirements.txt`, or look at the terminal for the exact command. |
-| **Screenshots aren't added to Word** | The document is probably open in Word. Close it and the waiting screenshots are added automatically, or click **Save to Word now**. |
-| **"Can't use this document"** | Only `.docx` files work. Re-save `.doc` files as `.docx` in Word. |
+| **Screenshots aren't added to the document** | The file is probably open in Word, Excel or PowerPoint. Close it and the waiting screenshots are added automatically, or click **Save to ... now**. |
+| **"Can't use this file"** | Only `.docx`, `.xlsx` and `.pptx` files work. Re-save older `.doc`, `.xls` or `.ppt` files in the newer format. |
 | **Full Page doesn't scroll** | Select only the scrolling content (not the address bar, tabs or side menus). Check with your mouse wheel which part scrolls. |
 | **Full Page shows a seam or repeated part** | Moving content (video, carousel) changed between steps. Pause it and try again. |
 | **Copied image doesn't paste** | Click **Copy** again just before pasting (another app may have replaced the clipboard), then press **Ctrl+V** in Teams / Outlook. |
@@ -420,4 +485,4 @@ That single `.exe` contains everything, including ffmpeg, the Word library, soun
 
 ---
 
-*Browser edition:* `ScreenCaptureUtility.html` is a separate, no-install version that runs in Edge or Chrome. It has its own on-screen instructions and isn't covered by this manual.
+*Browser edition:* `ScreenCaptureUtility.html` is a separate, no-install version that runs in Edge or Chrome. Double-click it to open it. It has the same Review window as this app (Highlighter, Pen, Eraser, Rectangle, Line, Text, Crop, Copy / Save / Cancel, Minimize / Maximize). The differences: there is no Full Page capture (use the browser's own full-page screenshot, then **Annotate an image...**); if no folder is chosen, files go to your Downloads folder; and recordings are saved as `.webm` or `.mp4`, depending on the browser.
