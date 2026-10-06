@@ -15,7 +15,7 @@ if exist "venv\Scripts\activate.bat" (
 echo.
 echo === Installing build requirements ===
 python -m pip install --upgrade pip
-python -m pip install pyinstaller pillow python-docx imageio-ffmpeg PyAudioWPatch ^
+python -m pip install pyinstaller pillow python-docx openpyxl python-pptx imageio-ffmpeg PyAudioWPatch ^
     winrt-runtime winrt-Windows.Foundation winrt-Windows.Foundation.Collections ^
     winrt-Windows.Globalization winrt-Windows.Graphics.Imaging ^
     winrt-Windows.Media.Ocr winrt-Windows.Storage.Streams
@@ -39,6 +39,9 @@ python -m PyInstaller ^
     --name ScreenCaptureUtility ^
     --hidden-import docx ^
     --collect-data docx ^
+    --hidden-import openpyxl ^
+    --hidden-import pptx ^
+    --collect-data pptx ^
     --hidden-import imageio_ffmpeg ^
     --collect-all imageio_ffmpeg ^
     --hidden-import pyaudiowpatch ^

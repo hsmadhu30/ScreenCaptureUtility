@@ -1,11 +1,12 @@
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
-from PIL import Image, ImageGrab, ImageOps, ImageFilter, ImageDraw, ImageChops
+from PIL import Image, ImageGrab, ImageOps, ImageFilter, ImageDraw, ImageChops, ImageStat
 from datetime import datetime
 from pathlib import Path
 from dataclasses import dataclass
 from io import BytesIO
 import threading
+import math
 import time
 import ctypes
 import sys
@@ -23,7 +24,8 @@ import concurrent.futures
 # ============================================================
 # Screen recording uses ffmpeg (imageio-ffmpeg) and, for sound,
 # PyAudioWPatch. OpenCV + NumPy are a fallback for video without sound.
-# Adding screenshots to a Word document needs python-docx.
+# Adding screenshots to a Word document needs python-docx, to an Excel
+# workbook openpyxl, and to a PowerPoint presentation python-pptx.
 # If they are not installed in the Python environment that runs
 # this script, we install them with pip on first start.
 
@@ -60,6 +62,8 @@ def optional_import(import_name):
 np = optional_import("numpy")
 cv2 = optional_import("cv2")
 docx = ensure_package("docx", "python-docx")
+openpyxl = ensure_package("openpyxl", "openpyxl")
+pptx = ensure_package("pptx", "python-pptx")
 
 # ffmpeg (bundled with imageio-ffmpeg) encodes the video as H.264 and
 # combines it with the recorded audio into one .mp4 file.
@@ -80,6 +84,9 @@ if imageio_ffmpeg is not None:
 RECORDING_AVAILABLE = FFMPEG_EXE is not None or (np is not None and cv2 is not None)
 AUDIO_AVAILABLE = FFMPEG_EXE is not None and pyaudio is not None
 DOCX_AVAILABLE = docx is not None
+XLSX_AVAILABLE = openpyxl is not None
+PPTX_AVAILABLE = pptx is not None
+OFFICE_AVAILABLE = DOCX_AVAILABLE or XLSX_AVAILABLE or PPTX_AVAILABLE
 
 if DOCX_AVAILABLE:
     from docx import Document
@@ -96,6 +103,14 @@ if not AUDIO_AVAILABLE:
 if not DOCX_AVAILABLE:
     print("Saving to Word documents is disabled. To enable it, run:")
     print(f'  "{sys.executable}" -m pip install python-docx')
+
+if not XLSX_AVAILABLE:
+    print("Saving to Excel workbooks is disabled. To enable it, run:")
+    print(f'  "{sys.executable}" -m pip install openpyxl')
+
+if not PPTX_AVAILABLE:
+    print("Saving to PowerPoint presentations is disabled. To enable it, run:")
+    print(f'  "{sys.executable}" -m pip install python-pptx')
 
 # Text extraction (OCR) uses the OCR engine built into Windows 10/11 via
 # PyWinRT. We only check that it's installed here; it is imported later
@@ -304,16 +319,19 @@ def save_screenshot(image, taken_at=None, update_status=True):
 
 
 # ============================================================
-# Word Document Output
+# Document Output (Word / Excel / PowerPoint)
 # ============================================================
-# When a Word document is selected, every screenshot is appended to the
-# end of that document (with a caption showing the capture time) and the
-# document is saved straight away. Screenshots are always added in the
-# order they were captured, so the earliest one is at the top.
+# When a document is selected, every screenshot is added to it and the
+# file is saved straight away, always in the order the screenshots were
+# taken (earliest first):
+#   Word (.docx)        - images one after another, 3 blank lines apart
+#   Excel (.xlsx)       - images stacked down a "Screenshots" sheet,
+#                         3 empty rows apart
+#   PowerPoint (.pptx)  - one slide per screenshot, fitted to the slide
 #
-# If the document is open in Word, Windows locks the file and it can't be
-# written. In that case captures wait in a queue (in capture order) and
-# are written automatically as soon as the document is closed in Word.
+# If the file is open in Word / Excel / PowerPoint, Windows locks it and
+# it can't be written. In that case captures wait in a queue (in capture
+# order) and are written automatically as soon as the file is closed.
 
 @dataclass
 class Capture:
@@ -323,7 +341,7 @@ class Capture:
     size: tuple        # (width, height) in pixels
 
 
-word_doc_path = None     # Path of the selected .docx, or None
+word_doc_path = None     # Path of the selected .docx / .xlsx / .pptx, or None
 pending_captures = []    # captures not yet written to the document
 retry_job = None         # id of the scheduled auto-retry, if any
 
@@ -419,8 +437,201 @@ def append_captures_to_docx(path, captures):
         raise
 
 
+# ---- Excel ----------------------------------------------------------
+
+EXCEL_SHEET = "Screenshots"
+EXCEL_MAX_WIDTH_PX = 1600         # wider screenshots are scaled down to this
+EXCEL_GAP_ROWS = 3                # empty rows between screenshots
+EXCEL_DEFAULT_ROW_PT = 15         # Excel's default row height (points)
+
+
+def _excel_row_px(ws, row):
+    """Height of a worksheet row (1-based) in screen pixels."""
+    dim = ws.row_dimensions.get(row) if hasattr(ws.row_dimensions, "get") else None
+    height = getattr(dim, "height", None) if dim is not None else None
+    if not height:
+        height = ws.sheet_format.defaultRowHeight or EXCEL_DEFAULT_ROW_PT
+    return float(height) * 96 / 72
+
+
+def _excel_rows_for(ws, first_row, height_px):
+    """How many rows (starting at first_row, 1-based) an image covers."""
+    rows, covered = 0, 0.0
+    while covered < height_px - 0.5:
+        covered += _excel_row_px(ws, first_row + rows)
+        rows += 1
+    return max(1, rows)
+
+
+def _excel_next_free_row(ws):
+    """First row (1-based) below everything already on the sheet."""
+    last = 0
+    if ws.max_row > 1 or ws.cell(1, 1).value is not None:
+        last = max(last, max((c.row for row in ws.iter_rows() for c in row
+                              if c.value is not None), default=0))
+    for img in getattr(ws, "_images", []):
+        anchor = img.anchor
+        start = getattr(getattr(anchor, "_from", None), "row", None)
+        if start is None:
+            continue
+        end = getattr(getattr(anchor, "to", None), "row", None)   # two-cell anchor
+        if end is None:
+            # displayed height (the anchor's size; img.height is the raw image size)
+            ext = getattr(anchor, "ext", None)
+            height = ext.height / EMU_PER_PIXEL if ext is not None and ext.height else img.height
+            end = start + _excel_rows_for(ws, start + 1, height) - 1
+        last = max(last, end + 1)
+    return last + 1
+
+
+def _excel_sheet(wb):
+    """The sheet screenshots go on: "Screenshots", or a single empty sheet."""
+    if EXCEL_SHEET in wb.sheetnames:
+        return wb[EXCEL_SHEET]
+    if len(wb.worksheets) == 1:
+        ws = wb.worksheets[0]
+        empty = ws.max_row == 1 and ws.max_column == 1 and ws.cell(1, 1).value is None
+        if empty and not getattr(ws, "_images", []):
+            ws.title = EXCEL_SHEET
+            return ws
+    return wb.create_sheet(EXCEL_SHEET)
+
+
+def new_excel_workbook():
+    wb = openpyxl.Workbook()
+    wb.active.title = EXCEL_SHEET
+    return wb
+
+
+def append_captures_to_xlsx(path, captures):
+    """Stack the screenshots (oldest first) down the Screenshots sheet."""
+    from openpyxl.drawing.image import Image as XLImage
+    path = Path(path)
+    wb = openpyxl.load_workbook(str(path)) if path.exists() else new_excel_workbook()
+    ws = _excel_sheet(wb)
+    row = _excel_next_free_row(ws)
+    if row > 1:
+        row += EXCEL_GAP_ROWS
+    keep = []                                   # buffers must live until saved
+    for capture in sorted(captures, key=lambda c: c.taken_at):
+        w_px, h_px = capture.size
+        buffer = BytesIO(capture.png)
+        keep.append(buffer)
+        img = XLImage(buffer)
+        if w_px > EXCEL_MAX_WIDTH_PX:
+            img.width = EXCEL_MAX_WIDTH_PX
+            img.height = round(h_px * EXCEL_MAX_WIDTH_PX / w_px)
+        else:
+            img.width, img.height = w_px, h_px
+        ws.add_image(img, f"A{row}")
+        row += _excel_rows_for(ws, row, img.height) + EXCEL_GAP_ROWS
+    wb.active = wb.worksheets.index(ws)
+    _save_atomically(path, lambda temp: wb.save(str(temp)))
+
+
+# ---- PowerPoint -----------------------------------------------------
+
+PPT_MARGIN_IN = 0.2               # space around the screenshot on each slide
+
+
+def new_presentation():
+    from pptx.util import Inches as PInches
+    prs = pptx.Presentation()
+    prs.slide_width = PInches(13.333)        # 16:9 widescreen
+    prs.slide_height = PInches(7.5)
+    return prs
+
+
+def _blank_layout(prs):
+    """The 'Blank' slide layout (or the one with the fewest placeholders)."""
+    layouts = list(prs.slide_layouts)
+    for layout in layouts:
+        if layout.name.strip().lower() == "blank":
+            return layout
+    return min(layouts, key=lambda l: len(l.placeholders))
+
+
+def _add_picture_slide(prs, png_bytes, w_px, h_px, max_w, max_h):
+    slide = prs.slides.add_slide(_blank_layout(prs))
+    for ph in list(slide.placeholders):        # keep the slide clean
+        ph._element.getparent().remove(ph._element)
+    scale = min(max_w / w_px, max_h / h_px, EMU_PER_PIXEL)   # never enlarge
+    width, height = int(w_px * scale), int(h_px * scale)
+    left = (prs.slide_width - width) // 2
+    top = (prs.slide_height - height) // 2
+    slide.shapes.add_picture(BytesIO(png_bytes), left, top, width, height)
+
+
+def append_captures_to_pptx(path, captures):
+    """Add one slide per screenshot (oldest first). Very tall screenshots
+    (full-page captures) are split over several slides so they stay readable."""
+    from pptx.util import Inches as PInches
+    path = Path(path)
+    prs = pptx.Presentation(str(path)) if path.exists() else new_presentation()
+    margin = PInches(PPT_MARGIN_IN)
+    max_w = prs.slide_width - 2 * margin
+    max_h = prs.slide_height - 2 * margin
+    for capture in sorted(captures, key=lambda c: c.taken_at):
+        w_px, h_px = capture.size
+        fit_width = min(max_w / w_px, EMU_PER_PIXEL)
+        if h_px * fit_width > max_h and (max_h / h_px) < fit_width * 0.6:
+            slice_px = max(1, int(max_h / fit_width))
+            with Image.open(BytesIO(capture.png)) as tall:
+                for top_px in range(0, h_px, slice_px):
+                    part = tall.crop((0, top_px, w_px, min(h_px, top_px + slice_px)))
+                    buffer = BytesIO()
+                    part.save(buffer, format="PNG")
+                    _add_picture_slide(prs, buffer.getvalue(), part.width, part.height, max_w, max_h)
+            continue
+        _add_picture_slide(prs, capture.png, w_px, h_px, max_w, max_h)
+    _save_atomically(path, lambda temp: prs.save(str(temp)))
+
+
+# ---- shared -----------------------------------------------------------
+
+DOC_TYPES = {   # extension -> (app name, file type label)
+    ".docx": ("Word", "Word document"),
+    ".xlsx": ("Excel", "Excel workbook"),
+    ".pptx": ("PowerPoint", "PowerPoint presentation"),
+}
+
+
+def doc_app(path=None):
+    """'Word', 'Excel' or 'PowerPoint' for the selected (or given) file."""
+    path = path if path is not None else word_doc_path
+    if path is None:
+        return "Word"
+    return DOC_TYPES.get(Path(path).suffix.lower(), ("Word",))[0]
+
+
+def _save_atomically(path, write):
+    """Write to a temporary file first, then swap it in, so the file can't
+    be left half-written."""
+    temp_path = path.with_name(f".{path.stem}.saving.tmp")
+    write(temp_path)
+    try:
+        os.replace(temp_path, path)
+    except Exception:
+        try:
+            temp_path.unlink()
+        except Exception:
+            pass
+        raise
+
+
+def append_captures(path, captures):
+    """Add captures to the selected Word / Excel / PowerPoint file."""
+    suffix = Path(path).suffix.lower()
+    if suffix == ".xlsx":
+        append_captures_to_xlsx(path, captures)
+    elif suffix == ".pptx":
+        append_captures_to_pptx(path, captures)
+    else:
+        append_captures_to_docx(path, captures)
+
+
 def is_file_locked(path):
-    """True if another program (usually Word) has the file open."""
+    """True if another program (Word, Excel, PowerPoint...) has the file open."""
     if not path.exists():
         return False
     try:
@@ -432,7 +643,7 @@ def is_file_locked(path):
 
 def flush_pending(interactive=False):
     """
-    Write any waiting captures to the Word document.
+    Write any waiting captures to the selected document.
     Returns True if nothing is left waiting.
     """
     if not pending_captures or word_doc_path is None:
@@ -448,19 +659,19 @@ def flush_pending(interactive=False):
     count = len(pending_captures)
 
     try:
-        append_captures_to_docx(word_doc_path, pending_captures)
+        append_captures(word_doc_path, pending_captures)
 
     except PermissionError:
         report_document_locked()
         return False
 
     except Exception as e:
-        print(f"Error updating Word document: {e}")
+        print(f"Error updating {doc_app()} file: {e}")
         status_var.set(f"Could not update {name} (see console)")
         update_word_controls()
         if interactive:
             messagebox.showerror(
-                "Could not update Word document",
+                f"Could not update {doc_app()} file",
                 f"{word_doc_path}\n\n{e}",
                 parent=root
             )
@@ -478,8 +689,8 @@ def report_document_locked():
     n = len(pending_captures)
     noun = "capture" if n == 1 else "captures"
     status_var.set(
-        f"{word_doc_path.name} is open in Word - {n} {noun} waiting. "
-        f"Close the document and they will be added automatically."
+        f"{word_doc_path.name} is open in {doc_app()} - {n} {noun} waiting. "
+        f"Close it there and they will be added automatically."
     )
     update_word_controls()
     schedule_retry()
@@ -513,7 +724,7 @@ def save_pending_as_png():
 
 
 def handle_capture(image, kind, taken_at):
-    """Route a new screenshot to the Word document or to a .png file."""
+    """Route a new screenshot to the selected document or to a .png file."""
     if word_doc_path is not None:
         pending_captures.append(make_capture(image, kind, taken_at))
 
@@ -534,7 +745,7 @@ def can_change_document():
         "Captures still waiting",
         f"{len(pending_captures)} capture(s) are still waiting to be added to:\n\n"
         f"{word_doc_path}\n\n"
-        "Close that document in Word so they can be saved, then try again.",
+        f"Close that file in {doc_app()} so they can be saved, then try again.",
         parent=root
     )
     return False
@@ -549,15 +760,56 @@ def document_start_folder():
     return str(save_folder) if save_folder else str(Path.home())
 
 
+def _available_types():
+    """File-dialog types for the document formats that can be used."""
+    types = []
+    if DOCX_AVAILABLE:
+        types.append(("Word documents", "*.docx"))
+    if XLSX_AVAILABLE:
+        types.append(("Excel workbooks", "*.xlsx"))
+    if PPTX_AVAILABLE:
+        types.append(("PowerPoint presentations", "*.pptx"))
+    return types
+
+
+def _check_document(path):
+    """Open the file with the matching library to make sure it can be used.
+    Returns an error message, or None if it's fine."""
+    suffix = path.suffix.lower()
+    old = {".doc": ("Word", ".docx", "Word Document (*.docx)"),
+           ".xls": ("Excel", ".xlsx", "Excel Workbook (*.xlsx)"),
+           ".xlsm": ("Excel", ".xlsx", "Excel Workbook (*.xlsx)"),
+           ".ppt": ("PowerPoint", ".pptx", "PowerPoint Presentation (*.pptx)")}
+    if suffix in old:
+        app, new, label = old[suffix]
+        return (f"Only {new} files are supported, not {suffix}. "
+                f"Open it in {app} and use Save As > {label}.")
+    if suffix not in DOC_TYPES:
+        return "Please choose a Word (.docx), Excel (.xlsx) or PowerPoint (.pptx) file."
+    try:
+        if suffix == ".docx":
+            Document(str(path))
+        elif suffix == ".xlsx":
+            openpyxl.load_workbook(str(path))
+        else:
+            pptx.Presentation(str(path))
+    except Exception as e:
+        return f"{e}\n\nThe file could not be opened as a {DOC_TYPES[suffix][1]}."
+    return None
+
+
 def select_word_document():
-    if not DOCX_AVAILABLE or not can_change_document():
+    """Select an existing Word, Excel or PowerPoint file."""
+    types = _available_types()
+    if not types or not can_change_document():
         return
 
+    patterns = " ".join(t[1] for t in types)
     path = filedialog.askopenfilename(
         parent=root,
-        title="Select the Word document to add screenshots to",
+        title="Select the Word, Excel or PowerPoint file to add screenshots to",
         initialdir=document_start_folder(),
-        filetypes=[("Word documents", "*.docx")]
+        filetypes=[("Word, Excel or PowerPoint", patterns)] + types
     )
     if not path:
         return
@@ -567,51 +819,68 @@ def select_word_document():
     if path.name.startswith("~$"):
         messagebox.showerror(
             "Not a document",
-            "That is a temporary lock file Word creates while a document "
-            "is open. Please select the real .docx file.",
+            "That is a temporary lock file Office creates while a file "
+            "is open. Please select the real file.",
             parent=root
         )
         return
 
-    # Make sure python-docx can actually read it
-    try:
-        Document(str(path))
-    except Exception as e:
-        messagebox.showerror(
-            "Can't use this document",
-            f"{path}\n\n{e}\n\n"
-            "Only Word .docx files are supported (not older .doc files). "
-            "Open it in Word and use Save As > Word Document (*.docx).",
-            parent=root
-        )
+    problem = _check_document(path)
+    if problem:
+        messagebox.showerror("Can't use this file", f"{path}\n\n{problem}", parent=root)
         return
 
     set_word_document(path)
 
 
-def new_word_document():
-    if not DOCX_AVAILABLE or not can_change_document():
+def new_document_menu():
+    """'New' button: choose Word, Excel or PowerPoint."""
+    menu = tk.Menu(root, tearoff=0, font=F_BODY)
+    menu.add_command(label="Word document (.docx)", command=lambda: new_word_document(".docx"),
+                     state="normal" if DOCX_AVAILABLE else "disabled")
+    menu.add_command(label="Excel workbook (.xlsx)", command=lambda: new_word_document(".xlsx"),
+                     state="normal" if XLSX_AVAILABLE else "disabled")
+    menu.add_command(label="PowerPoint presentation (.pptx)", command=lambda: new_word_document(".pptx"),
+                     state="normal" if PPTX_AVAILABLE else "disabled")
+    x = new_doc_button.winfo_rootx()
+    y = new_doc_button.winfo_rooty() + new_doc_button.winfo_height()
+    try:
+        menu.tk_popup(x, y)
+    finally:
+        menu.grab_release()
+
+
+def new_word_document(suffix=".docx"):
+    """Create a new, empty Word / Excel / PowerPoint file for screenshots."""
+    if not can_change_document():
         return
+    app, label = DOC_TYPES[suffix]
 
     path = filedialog.asksaveasfilename(
         parent=root,
-        title="Create a new Word document for screenshots",
+        title=f"Create a new {label} for screenshots",
         initialdir=document_start_folder(),
-        initialfile=f"Screen Captures {datetime.now():%Y-%m-%d}.docx",
-        defaultextension=".docx",
-        filetypes=[("Word documents", "*.docx")]
+        initialfile=f"Screen Captures {datetime.now():%Y-%m-%d}{suffix}",
+        defaultextension=suffix,
+        filetypes=[(f"{label}s", f"*{suffix}")]
     )
     if not path:
         return
 
     path = Path(path)
+    if path.suffix.lower() != suffix:
+        path = path.with_name(path.name + suffix)
 
     try:
-        doc = Document()   # empty document - images only, no heading
-        doc.save(str(path))
+        if suffix == ".docx":
+            Document().save(str(path))           # empty - images only, no heading
+        elif suffix == ".xlsx":
+            new_excel_workbook().save(str(path))
+        else:
+            new_presentation().save(str(path))   # no slides yet
     except Exception as e:
         messagebox.showerror(
-            "Could not create document",
+            "Could not create file",
             f"{path}\n\n{e}",
             parent=root
         )
@@ -631,7 +900,7 @@ def set_word_document(path):
         set_save_folder(str(path.parent))
 
     status_var.set(f"Screenshots will be added to: {path.name}")
-    print(f"Screenshots will be added to Word document: {path}")
+    print(f"Screenshots will be added to {DOC_TYPES[path.suffix.lower()][1]}: {path}")
     update_word_controls()
 
 
@@ -643,7 +912,7 @@ def clear_word_document():
 
     word_doc_path = None
     doc_var.set("")
-    status_var.set("No Word document - screenshots will be saved as .png files")
+    status_var.set("No document selected - screenshots will be saved as .png files")
     update_word_controls()
 
 
@@ -651,13 +920,13 @@ def open_word_document():
     if word_doc_path is None:
         return
     try:
-        os.startfile(str(word_doc_path))  # Windows: open in Word
+        os.startfile(str(word_doc_path))  # Windows: open in Word / Excel / PowerPoint
     except Exception as e:
         messagebox.showerror("Could not open document", str(e), parent=root)
 
 
 def update_word_controls():
-    """Enable/disable the Word buttons to match the current state."""
+    """Enable/disable the document buttons to match the current state."""
     has_doc = word_doc_path is not None
     state = "normal" if has_doc else "disabled"
 
@@ -666,11 +935,12 @@ def update_word_controls():
     keep_png_check.config(state=state)
 
     n = len(pending_captures)
+    app = doc_app()
     if n:
-        save_pending_button.config(text=f"Save to Word now ({n} waiting)",
+        save_pending_button.config(text=f"Save to {app} now ({n} waiting)",
                                    state="normal")
     else:
-        save_pending_button.config(text="Save to Word now", state="disabled")
+        save_pending_button.config(text=f"Save to {app} now", state="disabled")
 
 
 # ============================================================
@@ -1351,7 +1621,7 @@ def annotate_then_save(image, kind, taken_at):
         image,
         on_save=lambda result: handle_capture(result, kind, taken_at),
         title=f"{kind} capture",
-        save_label="Save to Word" if word_doc_path is not None else "Save",
+        save_label=f"Save to {doc_app()}" if word_doc_path is not None else "Save",
     ))
 
 
@@ -2835,6 +3105,1107 @@ def start_scrolling_capture(x1, y1, x2, y2):
 
 
 # ============================================================
+# Compare Images
+# ============================================================
+# Load or capture two images (Image 1 and Image 2) and highlight every
+# difference in red: changed text, moved or recoloured graphics, added or
+# removed items.
+#
+#   1. If the images are almost the same shape but a different size (e.g.
+#      captured at another zoom level), Image 1 is resized to match Image 2.
+#   2. Auto-align: separately captured regions are often a few pixels
+#      apart, so the best small shift between them is found first
+#      (coarse search on a small copy, then refined at full resolution).
+#   3. Pixels whose colour differs by more than the tolerance are marked.
+#   4. Nearby changed pixels are grouped into numbered regions, each drawn
+#      with a red box; the changed pixels themselves are tinted red.
+# Pure Pillow - no extra packages.
+
+COMPARE_RED = (230, 0, 0)
+COMPARE_HEX = "#E60000"
+COMPARE_NEUTRAL = (229, 231, 235)    # canvas area covered by only one image
+COMPARE_MIN_PIXELS = 3               # smaller specks are ignored (noise)
+
+
+@dataclass
+class CompareResult:
+    before: Image.Image          # Image 1 on the common canvas
+    after: Image.Image           # Image 2 on the common canvas
+    mask: Image.Image            # "L": 255 where the images differ
+    regions: list                # [(x0, y0, x1, y1), ...] in reading order
+    changed_pixels: int
+    compared_pixels: int
+    notes: list
+
+
+def _max_channel_diff(a, b):
+    """Per-pixel difference: the largest change in R, G or B (so a colour
+    change is found even when brightness stays the same)."""
+    r, g, bl = ImageChops.difference(a, b).split()
+    return ImageChops.lighter(ImageChops.lighter(r, g), bl)
+
+
+def _changed_mask(a, b, tolerance):
+    """255 where the images really differ. A pixel only counts as changed
+    if it matches nothing in the other image's 3x3 neighbourhood (by more
+    than the tolerance), so anti-aliasing, JPEG noise and sub-pixel shifts
+    are ignored while real edits are found. Tolerance 0 = exact compare."""
+    if tolerance <= 0:
+        return _max_channel_diff(a, b).point(lambda v: 255 if v else 0)
+    amin, amax = a.filter(ImageFilter.MinFilter(3)), a.filter(ImageFilter.MaxFilter(3))
+    bmin, bmax = b.filter(ImageFilter.MinFilter(3)), b.filter(ImageFilter.MaxFilter(3))
+
+    def max_channel(img):
+        r, g, bl = img.split()
+        return ImageChops.lighter(ImageChops.lighter(r, g), bl)
+    a_out = max_channel(ImageChops.lighter(ImageChops.subtract(a, bmax), ImageChops.subtract(bmin, a)))
+    b_out = max_channel(ImageChops.lighter(ImageChops.subtract(b, amax), ImageChops.subtract(amin, b)))
+    return ImageChops.lighter(a_out, b_out).point(lambda v: 255 if v > tolerance else 0)
+
+
+def _shift_score(a, b, dx, dy, min_overlap=0.5):
+    """Mean grey-level difference with image a placed at (dx, dy) over b,
+    or None if they would overlap too little."""
+    aw, ah = a.size
+    bw, bh = b.size
+    x0, y0 = max(0, dx), max(0, dy)
+    x1, y1 = min(bw, dx + aw), min(bh, dy + ah)
+    if x1 - x0 < min(aw, bw) * min_overlap or y1 - y0 < min(ah, bh) * min_overlap:
+        return None
+    diff = ImageChops.difference(a.crop((x0 - dx, y0 - dy, x1 - dx, y1 - dy)),
+                                 b.crop((x0, y0, x1, y1)))
+    return ImageStat.Stat(diff).mean[0]
+
+
+def _best_shift(score, cx, cy, radius):
+    best = None
+    for dy in range(cy - radius, cy + radius + 1):
+        for dx in range(cx - radius, cx + radius + 1):
+            s = score(dx, dy)
+            if s is None:
+                continue
+            key = (round(s, 4), dx * dx + dy * dy)        # ties: smallest shift
+            if best is None or key < best[0]:
+                best = (key, dx, dy)
+    return best
+
+
+def find_alignment(a, b):
+    """Shift (dx, dy) that lines up Image 1 (a) with Image 2 (b): pixel (x, y)
+    of a matches pixel (x + dx, y + dy) of b. (0, 0) unless shifting is
+    clearly better."""
+    ga, gb = a.convert("L"), b.convert("L")
+    biggest = max(ga.width, ga.height, gb.width, gb.height)
+
+    def scaled(img, f):
+        if f <= 1:
+            return img
+        return img.resize((max(1, round(img.width / f)), max(1, round(img.height / f))), Image.BOX)
+
+    # 1) coarse: small copies (about 400 px), +-10 steps
+    f1 = max(1.0, biggest / 400)
+    sa, sb = scaled(ga, f1), scaled(gb, f1)
+    coarse = _best_shift(lambda dx, dy: _shift_score(sa, sb, dx, dy), 0, 0, 10)
+    if coarse is None:
+        return 0, 0
+
+    # 2) medium: about 1600 px
+    f2 = max(1.0, biggest / 1600)
+    ma, mb = scaled(ga, f2), scaled(gb, f2)
+    cx, cy = round(coarse[1] * f1 / f2), round(coarse[2] * f1 / f2)
+    medium = _best_shift(lambda dx, dy: _shift_score(ma, mb, dx, dy), cx, cy,
+                         int(math.ceil(f1 / f2)) + 1)
+    zero = _shift_score(ma, mb, 0, 0)
+    if medium is None or zero is None:
+        return 0, 0
+    dx, dy = round(medium[1] * f2), round(medium[2] * f2)
+
+    # 3) full resolution, on the most detailed parts of the image (text and
+    #    edges give a precise match; plain areas or lines running in one
+    #    direction don't), so it stays fast even for 4K screenshots
+    if f2 > 1:
+        r = int(math.ceil(f2)) + 1
+        x0, y0 = max(0, dx) + r, max(0, dy) + r
+        x1 = min(gb.width, dx + ga.width) - r
+        y1 = min(gb.height, dy + ga.height) - r
+        if x1 - x0 > 60 and y1 - y0 > 60:
+            tile = min(600, max(60, (x1 - x0) // 4), max(60, (y1 - y0) // 4))
+            edges = gb.filter(ImageFilter.FIND_EDGES) if biggest <= 2000 else \
+                scaled(gb, f2).filter(ImageFilter.FIND_EDGES)
+            ef = 1 if biggest <= 2000 else f2
+            tiles = []
+            for ty in range(y0, y1 - tile + 1, tile):
+                for tx in range(x0, x1 - tile + 1, tile):
+                    box = tuple(int(v / ef) for v in (tx, ty, tx + tile, ty + tile))
+                    tiles.append((ImageStat.Stat(edges.crop(box)).mean[0], (tx, ty, tx + tile, ty + tile)))
+            tiles.sort(reverse=True)
+            windows = [(w, gb.crop(w)) for _, w in tiles[:4]]
+
+            def window_score(sx, sy):
+                return sum(ImageStat.Stat(ImageChops.difference(
+                    ga.crop((w[0] - sx, w[1] - sy, w[2] - sx, w[3] - sy)), bw)).mean[0]
+                    for w, bw in windows)
+            if windows:
+                fine = _best_shift(window_score, dx, dy, r)
+                if fine is not None:
+                    dx, dy = fine[1], fine[2]
+
+    # Only shift when it really is a better match
+    best = _shift_score(ma, mb, round(dx / f2), round(dy / f2))
+    if best is None or best >= zero * 0.9 or zero - best < 0.3:
+        return 0, 0
+    return dx, dy
+
+
+def find_regions(mask):
+    """Group changed pixels into boxes [(x0, y0, x1, y1), ...]."""
+    W, H = mask.size
+    cell = int(min(15, max(4, round(max(W, H) / 500))))
+    gw, gh = int(math.ceil(W / cell)), int(math.ceil(H / cell))
+    grid = mask.resize((gw, gh), Image.BOX).point(lambda v: 255 if v else 0)
+    grid = grid.filter(ImageFilter.MaxFilter(5))          # join nearby changes (e.g. words of a line)
+    data = grid.tobytes()
+    seen = bytearray(gw * gh)
+    boxes = []
+    for start in range(gw * gh):
+        if not data[start] or seen[start]:
+            continue
+        seen[start] = 1
+        stack = [start]
+        x0 = x1 = start % gw
+        y0 = y1 = start // gw
+        while stack:
+            i = stack.pop()
+            x, y = i % gw, i // gw
+            x0, x1, y0, y1 = min(x0, x), max(x1, x), min(y0, y), max(y1, y)
+            for j in ((i - 1) if x > 0 else -1, (i + 1) if x < gw - 1 else -1,
+                      (i - gw) if y > 0 else -1, (i + gw) if y < gh - 1 else -1):
+                if j >= 0 and data[j] and not seen[j]:
+                    seen[j] = 1
+                    stack.append(j)
+        box = (x0 * cell, y0 * cell, min(W, (x1 + 1) * cell), min(H, (y1 + 1) * cell))
+        tight = mask.crop(box).getbbox()
+        if tight is None:
+            continue
+        tight = (box[0] + tight[0], box[1] + tight[1], box[0] + tight[2], box[1] + tight[3])
+        if mask.crop(tight).histogram()[255] >= COMPARE_MIN_PIXELS:
+            boxes.append(tight)
+
+    # merge boxes that touch or overlap (after padding)
+    gap = cell
+    merged = True
+    while merged:
+        merged = False
+        out = []
+        for b in boxes:
+            for k, o in enumerate(out):
+                if (b[0] <= o[2] + gap and o[0] <= b[2] + gap and
+                        b[1] <= o[3] + gap and o[1] <= b[3] + gap):
+                    out[k] = (min(b[0], o[0]), min(b[1], o[1]), max(b[2], o[2]), max(b[3], o[3]))
+                    merged = True
+                    break
+            else:
+                out.append(b)
+        boxes = out
+    # reading order: top to bottom, then left to right (rows of ~cell*4 px)
+    boxes.sort(key=lambda b: (b[1] // (cell * 4), b[0]))
+    return boxes
+
+
+def compare_images(a, b, tolerance=30, align=True):
+    """Compare Image 1 (a) with Image 2 (b). tolerance: 0-255 colour change
+    that is still treated as 'the same'."""
+    a, b = a.convert("RGB"), b.convert("RGB")
+    notes = []
+
+    if a.size != b.size:
+        ra, rb = a.width / a.height, b.width / b.height
+        if abs(ra - rb) / rb < 0.01 and 0.4 < a.width / b.width < 2.5:
+            a = a.resize(b.size, Image.LANCZOS)
+            notes.append("Image 1 was resized to match Image 2")
+
+    resized = bool(notes)
+    dx, dy = find_alignment(a, b) if align else (0, 0)
+    if (dx, dy) != (0, 0):
+        notes.append(f"aligned by {dx:+d}, {dy:+d} px")
+
+    # common canvas holding both images
+    left, top = min(0, dx), min(0, dy)
+    W = max(b.width, dx + a.width) - left
+    H = max(b.height, dy + a.height) - top
+    ax, ay, bx, by = dx - left, dy - top, -left, -top
+    before = Image.new("RGB", (W, H), COMPARE_NEUTRAL)
+    before.paste(a, (ax, ay))
+    after = Image.new("RGB", (W, H), COMPARE_NEUTRAL)
+    after.paste(b, (bx, by))
+
+    mask = Image.new("L", (W, H), 0)
+    ov = (max(ax, bx), max(ay, by), min(ax + a.width, bx + b.width), min(ay + a.height, by + b.height))
+    compared = 0
+    if ov[2] > ov[0] and ov[3] > ov[1]:
+        changed = _changed_mask(before.crop(ov), after.crop(ov), tolerance)
+        if resized and changed.width > 8 and changed.height > 8:
+            # resizing blurs the outermost pixels - don't report them
+            inner = Image.new("L", changed.size, 0)
+            inner.paste(255, (2, 2, changed.width - 2, changed.height - 2))
+            changed = ImageChops.darker(changed, inner)
+        mask.paste(changed, ov[:2])
+        compared = (ov[2] - ov[0]) * (ov[3] - ov[1])
+
+    if a.size != b.size:
+        # content that exists in only one of the images is a difference too
+        pa = Image.new("L", (W, H), 0)
+        pa.paste(255, (ax, ay, ax + a.width, ay + a.height))
+        pb = Image.new("L", (W, H), 0)
+        pb.paste(255, (bx, by, bx + b.width, by + b.height))
+        only_one = ImageChops.difference(pa, pb)
+        mask = ImageChops.lighter(mask, only_one)
+        compared = W * H
+        notes.append(f"sizes differ ({a.width}×{a.height} vs {b.width}×{b.height})")
+    else:
+        # with the same size, the thin strips left by aligning are not changes
+        keep = Image.new("L", (W, H), 0)
+        keep.paste(255, ov)
+        mask = ImageChops.darker(mask, keep)
+        before, after, mask = before.crop((bx, by, bx + b.width, by + b.height)), \
+            after.crop((bx, by, bx + b.width, by + b.height)), mask.crop((bx, by, bx + b.width, by + b.height))
+
+    regions = find_regions(mask)
+    return CompareResult(before=before, after=after, mask=mask, regions=regions,
+                         changed_pixels=mask.histogram()[255], compared_pixels=max(1, compared),
+                         notes=notes)
+
+
+def emphasise_changes(image, result, dim=True):
+    """Spotlight the differences: unchanged areas are faded out, changed
+    areas keep their true, full colour. (Boxes and numbers are drawn
+    separately, at screen size.)"""
+    out = image.copy()
+    W, H = out.size
+    if dim and result.regions:
+        faded = Image.blend(out, Image.new("RGB", out.size, (255, 255, 255)), 0.62)
+        keep = Image.new("L", out.size, 0)
+        d = ImageDraw.Draw(keep)
+        pad = max(6, round(max(W, H) / 300))
+        for x0, y0, x1, y1 in result.regions:
+            d.rectangle([x0 - pad, y0 - pad, x1 + pad, y1 + pad], fill=255)
+        out = Image.composite(out, faded, keep)
+    return out
+
+
+def side_by_side(before, after):
+    """Image 1 | Image 2 with a label above each. Returns the image and the
+    offset of each half."""
+    gap, bar = 24, 34
+    W, H = before.width + gap + after.width, max(before.height, after.height) + bar
+    out = Image.new("RGB", (W, H), (255, 255, 255))
+    out.paste(before, (0, bar))
+    out.paste(after, (before.width + gap, bar))
+    d = ImageDraw.Draw(out)
+    font = text_font(16)
+    d.text((4, 8), "IMAGE 1", fill=(27, 31, 42), font=font)
+    d.text((before.width + gap + 4, 8), "IMAGE 2", fill=(27, 31, 42), font=font)
+    return out, [(0, bar), (before.width + gap, bar)]
+
+
+def draw_difference_boxes(image, regions, offsets, selected=None):
+    """Numbered red boxes drawn into the image itself (for Copy / Save)."""
+    out = image.copy()
+    W, H = out.size
+    d = ImageDraw.Draw(out)
+    lw = max(3, round(max(W, H) / 450))
+    pad = lw + 4
+    font = text_font(max(14, lw * 5))
+    for n, (x0, y0, x1, y1) in enumerate(regions, 1):
+        for ox, oy in offsets:
+            bx0, by0, bx1, by1 = x0 + ox - pad, y0 + oy - pad, x1 + ox + pad, y1 + oy + pad
+            width = lw * 2 if n == selected else lw
+            d.rectangle([bx0, by0, bx1, by1], outline=COMPARE_RED, width=width)
+            label = str(n)
+            tb = d.textbbox((0, 0), label, font=font)
+            tw, th = tb[2] - tb[0], tb[3] - tb[1]
+            ty = by0 - th - 10 if by0 - th - 10 >= 0 else by1 + 2
+            d.rectangle([bx0, ty, bx0 + tw + 10, ty + th + 10], fill=COMPARE_RED)
+            d.text((bx0 + 5 - tb[0], ty + 5 - tb[1]), label, fill="white", font=font)
+    return out
+
+
+def classify_difference(result, box):
+    """'Changed', 'Only in Image 1' or 'Only in Image 2'."""
+    def plain(img):
+        return ImageStat.Stat(img.crop(box).convert("L")).stddev[0] < 4
+    p1, p2 = plain(result.before), plain(result.after)
+    if p1 and not p2:
+        return "Only in Image 2"
+    if p2 and not p1:
+        return "Only in Image 1"
+    return "Changed"
+
+
+def difference_thumbnail(result, box, size):
+    """Zoomed close-up of one difference: Image 1 | arrow | Image 2."""
+    max_w, max_h = size
+    W, H = result.after.size
+    x0, y0, x1, y1 = box
+    ctx = max(14, int(max(x1 - x0, y1 - y0) * 0.35))
+    cx0, cy0 = max(0, x0 - ctx), max(0, y0 - ctx)
+    cx1, cy1 = min(W, x1 + ctx), min(H, y1 + ctx)
+    cw, ch = cx1 - cx0, cy1 - cy0
+    scale = min(4.0, max_w / cw, max_h / ch)
+    tw, th = max(1, int(cw * scale)), max(1, int(ch * scale))
+    method = Image.NEAREST if scale >= 2 else (Image.BICUBIC if scale >= 1 else Image.LANCZOS)
+    arrow_w = 26
+    out = Image.new("RGB", (max_w * 2 + arrow_w, max_h), (255, 255, 255))
+    for k, img in enumerate((result.before, result.after)):
+        crop = img.crop((cx0, cy0, cx1, cy1)).resize((tw, th), method)
+        d = ImageDraw.Draw(crop)
+        d.rectangle([(x0 - cx0) * scale - 2, (y0 - cy0) * scale - 2,
+                     (x1 - cx0) * scale + 1, (y1 - cy0) * scale + 1], outline=COMPARE_RED, width=2)
+        px = k * (max_w + arrow_w) + (max_w - tw) // 2
+        out.paste(crop, (px, (max_h - th) // 2))
+        ImageDraw.Draw(out).rectangle([px - 1, (max_h - th) // 2 - 1, px + tw, (max_h - th) // 2 + th],
+                                      outline=(201, 206, 216))
+    d = ImageDraw.Draw(out)
+    ax, ay = max_w + 5, max_h // 2
+    d.line([ax, ay, ax + 14, ay], fill=(75, 85, 99), width=3)
+    d.polygon([(ax + 12, ay - 6), (ax + 19, ay), (ax + 12, ay + 6)], fill=(75, 85, 99))
+    return out
+
+
+class CompareWindow:
+    """Load or capture two images, compare them, and show the differences."""
+
+    current = None
+    SLOT_TITLES = ("IMAGE 1", "IMAGE 2")
+    VIEWS = (("before", "Image 1"), ("after", "Image 2"), ("side", "Side by side"), ("blink", "Blink"))
+    MAX_LISTED = 150
+
+    def __init__(self):
+        if CompareWindow.current is not None and CompareWindow.current.win.winfo_exists():
+            CompareWindow.current.show()
+            return
+        CompareWindow.current = self
+        self.images = [None, None]
+        self.names = ["", ""]
+        self.result = None
+        self.bases = {}           # view -> (image, [offset per copy of each region])
+        self.kinds = []
+        self.selected = None      # number of the selected difference (1-based)
+        self.zoom = None          # (x0, y0, x1, y1) in view-image coordinates
+        self.photo = None
+        self.thumbs = [None, None]
+        self.item_photos = []
+        self.items = []
+        self.busy = False
+        self._resize_job = None
+        self._blink_job = None
+        self.blink_state = 0
+        self.transform = None     # (scale, ox, oy, vx0, vy0) of the current drawing
+
+        self.win = tk.Toplevel(root)
+        self.win.title("Compare images")
+        self.win.configure(bg=BG)
+        self.win.protocol("WM_DELETE_WINDOW", self.close)
+
+        # --- header ---------------------------------------------------
+        head = tk.Frame(self.win, bg=HEADER_BG)
+        head.pack(fill="x")
+        inner = tk.Frame(head, bg=HEADER_BG)
+        inner.pack(fill="x", padx=S(20), pady=S(10))
+        tk.Label(inner, image=icon("compare", "white", 22), bg=HEADER_BG).pack(side="left")
+        titles = tk.Frame(inner, bg=HEADER_BG)
+        titles.pack(side="left", padx=(S(10), 0))
+        tk.Label(titles, text="Compare images", font=F_TILE, fg="white", bg=HEADER_BG).pack(anchor="w")
+        tk.Label(titles, text="Open or capture two images, then click Compare. "
+                              "Differences are boxed in red; click one to zoom in.",
+                 font=F_TILE_SUB, fg=HEADER_SUB, bg=HEADER_BG).pack(anchor="w")
+        tk.Frame(self.win, bg=ACCENT, height=S(3)).pack(fill="x")
+
+        body = tk.Frame(self.win, bg=BG)
+        body.pack(fill="both", expand=True, padx=S(16), pady=S(12))
+
+        # --- the two image slots -----------------------------------------
+        slots = tk.Frame(body, bg=BG)
+        slots.pack(fill="x")
+        slots.columnconfigure((0, 1), weight=1, uniform="slots")
+        self.slot = [self._make_slot(slots, i) for i in range(2)]
+
+        # --- options + Compare --------------------------------------------
+        opts = tk.Frame(body, bg=CARD, highlightthickness=1, highlightbackground=BORDER)
+        opts.pack(fill="x", pady=(S(8), 0))
+        row = tk.Frame(opts, bg=CARD)
+        row.pack(fill="x", padx=S(12), pady=S(7))
+        tk.Label(row, text="Tolerance", font=F_BODY_BOLD, fg=TEXT, bg=CARD).pack(side="left")
+        self.tol_var = tk.DoubleVar(value=30)
+        ttk.Scale(row, from_=0, to=120, orient="horizontal", variable=self.tol_var,
+                  length=S(150)).pack(side="left", padx=(S(8), S(6)))
+        self.tol_label = tk.Label(row, font=F_BODY, fg=MUTED, bg=CARD, width=15, anchor="w")
+        self.tol_label.pack(side="left")
+        self.tol_var.trace_add("write", lambda *a: self._tol_text())
+        self._tol_text()
+        self.align_var = tk.BooleanVar(value=True)
+        Toggle(row, "Auto-align", self.align_var).pack(side="left", padx=(S(6), 0))
+        self.dim_var = tk.BooleanVar(value=True)
+        Toggle(row, "Fade unchanged areas", self.dim_var).pack(side="left", padx=(S(16), 0))
+        self.dim_var.trace_add("write", lambda *a: self._rebuild_bases())
+        self.compare_button = FlatButton(row, "Compare", self.compare, style="primary")
+        self.compare_button.pack(side="right")
+        self.swap_button = FlatButton(row, "Swap images", self.swap)
+        self.swap_button.pack(side="right", padx=(0, S(8)))
+
+        # --- result header: summary + views ---------------------------------
+        res_head = tk.Frame(body, bg=BG)
+        res_head.pack(fill="x", pady=(S(8), S(6)))
+        self.summary = tk.Label(res_head, text="", font=F_BODY_BOLD, fg=TEXT, bg=BG, anchor="w",
+                                justify="left")
+        self.summary.pack(side="left", fill="x", expand=True)
+        self.view_var = tk.StringVar(value="after")
+        self.view_buttons = []
+        for value, label in reversed(self.VIEWS):
+            b = tk.Radiobutton(res_head, text=label, value=value, variable=self.view_var,
+                               indicatoron=False, command=self._view_changed, font=F_BODY_BOLD,
+                               bg=CARD, fg=TEXT, selectcolor=ACCENT_SOFT, activebackground="#EEF0F4",
+                               relief="flat", bd=0, highlightthickness=1, highlightbackground=FIELD_BORDER,
+                               padx=S(12), pady=S(4), cursor="hand2")
+            b.pack(side="right", padx=(S(4), 0))
+            self.view_buttons.append(b)
+
+        # bottom buttons (packed before the result so they stay visible)
+        bottom = tk.Frame(body, bg=BG)
+        bottom.pack(side="bottom", fill="x", pady=(S(10), 0))
+        self.copy_button = FlatButton(bottom, "Copy result", self.copy_result,
+                                      icons={"Copy result": icon("copy", TEXT, 15),
+                                             "Copied": icon("check", GREEN, 15)})
+        self.copy_button.pack(side="left")
+        self.save_button = FlatButton(bottom, "Save result...", self.save_result)
+        self.save_button.pack(side="left", padx=(S(8), 0))
+        FlatButton(bottom, "Close", self.close).pack(side="right")
+
+        # --- result: picture (left) + list of differences (right) ----------
+        result_row = tk.Frame(body, bg=BG)
+        result_row.pack(fill="both", expand=True)
+
+        side = tk.Frame(result_row, bg=CARD, highlightthickness=1, highlightbackground=BORDER,
+                        width=S(330))
+        side.pack(side="right", fill="y", padx=(S(10), 0))
+        side.pack_propagate(False)
+        side_head = tk.Frame(side, bg=CARD)
+        side_head.pack(fill="x", padx=S(10), pady=(S(8), S(4)))
+        tk.Label(side_head, text="DIFFERENCES", font=F_SECTION, fg=TEXT, bg=CARD).pack(side="left")
+        self.count_label = tk.Label(side_head, text="", font=F_SECTION, fg=COMPARE_HEX, bg=CARD)
+        self.count_label.pack(side="left", padx=(S(6), 0))
+        nav = tk.Frame(side, bg=CARD)
+        nav.pack(fill="x", padx=S(10), pady=(0, S(6)))
+        self.prev_button = FlatButton(nav, "Previous", lambda: self.step(-1))
+        self.prev_button.pack(side="left")
+        self.next_button = FlatButton(nav, "Next", lambda: self.step(1))
+        self.next_button.pack(side="left", padx=(S(6), 0))
+        self.all_button = FlatButton(nav, "Show all", self.show_all)
+        self.all_button.pack(side="right")
+        tk.Frame(side, bg="#E3E6EC", height=1).pack(fill="x")
+        list_wrap = tk.Frame(side, bg=CARD)
+        list_wrap.pack(fill="both", expand=True)
+        self.list_canvas = tk.Canvas(list_wrap, bg=CARD, highlightthickness=0)
+        list_scroll = tk.Scrollbar(list_wrap, orient="vertical", command=self.list_canvas.yview)
+        self.list_canvas.configure(yscrollcommand=list_scroll.set)
+        list_scroll.pack(side="right", fill="y")
+        self.list_canvas.pack(side="left", fill="both", expand=True)
+        self.list_frame = tk.Frame(self.list_canvas, bg=CARD)
+        self.list_window = self.list_canvas.create_window(0, 0, anchor="nw", window=self.list_frame)
+        self.list_frame.bind("<Configure>", lambda e: self.list_canvas.configure(
+            scrollregion=self.list_canvas.bbox("all")))
+        self.list_canvas.bind("<Configure>", lambda e: self.list_canvas.itemconfigure(
+            self.list_window, width=e.width))
+        for w in (self.list_canvas, self.list_frame):
+            w.bind("<MouseWheel>", self._list_wheel)
+
+        frame = tk.Frame(result_row, bg=CARD, highlightthickness=1, highlightbackground=FIELD_BORDER)
+        frame.pack(side="left", fill="both", expand=True)
+        self.canvas = tk.Canvas(frame, bg="#2A2F3A", highlightthickness=0, height=S(300))
+        self.scroll = tk.Scrollbar(frame, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=self.scroll.set)
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.canvas.bind("<Configure>", lambda e: self._schedule_redraw())
+        self.canvas.bind("<MouseWheel>", self._canvas_wheel)
+        self.canvas.bind("<Button-1>", self._canvas_click)
+        self.canvas.bind("<Double-Button-1>", lambda e: self.show_all())
+
+        self.win.bind("<Return>", lambda e: self.compare())
+        self.win.bind("<Escape>", lambda e: self.show_all() if self.zoom else self.close())
+        self.win.bind("<Control-c>", lambda e: self.copy_result())
+        self.win.bind("<Control-C>", lambda e: self.copy_result())
+        self.win.bind("<Down>", lambda e: self.step(1))
+        self.win.bind("<Up>", lambda e: self.step(-1))
+
+        left, top, width, height = screen_work_area()
+        w, h = min(S(1280), int(width * 0.94)), min(S(940), int(height * 0.92))
+        self.win.geometry(f"{w}x{h}+{left + (width - w) // 2}+{top + max(0, (height - h) // 2 - S(10))}")
+        self.win.minsize(min(w, S(900)), min(h, S(600)))
+        self._update_state()
+        self._fill_list()
+        self.show_result()
+        self.show()
+
+    # ---- slots ---------------------------------------------------------
+
+    def _make_slot(self, parent, i):
+        card = tk.Frame(parent, bg=CARD, highlightthickness=1, highlightbackground=BORDER)
+        card.grid(row=0, column=i, sticky="nsew", padx=(0, S(5)) if i == 0 else (S(5), 0))
+        top = tk.Frame(card, bg=CARD)
+        top.pack(fill="x", padx=S(12), pady=(S(8), S(4)))
+        tk.Frame(top, bg=ACCENT, width=S(4), height=S(14)).pack(side="left", padx=(0, S(8)))
+        tk.Label(top, text=self.SLOT_TITLES[i], font=F_SECTION, fg=TEXT, bg=CARD).pack(side="left")
+        info = tk.Label(top, text="No image yet", font=F_TILE_SUB, fg=MUTED, bg=CARD)
+        info.pack(side="right")
+        preview = tk.Canvas(card, bg="#2A2F3A", highlightthickness=0, height=S(110))
+        preview.pack(fill="x", padx=S(12))
+        preview.bind("<Configure>", lambda e, i=i: self._draw_thumb(i))
+        buttons = tk.Frame(card, bg=CARD)
+        buttons.pack(fill="x", padx=S(12), pady=S(8))
+        FlatButton(buttons, "Open...", lambda: self.open_file(i)).pack(side="left")
+        FlatButton(buttons, "Capture region", lambda: self.capture_region(i)).pack(side="left", padx=(S(6), 0))
+        FlatButton(buttons, "Full screen", lambda: self.capture_screen(i)).pack(side="left", padx=(S(6), 0))
+        FlatButton(buttons, "Paste", lambda: self.paste(i)).pack(side="left", padx=(S(6), 0))
+        return {"info": info, "preview": preview}
+
+    def _draw_thumb(self, i):
+        c = self.slot[i]["preview"]
+        c.delete("all")
+        cw, ch = max(10, c.winfo_width()), max(10, c.winfo_height())
+        img = self.images[i]
+        if img is None:
+            c.create_text(cw // 2, ch // 2, fill="#9AA3B2", font=F_BODY,
+                          text="Open, capture or paste an image")
+            return
+        thumb = img.copy()
+        thumb.thumbnail((cw - 8, ch - 8), Image.LANCZOS)
+        self.thumbs[i] = ImageTk.PhotoImage(thumb)
+        c.create_image(cw // 2, ch // 2, image=self.thumbs[i])
+
+    def set_image(self, i, image, name):
+        self.images[i] = image.convert("RGB")
+        self.names[i] = name
+        w, h = self.images[i].size
+        self.slot[i]["info"].configure(text=f"{name}  ·  {w} × {h} px", fg=TEXT)
+        self._draw_thumb(i)
+        self.clear_result()
+        self._update_state()
+
+    def _update_state(self):
+        both = all(img is not None for img in self.images)
+        self.compare_button.config(state="normal" if both and not self.busy else "disabled")
+        self.swap_button.config(state="normal" if any(self.images) and not self.busy else "disabled")
+        has = self.result is not None
+        n = len(self.result.regions) if has else 0
+        self.copy_button.config(state="normal" if has else "disabled")
+        self.save_button.config(state="normal" if has else "disabled")
+        for b in self.view_buttons:
+            b.configure(state="normal" if has else "disabled")
+        self.prev_button.config(state="normal" if n else "disabled")
+        self.next_button.config(state="normal" if n else "disabled")
+        self.all_button.config(state="normal" if self.zoom else "disabled")
+
+    def _tol_text(self):
+        v = int(round(self.tol_var.get()))
+        word = ("exact" if v == 0 else "strict" if v < 20 else "normal" if v < 60 else "relaxed")
+        self.tol_label.configure(text=f"{v}  ({word})")
+
+    # ---- loading images ------------------------------------------------
+
+    def show(self):
+        self.win.deiconify()
+        self.win.lift()
+        self.win.focus_force()
+
+    def open_file(self, i):
+        path = filedialog.askopenfilename(
+            parent=self.win, title=f"Open Image {i + 1}",
+            initialdir=str(save_folder) if save_folder else str(Path.home()),
+            filetypes=[("Images", "*.png *.jpg *.jpeg *.bmp *.gif *.tif *.tiff *.webp"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            with Image.open(path) as im:
+                im.load()
+                self.set_image(i, im, Path(path).name)
+        except Exception as e:
+            messagebox.showerror("Could not open image", f"{path}\n\n{e}", parent=self.win)
+
+    def paste(self, i):
+        try:
+            data = ImageGrab.grabclipboard()
+        except Exception as e:
+            data = None
+            print(f"Clipboard read failed: {e}")
+        if isinstance(data, list):                     # files copied in Explorer
+            for p in data:
+                try:
+                    with Image.open(p) as im:
+                        im.load()
+                        self.set_image(i, im, Path(p).name)
+                        return
+                except Exception:
+                    continue
+            data = None
+        if data is None or not hasattr(data, "size"):
+            messagebox.showinfo("Nothing to paste",
+                                "There is no image on the clipboard.\n\n"
+                                "Copy a screenshot or an image file first, then click Paste.",
+                                parent=self.win)
+            return
+        self.set_image(i, data, "Pasted image")
+
+    def capture_region(self, i):
+        if recorder is not None:
+            return
+        self.win.withdraw()
+        start_region_selection(lambda x1, y1, x2, y2: self._grab(i, (x1, y1, x2, y2)),
+                               hint=f"Drag over the area for Image {i + 1}  ·  Esc to cancel",
+                               on_cancel=self.show)
+
+    def capture_screen(self, i):
+        if recorder is not None:
+            return
+        self.win.withdraw()
+        root.withdraw()
+        root.after(500, lambda: self._grab(i, None))
+
+    def _grab(self, i, bbox):
+        try:
+            image = ImageGrab.grab(bbox=bbox, all_screens=True)
+        except Exception as e:
+            image = None
+            messagebox.showerror("Capture failed", str(e), parent=root)
+        root.deiconify()
+        self.show()
+        if image is not None:
+            self.set_image(i, image, "Screen region" if bbox else "Full screen")
+
+    def swap(self):
+        self.images.reverse()
+        self.names.reverse()
+        for i in range(2):
+            img = self.images[i]
+            if img is None:
+                self.slot[i]["info"].configure(text="No image yet", fg=MUTED)
+            else:
+                self.slot[i]["info"].configure(
+                    text=f"{self.names[i]}  ·  {img.width} × {img.height} px", fg=TEXT)
+            self._draw_thumb(i)
+        self.clear_result()
+        self._update_state()
+
+    # ---- comparing -----------------------------------------------------
+
+    def compare(self):
+        if self.busy or not all(img is not None for img in self.images):
+            return
+        self.busy = True
+        self.clear_result()
+        self.compare_button.config(text="Comparing...")
+        self.summary.configure(text="Comparing...", fg=MUTED)
+        self._update_state()
+        self.show_result()
+        a, b = self.images
+        tol, align, dim = int(round(self.tol_var.get())), self.align_var.get(), self.dim_var.get()
+        box = {}
+
+        def work():
+            try:
+                res = compare_images(a, b, tolerance=tol, align=align)
+                box["bases"] = self._make_bases(res, dim)
+                box["kinds"] = [classify_difference(res, r) for r in res.regions[:self.MAX_LISTED]]
+                box["thumbs"] = [difference_thumbnail(res, r, (S(132), S(92)))
+                                 for r in res.regions[:self.MAX_LISTED]]
+                box["result"] = res
+            except Exception as e:
+                box["error"] = e
+
+        thread = threading.Thread(target=work, daemon=True)
+        thread.start()
+
+        def poll():
+            if thread.is_alive():
+                self.win.after(100, poll)
+                return
+            self.busy = False
+            self.compare_button.config(text="Compare")
+            if "error" in box:
+                print(f"Compare failed: {box['error']}")
+                self.summary.configure(text=f"Could not compare the images: {box['error']}", fg=RED)
+            else:
+                self.result, self.bases, self.kinds = box["result"], box["bases"], box["kinds"]
+                self._summarise()
+                self._fill_list(box["thumbs"])
+            self._update_state()
+            self.show_result()
+        poll()
+
+    @staticmethod
+    def _make_bases(res, dim):
+        b1 = emphasise_changes(res.before, res, dim)
+        b2 = emphasise_changes(res.after, res, dim)
+        side, offsets = side_by_side(b1, b2)
+        return {"before": (b1, [(0, 0)]), "after": (b2, [(0, 0)]), "side": (side, offsets)}
+
+    def _rebuild_bases(self):
+        if self.result is not None:
+            self.bases = self._make_bases(self.result, self.dim_var.get())
+            self.show_result()
+
+    def _summarise(self):
+        r = self.result
+        n = len(r.regions)
+        extra = ("   ·   " + "; ".join(r.notes)) if r.notes else ""
+        if n == 0:
+            self.summary.configure(text="No differences found - the images match." + extra, fg=GREEN)
+            status_var.set("Compare images: no differences found")
+        else:
+            pct = 100 * r.changed_pixels / r.compared_pixels
+            pct_text = f"{pct:.2f}" if pct < 10 else f"{pct:.0f}"
+            self.summary.configure(
+                text=f"{n} difference{'s' if n != 1 else ''} found   ·   "
+                     f"{pct_text}% of the image changed{extra}", fg=COMPARE_HEX)
+            status_var.set(f"Compare images: {n} difference{'s' if n != 1 else ''} found")
+
+    def clear_result(self):
+        self._stop_blink()
+        self.result = None
+        self.bases = {}
+        self.kinds = []
+        self.selected = None
+        self.zoom = None
+        self.summary.configure(text="", fg=TEXT)
+        if hasattr(self, "list_frame"):
+            self._fill_list()
+        if hasattr(self, "all_button"):
+            self._update_state()
+        self.show_result()
+
+    # ---- list of differences --------------------------------------------
+
+    def _fill_list(self, thumbs=None):
+        for w in self.list_frame.winfo_children():
+            w.destroy()
+        self.items, self.item_photos = [], []
+        if self.result is None or not self.result.regions:
+            self.count_label.configure(text="")
+            msg = ("Comparing..." if self.busy else
+                   "No differences - the images match." if self.result is not None else
+                   "The differences will be listed here, each one zoomed in so it's easy to see.")
+            tk.Label(self.list_frame, text=msg, font=F_BODY, fg=MUTED, bg=CARD, wraplength=S(280),
+                     justify="left").pack(anchor="w", padx=S(12), pady=S(12))
+            return
+        regions = self.result.regions
+        self.count_label.configure(text=str(len(regions)))
+        for n, (box, kind) in enumerate(zip(regions, self.kinds), 1):
+            item = tk.Frame(self.list_frame, bg=CARD, cursor="hand2", highlightthickness=1,
+                            highlightbackground=CARD)
+            item.pack(fill="x", padx=S(6), pady=(S(4), 0))
+            head = tk.Frame(item, bg=CARD)
+            head.pack(fill="x", padx=S(6), pady=(S(4), S(2)))
+            badge = tk.Label(head, text=str(n), font=F_BODY_BOLD, fg="white", bg=COMPARE_HEX,
+                             padx=S(6))
+            badge.pack(side="left")
+            title = tk.Label(head, text=kind, font=F_BODY_BOLD, fg=TEXT, bg=CARD)
+            title.pack(side="left", padx=(S(8), 0))
+            size = tk.Label(head, text=f"{box[2] - box[0]} × {box[3] - box[1]} px",
+                            font=F_TILE_SUB, fg=MUTED, bg=CARD)
+            size.pack(side="right")
+            widgets = [item, head, badge, title, size]
+            if thumbs is not None and n - 1 < len(thumbs):
+                photo = ImageTk.PhotoImage(thumbs[n - 1])
+                self.item_photos.append(photo)
+                pic = tk.Label(item, image=photo, bg=CARD)
+                pic.pack(padx=S(6), pady=(0, S(2)))
+                caps = tk.Frame(item, bg=CARD)
+                caps.pack(fill="x", padx=S(6), pady=(0, S(4)))
+                c1 = tk.Label(caps, text="Image 1", font=F_TILE_SUB, fg=MUTED, bg=CARD)
+                c1.pack(side="left", expand=True)
+                c2 = tk.Label(caps, text="Image 2", font=F_TILE_SUB, fg=MUTED, bg=CARD)
+                c2.pack(side="left", expand=True)
+                widgets += [pic, caps, c1, c2]
+            for w in widgets:
+                w.bind("<Button-1>", lambda e, n=n: self.select(n, zoom=True))
+                w.bind("<MouseWheel>", self._list_wheel)
+            self.items.append((item, widgets))
+        if len(regions) > len(self.kinds):
+            tk.Label(self.list_frame, text=f"+ {len(regions) - len(self.kinds)} more (boxed in the picture)",
+                     font=F_TILE_SUB, fg=MUTED, bg=CARD).pack(anchor="w", padx=S(12), pady=S(6))
+        self.list_canvas.yview_moveto(0)
+
+    def _list_wheel(self, event):
+        self.list_canvas.yview_scroll(int(-event.delta / 120) * 3, "units")
+
+    def _highlight_item(self):
+        for k, (item, widgets) in enumerate(self.items, 1):
+            on = k == self.selected
+            bg = ACCENT_SOFT if on else CARD
+            for w in widgets:
+                if not (isinstance(w, tk.Label) and w.cget("bg") == COMPARE_HEX):
+                    w.configure(bg=bg)
+            item.configure(highlightbackground=ACCENT if on else CARD)
+        if self.selected and self.selected <= len(self.items):
+            item = self.items[self.selected - 1][0]
+            self.list_canvas.update_idletasks()
+            total = max(1, self.list_frame.winfo_height())
+            top, bottom = item.winfo_y() / total, (item.winfo_y() + item.winfo_height()) / total
+            first, last = self.list_canvas.yview()
+            if top < first or bottom > last:
+                self.list_canvas.yview_moveto(max(0.0, top - 0.02))
+
+    def select(self, n, zoom=True):
+        if self.result is None or not (1 <= n <= len(self.result.regions)):
+            return
+        self.selected = n
+        if zoom:
+            self.zoom_to(n)
+        self._highlight_item()
+        self._update_state()
+        self.show_result()
+
+    def step(self, delta):
+        if self.result is None or not self.result.regions:
+            return
+        n = len(self.result.regions)
+        cur = self.selected or (0 if delta > 0 else n + 1)
+        self.select((cur - 1 + delta) % n + 1, zoom=True)
+
+    def zoom_to(self, n):
+        """Zoom the picture onto difference n (with some context around it)."""
+        base = self.bases["after"][0]
+        bx0, by0, bx1, by1 = self.result.regions[n - 1]
+        ctx = max(60, int(max(bx1 - bx0, by1 - by0) * 0.8))
+        self.zoom = (max(0, bx0 - ctx), max(0, by0 - ctx),
+                     min(base.width, bx1 + ctx), min(base.height, by1 + ctx))
+
+    def show_all(self):
+        self.zoom = None
+        self._update_state()
+        self.show_result()
+
+    # ---- showing the result -------------------------------------------
+
+    def _view_changed(self):
+        self._stop_blink()
+        if self.view_var.get() == "blink" and self.result is not None:
+            self._blink_job = self.win.after(650, self._blink_tick)
+        if self.selected and self.zoom:
+            self.zoom_to(self.selected)
+        else:
+            self.zoom = None
+        self._update_state()
+        self.show_result()
+
+    def _blink_tick(self):
+        self.blink_state ^= 1
+        self.show_result()
+        self._blink_job = self.win.after(650, self._blink_tick)
+
+    def _stop_blink(self):
+        if self._blink_job:
+            self.win.after_cancel(self._blink_job)
+            self._blink_job = None
+        self.blink_state = 0
+
+    def _schedule_redraw(self):
+        if self._resize_job:
+            self.win.after_cancel(self._resize_job)
+        self._resize_job = self.win.after(60, self.show_result)
+
+    def _current_base(self):
+        view = self.view_var.get()
+        if view == "blink":
+            return self.bases.get("before" if self.blink_state else "after")
+        return self.bases.get(view)
+
+    def show_result(self):
+        self._resize_job = None
+        c = self.canvas
+        c.delete("all")
+        cw, ch = max(20, c.winfo_width()), max(20, c.winfo_height())
+        current = self._current_base()
+        if current is None:
+            self.scroll.pack_forget()
+            self.transform = None
+            msg = ("Comparing..." if self.busy else
+                   "Click Compare to find the differences" if all(img is not None for img in self.images) else
+                   "Load Image 1 and Image 2 above")
+            c.create_text(cw // 2, ch // 2, text=msg, fill="#9AA3B2", font=F_TILE)
+            c.configure(scrollregion=(0, 0, cw, ch))
+            return
+        base, offsets = current
+        clips = None
+        if self.zoom and self.view_var.get() == "side":
+            # zoomed side by side: the same close-up of Image 1 and Image 2
+            zx0, zy0, zx1, zy1 = self.zoom
+            zw, zh = zx1 - zx0, zy1 - zy0
+            gap, bar = max(12, zw // 25), max(22, zh // 12)
+            comp = Image.new("RGB", (zw * 2 + gap, zh + bar), (255, 255, 255))
+            comp.paste(self.bases["before"][0].crop(self.zoom), (0, bar))
+            comp.paste(self.bases["after"][0].crop(self.zoom), (zw + gap, bar))
+            d = ImageDraw.Draw(comp)
+            d.rectangle([zw, 0, zw + gap - 1, zh + bar], fill=(201, 206, 216))
+            font = text_font(min(18, max(11, bar - 10)))
+            d.text((4, 3), "IMAGE 1", fill=(27, 31, 42), font=font)
+            d.text((zw + gap + 4, 3), "IMAGE 2", fill=(27, 31, 42), font=font)
+            base, offsets = comp, [(-zx0, bar - zy0), (zw + gap - zx0, bar - zy0)]
+            clips = [(0, bar, zw, bar + zh), (zw + gap, bar, zw * 2 + gap, bar + zh)]
+            vx0, vy0, vw, vh = 0, 0, comp.width, comp.height
+            scale = min(4.0, (cw - 8) / vw, (ch - 8) / vh)
+            tall = False
+        elif self.zoom:
+            vx0, vy0, vx1, vy1 = self.zoom
+            vw, vh = vx1 - vx0, vy1 - vy0
+            scale = min(4.0, (cw - 8) / vw, (ch - 8) / vh)
+            tall = False
+        else:
+            vx0, vy0, vw, vh = 0, 0, base.width, base.height
+            fit_w = min(1.0, (cw - 4) / vw)
+            fit_both = min(fit_w, (ch - 4) / vh)
+            tall = vh > vw and fit_both < fit_w * 0.6
+            scale = min(1.0, (cw - 20) / vw) if tall else fit_both
+        crop = base.crop((vx0, vy0, vx0 + vw, vy0 + vh))
+        size = (max(1, int(vw * scale)), max(1, int(vh * scale)))
+        if size != crop.size:
+            crop = crop.resize(size, Image.LANCZOS if scale < 1 else Image.BICUBIC)
+        self.photo = ImageTk.PhotoImage(crop)
+        if tall:
+            if not self.scroll.winfo_ismapped():
+                self.scroll.pack(side="right", fill="y", before=c)
+            ox, oy = max(0, (cw - size[0]) // 2), 0
+            c.configure(scrollregion=(0, 0, cw, size[1]))
+        else:
+            self.scroll.pack_forget()
+            ox, oy = (cw - size[0]) // 2, (ch - size[1]) // 2
+            c.configure(scrollregion=(0, 0, cw, ch))
+            c.yview_moveto(0)
+        c.create_image(ox, oy, anchor="nw", image=self.photo)
+        self.transform = (scale, ox, oy, vx0, vy0)
+        self.drawn_offsets = offsets
+        self._draw_boxes(offsets, clips)
+        if self.view_var.get() == "blink":
+            label = "Image 1" if self.blink_state else "Image 2"
+            c.create_rectangle(10, 10, 10 + S(90), 10 + S(28), fill="#141824", outline="")
+            c.create_text(10 + S(45), 10 + S(14), text=label, fill="white", font=F_BODY_BOLD)
+
+    def _draw_boxes(self, offsets, clips=None):
+        """Red boxes + numbers drawn at screen size (always clearly visible)."""
+        if not self.result or not self.result.regions:
+            return
+        scale, ox, oy, vx0, vy0 = self.transform
+        c = self.canvas
+        min_px = S(18)
+        badge_font = ("Segoe UI", 9, "bold")
+        for n, (x0, y0, x1, y1) in enumerate(self.result.regions, 1):
+            sel = n == self.selected
+            for k, (dx, dy) in enumerate(offsets):
+                bx = (x0 + dx, y0 + dy, x1 + dx, y1 + dy)
+                if clips:                      # zoomed side by side: keep each box in its half
+                    cl = clips[k]
+                    if bx[2] <= cl[0] or bx[0] >= cl[2] or bx[3] <= cl[1] or bx[1] >= cl[3]:
+                        continue
+                sx0 = ox + (x0 + dx - vx0) * scale
+                sy0 = oy + (y0 + dy - vy0) * scale
+                sx1 = ox + (x1 + dx - vx0) * scale
+                sy1 = oy + (y1 + dy - vy0) * scale
+                # tiny changes still get a box you can see
+                if sx1 - sx0 < min_px:
+                    m = (sx0 + sx1) / 2
+                    sx0, sx1 = m - min_px / 2, m + min_px / 2
+                if sy1 - sy0 < min_px:
+                    m = (sy0 + sy1) / 2
+                    sy0, sy1 = m - min_px / 2, m + min_px / 2
+                pad = 4
+                bx0, by0, bx1, by1 = sx0 - pad, sy0 - pad, sx1 + pad, sy1 + pad
+                if sel:
+                    c.create_rectangle(bx0 - 3, by0 - 3, bx1 + 3, by1 + 3, outline="white", width=3)
+                c.create_rectangle(bx0, by0, bx1, by1, outline=COMPARE_HEX, width=5 if sel else 3,
+                                   tags=(f"diff{n}",))
+                bw, bh = S(10) + 7 * len(str(n)), S(20)
+                ty = by0 - bh if by0 - bh > 0 else by1
+                c.create_rectangle(bx0 - (3 if sel else 1), ty, bx0 + bw, ty + bh, fill=COMPARE_HEX,
+                                   outline="white" if sel else COMPARE_HEX, tags=(f"diff{n}",))
+                c.create_text(bx0 + bw / 2, ty + bh / 2, text=str(n), fill="white", font=badge_font,
+                              tags=(f"diff{n}",))
+
+    def _canvas_click(self, event):
+        """Click a red box to select (and zoom to) that difference."""
+        if not self.result or not self.result.regions or not self.transform:
+            return
+        x, y = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
+        for item in reversed(self.canvas.find_overlapping(x - 3, y - 3, x + 3, y + 3)):
+            for tag in self.canvas.gettags(item):
+                if tag.startswith("diff"):
+                    self.select(int(tag[4:]), zoom=True)
+                    return
+        # otherwise: inside a box?
+        scale, ox, oy, vx0, vy0 = self.transform
+        offsets = self.drawn_offsets
+        ix, iy = (x - ox) / scale + vx0, (y - oy) / scale + vy0
+        for n, (x0, y0, x1, y1) in enumerate(self.result.regions, 1):
+            for dx, dy in offsets:
+                if x0 + dx - 8 <= ix <= x1 + dx + 8 and y0 + dy - 8 <= iy <= y1 + dy + 8:
+                    self.select(n, zoom=True)
+                    return
+
+    def _canvas_wheel(self, event):
+        if self.scroll.winfo_ismapped():
+            self.canvas.yview_scroll(int(-event.delta / 120) * 3, "units")
+
+    # ---- output --------------------------------------------------------
+
+    def result_image(self):
+        """The current view as an image, with numbered boxes drawn in."""
+        view = self.view_var.get()
+        current = self.bases.get("after" if view == "blink" else view)
+        if current is None:
+            return None
+        base, offsets = current
+        return draw_difference_boxes(base, self.result.regions, offsets, self.selected)
+
+    def copy_result(self):
+        img = self.result_image()
+        if img is None:
+            return
+        try:
+            ok = copy_image_to_clipboard(img)
+        except Exception as e:
+            print(f"Copy failed: {e}")
+            ok = False
+        if not ok:
+            messagebox.showerror("Copy failed", "Could not copy the image to the clipboard.",
+                                 parent=self.win)
+            return
+        self.copy_button.config(text="Copied")
+        self.win.after(1500, lambda: self.copy_button.winfo_exists()
+                       and self.copy_button.config(text="Copy result"))
+        status_var.set("Comparison copied to the clipboard - paste it with Ctrl+V")
+
+    def save_result(self):
+        """Open the result in the Review window (annotate, then save to the
+        folder or the selected Word / Excel / PowerPoint file)."""
+        img = self.result_image()
+        if img is None or not ensure_save_folder():
+            return
+        taken_at = datetime.now()
+        AnnotateEditor(img, on_save=lambda result: handle_capture(result, "Comparison", taken_at),
+                       title="Comparison result",
+                       save_label=f"Save to {doc_app()}" if word_doc_path is not None else "Save")
+
+    def close(self):
+        self._stop_blink()
+        CompareWindow.current = None
+        self.win.destroy()
+
+
+def open_compare_window():
+    if recorder is not None:
+        return
+    CompareWindow()
+
+
+# ============================================================
 # Capture Full Screen
 # ============================================================
 
@@ -2868,17 +4239,17 @@ def perform_full_screen_capture():
 # Region Selection Overlay (shared by screenshot and recording)
 # ============================================================
 
-def start_region_selection(on_selected, hint=None):
+def start_region_selection(on_selected, hint=None, on_cancel=None):
     """
     Hide the main window and show the selection overlay.
     on_selected(left, top, right, bottom) is called with screen
     coordinates after the user drags out a rectangle.
     """
     root.withdraw()
-    root.after(200, lambda: create_selection_overlay(on_selected, hint))
+    root.after(200, lambda: create_selection_overlay(on_selected, hint, on_cancel))
 
 
-def create_selection_overlay(on_selected, hint=None):
+def create_selection_overlay(on_selected, hint=None, on_cancel=None):
     overlay = tk.Toplevel(root)
     overlay.attributes("-fullscreen", True)
     overlay.attributes("-topmost", True)
@@ -2934,6 +4305,8 @@ def create_selection_overlay(on_selected, hint=None):
             root.deiconify()
             root.lift()
             status_var.set("Selection too small - cancelled")
+            if on_cancel:
+                on_cancel()
             return
 
         # Wait for overlay to disappear
@@ -2944,6 +4317,8 @@ def create_selection_overlay(on_selected, hint=None):
         root.deiconify()
         root.lift()
         status_var.set("Selection cancelled")
+        if on_cancel:
+            on_cancel()
 
     canvas.bind("<ButtonPress-1>", mouse_down)
     canvas.bind("<B1-Motion>", mouse_move)
@@ -3860,13 +5235,13 @@ def on_close():
         )
         return
 
-    # Make sure every screenshot ends up in the Word document
+    # Make sure every screenshot ends up in the selected document
     while pending_captures and not flush_pending(interactive=True):
         retry = messagebox.askretrycancel(
-            "Word document is open",
+            f"{doc_app()} file is open",
             f"{len(pending_captures)} capture(s) haven't been added to:\n\n"
             f"{word_doc_path}\n\n"
-            "The document is probably open in Word. Close it there, "
+            f"The file is probably open in {doc_app()}. Close it there, "
             "then click Retry.\n\n"
             "Cancel saves them as separate .png files instead.",
             parent=root
@@ -4038,6 +5413,13 @@ def draw_icon(kind, color, size, accent=RED):
         d.rounded_rectangle(box(5, 2, 19, 22), radius=2 * u, outline=color, width=w)
         d.line(box(12, 6.5, 12, 15.5), fill=color, width=w)
         d.polygon([(8.2 * u, 13 * u), (15.8 * u, 13 * u), (12 * u, 18 * u)], fill=color)
+
+    elif kind == "compare":
+        d.rounded_rectangle(box(2, 4, 11, 20), radius=1.5 * u, outline=color, width=w)
+        d.rounded_rectangle(box(13, 4, 22, 20), radius=1.5 * u, outline=color, width=w)
+        d.ellipse(box(15, 9, 20, 14), fill=accent)
+        d.line(box(4.5, 9, 8.5, 9), fill=color, width=w)
+        d.line(box(4.5, 13, 8.5, 13), fill=color, width=w)
 
     elif kind == "ocr":
         L = 5
@@ -4340,7 +5722,7 @@ header_text.pack(side="left", padx=(S(12), 0))
 tk.Label(header_text, text="Screen Capture Utility", font=F_TITLE,
          fg="white", bg=HEADER_BG).pack(anchor="w")
 header_subtitle = tk.Label(header_text,
-                           text="Screenshots, recordings with sound, and Word reports",
+                           text="Screenshots, recordings with sound, and Word / Excel / PowerPoint reports",
                            font=F_SUB, fg=HEADER_SUB, bg=HEADER_BG)
 header_subtitle.pack(anchor="w")
 
@@ -4372,15 +5754,15 @@ browse_button.pack(side="left", padx=(S(8), 0))
 
 
 # ============================================================
-# Word Document Card
+# Document Card (Word / Excel / PowerPoint)
 # ============================================================
 
-word_frame = Card(content, "Word document", badge="Optional")
+word_frame = Card(content, "Document  (Word / Excel / PowerPoint)", badge="Optional")
 word_frame.pack(fill="x", pady=(0, S(12)))
 
 word_hint_label = tk.Label(
     word_frame.body,
-    text="Screenshots are added to this document in the order you take them.",
+    text="Screenshots are added to this Word, Excel or PowerPoint file in the order you take them.",
     font=F_TILE_SUB, fg=MUTED, bg=CARD)
 word_hint_label.pack(anchor="w", pady=(0, S(6)))
 
@@ -4395,7 +5777,7 @@ doc_entry.pack(side="left", fill="x", expand=True, ipady=S(5), ipadx=S(4))
 select_doc_button = FlatButton(doc_row, "Select", select_word_document)
 select_doc_button.pack(side="left", padx=(S(8), 0))
 
-new_doc_button = FlatButton(doc_row, "New", new_word_document)
+new_doc_button = FlatButton(doc_row, "New...", new_document_menu)
 new_doc_button.pack(side="left", padx=(S(6), 0))
 
 clear_doc_button = FlatButton(doc_row, "Clear", clear_word_document)
@@ -4414,38 +5796,44 @@ save_pending_button = FlatButton(doc_options_row, "Save to Word now",
                                  lambda: flush_pending(interactive=True))
 save_pending_button.pack(side="right", padx=(0, S(6)))
 
-if not DOCX_AVAILABLE:
+if not OFFICE_AVAILABLE:
     for widget in (select_doc_button, new_doc_button):
         widget.config(state="disabled")
-    word_frame.set_badge("Unavailable - python-docx not installed", warn=True)
+    word_frame.set_badge("Unavailable - see console", warn=True)
 
 
 # ============================================================
 # Screenshot Card
 # ============================================================
 
-shot_card = Card(content, "Screenshot & text", badge="PNG / Word / Text")
+shot_card = Card(content, "Screenshot & text", badge="PNG / Office / Text")
 shot_card.pack(fill="x", pady=(0, S(12)))
 
 shot_tiles = tk.Frame(shot_card.body, bg=CARD)
 shot_tiles.pack(fill="x")
-shot_tiles.columnconfigure((0, 1, 2, 3), weight=1, uniform="tiles")
+# keeps the window as wide as before the tiles moved to two rows
+tk.Frame(shot_card.body, bg=CARD, width=S(860), height=1).pack()
+shot_tiles.columnconfigure((0, 1, 2, 3, 4, 5), weight=1, uniform="tiles")
 
 capture_button = Tile(shot_tiles, icon("screen", ACCENT, 24), "Capture Screen",
                       "Entire desktop\nCtrl+Shift+F", capture_screen)
-capture_button.grid(row=0, column=0, sticky="nsew", padx=(0, S(5)))
+capture_button.grid(row=0, column=0, columnspan=2, sticky="nsew", padx=(0, S(5)))
 
 region_button = Tile(shot_tiles, icon("region", ACCENT, 24), "Capture Region",
                      "Drag to select\nCtrl+Shift+R", select_region)
-region_button.grid(row=0, column=1, sticky="nsew", padx=(S(5), S(5)))
+region_button.grid(row=0, column=2, columnspan=2, sticky="nsew", padx=(S(5), S(5)))
 
 fullpage_button = Tile(shot_tiles, icon("fullpage", ACCENT, 24), "Full Page",
                        "Scrolls long pages\nCtrl+Shift+S", full_page_capture)
-fullpage_button.grid(row=0, column=2, sticky="nsew", padx=(S(5), S(5)))
+fullpage_button.grid(row=0, column=4, columnspan=2, sticky="nsew", padx=(S(5), 0))
 
 ocr_button = Tile(shot_tiles, icon("ocr", ACCENT, 24), "Extract Text",
                   "Copy text (OCR)\nCtrl+Shift+T", extract_text_region)
-ocr_button.grid(row=0, column=3, sticky="nsew", padx=(S(5), 0))
+ocr_button.grid(row=1, column=0, columnspan=3, sticky="nsew", padx=(0, S(5)), pady=(S(10), 0))
+
+compare_button = Tile(shot_tiles, icon("compare", ACCENT, 24), "Compare Images",
+                      "Highlight differences\nCtrl+Shift+C", open_compare_window)
+compare_button.grid(row=1, column=3, columnspan=3, sticky="nsew", padx=(S(5), 0), pady=(S(10), 0))
 
 if not OCR_AVAILABLE:
     ocr_button.sub.configure(text="Needs Windows OCR\n(see console)")
@@ -4709,6 +6097,7 @@ root.bind("<Control-Shift-R>",
           lambda event: select_region() if recorder is None else None)
 root.bind("<Control-Shift-S>",
           lambda event: full_page_capture() if recorder is None else None)
+root.bind("<Control-Shift-C>", lambda event: open_compare_window())
 root.bind("<Control-Shift-T>",
           lambda event: extract_text_region() if recorder is None else None)
 root.bind("<Control-Shift-V>", lambda event: toggle_screen_recording())
@@ -4723,6 +6112,6 @@ center_window()
 
 print("Screen Capture Utility started.")
 print("Choose a save folder in the window (type a path or click Browse...).")
-print("Optionally select a Word document to collect screenshots in.")
+print("Optionally select a Word, Excel or PowerPoint file to collect screenshots in.")
 
 root.mainloop()
