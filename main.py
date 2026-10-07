@@ -1297,12 +1297,11 @@ class OcrWindow:
 # ============================================================
 # Blur Sensitive Information
 # ============================================================
-# After a screenshot is taken (when "Review & blur before saving" is on),
-# the Blur editor opens: drag boxes over anything sensitive and each box
-# is blurred with a Gaussian blur. Saving sends the result on to the Word
-# document or .png file as usual. Existing images can be blurred too.
+# Blurring is a tool in the Review window (shortcut B): drag a box over
+# anything sensitive and that part of the screenshot gets a Gaussian blur.
 
 BLUR_DEFAULT_RADIUS = 12
+BLUR_RADII = [4, 8, 12, 20, 32]       # Review window "Strength" choices (image pixels)
 
 
 def blur_region(image, box, radius):
@@ -1313,304 +1312,17 @@ def blur_region(image, box, radius):
 
 
 def deliver_capture(image, kind, taken_at):
-    """Save a new screenshot - via the Blur editor if review is switched on."""
-    if blur_review_var.get():
-        # open after the main window has been restored, so the editor is on top
-        root.after(50, lambda: BlurEditor(
-            image,
-            on_save=lambda result: annotate_then_save(result, kind, taken_at),
-            title=f"{kind} capture",
-        ))
-    else:
-        annotate_then_save(image, kind, taken_at)
-
-
-def blur_existing_image():
-    """Pick a saved image, blur parts of it and save a copy."""
-    folder = save_folder or (word_doc_path.parent if word_doc_path else Path.home())
-    path = filedialog.askopenfilename(
-        parent=root,
-        title="Choose an image to blur",
-        initialdir=str(folder),
-        filetypes=[("Images", "*.png *.jpg *.jpeg *.bmp *.gif *.tif *.tiff *.webp"),
-                   ("All files", "*.*")])
-    if not path:
-        return
-    path = Path(path)
-    try:
-        with Image.open(path) as img:
-            image = img.convert("RGB")
-    except Exception as e:
-        messagebox.showerror("Could not open image", str(e), parent=root)
-        return
-
-    def save_copy(result):
-        target = filedialog.asksaveasfilename(
-            parent=root,
-            title="Save blurred image",
-            initialdir=str(path.parent),
-            initialfile=f"{path.stem}_blurred.png",
-            defaultextension=".png",
-            filetypes=[("PNG image", "*.png"), ("JPEG image", "*.jpg *.jpeg")])
-        if not target:
-            return False
-        try:
-            result.save(target)
-            status_var.set(f"Saved: {Path(target).name}")
-            return True
-        except Exception as e:
-            messagebox.showerror("Could not save", str(e), parent=root)
-            return False
-
-    BlurEditor(image, on_save=save_copy, title=path.name, save_label="Save copy")
-
-
-class BlurEditor:
-    """Window where the user drags boxes over sensitive areas to blur them."""
-
-    def __init__(self, image, on_save, title="", save_label="Save"):
-        self.original = image.convert("RGB")
-        self.on_save = on_save
-        self.boxes = []                 # blurred areas, in image pixels
-        self.drag_start = None
-        self.drag_rect = None
-        self.photo = None
-
-        self.win = tk.Toplevel(root)
-        self.win.title("Blur sensitive information")
-        self.win.configure(bg=BG)
-        self.win.transient(root)
-        self.win.protocol("WM_DELETE_WINDOW", self.cancel)
-
-        # --- header ---------------------------------------------------
-        head = tk.Frame(self.win, bg=HEADER_BG)
-        head.pack(fill="x")
-        inner = tk.Frame(head, bg=HEADER_BG)
-        inner.pack(fill="x", padx=S(20), pady=S(12))
-        tk.Label(inner, image=icon("blur", "white", 22), bg=HEADER_BG).pack(side="left")
-        titles = tk.Frame(inner, bg=HEADER_BG)
-        titles.pack(side="left", padx=(S(10), 0))
-        tk.Label(titles, text="Blur sensitive information", font=F_TILE,
-                 fg="white", bg=HEADER_BG).pack(anchor="w")
-        tk.Label(titles,
-                 text="Drag over anything you want to hide.  Ctrl+Z undoes the last box.",
-                 font=F_TILE_SUB, fg=HEADER_SUB, bg=HEADER_BG).pack(anchor="w")
-        self.info = tk.Label(inner, text="", font=F_TILE_SUB, fg=HEADER_SUB, bg=HEADER_BG)
-        self.info.pack(side="right")
-        tk.Frame(self.win, bg=ACCENT, height=S(3)).pack(fill="x")
-
-        body = tk.Frame(self.win, bg=BG)
-        body.pack(fill="both", expand=True, padx=S(16), pady=S(12))
-
-        # --- image canvas (scaled to fit the screen) -------------------
-        left, top, width, height = screen_work_area()
-        max_w, max_h = int(width * 0.82), int(height * 0.62)
-        iw, ih = self.original.size
-        width_scale = min(1.0, max_w / iw)
-        # Tall images (full-page captures) are shown at a readable width
-        # with a scrollbar instead of being squeezed to fit the screen
-        self.tall = ih * width_scale > max_h * 1.3
-        self.scale = width_scale if self.tall else min(1.0, max_w / iw, max_h / ih)
-        self.view_w = max(1, int(iw * self.scale))
-        self.view_h = max(1, int(ih * self.scale))
-
-        frame = tk.Frame(body, bg=CARD, highlightthickness=1, highlightbackground=FIELD_BORDER)
-        frame.pack()
-        self.canvas = tk.Canvas(frame, width=self.view_w, height=min(self.view_h, max_h),
-                                bg="#2A2F3A", highlightthickness=0, cursor="crosshair",
-                                scrollregion=(0, 0, self.view_w, self.view_h))
-        if self.tall:
-            scroll = tk.Scrollbar(frame, orient="vertical", command=self.canvas.yview)
-            self.canvas.configure(yscrollcommand=scroll.set)
-            scroll.pack(side="right", fill="y")
-            self.canvas.bind("<MouseWheel>", lambda e: self.canvas.yview_scroll(
-                int(-e.delta / 120) * 3, "units"))
-            self.canvas.bind("<Button-4>", lambda e: self.canvas.yview_scroll(-3, "units"))
-            self.canvas.bind("<Button-5>", lambda e: self.canvas.yview_scroll(3, "units"))
-        self.canvas.pack(side="left")
-        self.image_item = self.canvas.create_image(0, 0, anchor="nw")
-
-        self.canvas.bind("<ButtonPress-1>", self._press)
-        self.canvas.bind("<B1-Motion>", self._drag)
-        self.canvas.bind("<ButtonRelease-1>", self._release)
-
-        # --- controls ------------------------------------------------
-        controls = tk.Frame(body, bg=BG)
-        controls.pack(fill="x", pady=(S(12), 0))
-
-        tk.Label(controls, text="Blur strength", font=F_BODY_BOLD, fg=TEXT,
-                 bg=BG).pack(side="left")
-        self.radius_var = tk.IntVar(value=BLUR_DEFAULT_RADIUS)
-        style = ttk.Style(self.win)
-        style.configure("Blur.Horizontal.TScale", background=BG)
-        self.slider = ttk.Scale(controls, from_=4, to=40, orient="horizontal",
-                                length=S(170), style="Blur.Horizontal.TScale",
-                                value=BLUR_DEFAULT_RADIUS,
-                                command=lambda v: self._slider_moved(v))
-        self.slider.pack(side="left", padx=(S(8), S(6)))
-        # re-blur once when the slider is released (smooth while dragging)
-        self.slider.bind("<ButtonRelease-1>", lambda e: self._strength_changed())
-        self.radius_label = tk.Label(controls, text=str(BLUR_DEFAULT_RADIUS),
-                                     font=F_BODY, fg=MUTED, bg=BG, width=3, anchor="w")
-        self.radius_label.pack(side="left")
-
-        self.undo_button = FlatButton(controls, "Undo", self.undo)
-        self.undo_button.pack(side="left", padx=(S(12), 0))
-        self.clear_button = FlatButton(controls, "Clear all", self.clear)
-        self.clear_button.pack(side="left", padx=(S(6), 0))
-
-        FlatButton(controls, save_label, self.save, style="primary").pack(side="right")
-        FlatButton(controls, "Cancel", self.cancel).pack(side="right", padx=(0, S(6)))
-
-        self.win.bind("<Control-z>", lambda e: self.undo())
-        self.win.bind("<Control-Z>", lambda e: self.undo())
-        self.win.bind("<Return>", lambda e: self.save())
-        self.win.bind("<Escape>", lambda e: self.cancel())
-
-        self.working = self.original.copy()
-        self.redraw()
-
-        self.win.update_idletasks()
-        w = self.win.winfo_reqwidth()
-        h = self.win.winfo_reqheight() + S(39)
-        self.win.geometry(f"+{left + max(0, (width - w) // 2)}+{top + max(0, (height - h) // 2)}")
-        self.win.lift()
-        self.win.focus_force()
-        self.win.grab_set()   # finish (save/cancel) before doing anything else
-
-    # ---- drawing ----------------------------------------------------
-
-    def rebuild(self):
-        """Re-apply every blur box to a fresh copy of the original."""
-        self.working = self.original.copy()
-        radius = self.radius_var.get()
-        for box in self.boxes:
-            blur_region(self.working, box, radius)
-
-    def redraw(self):
-        view = self.working
-        if self.scale < 1.0:
-            view = view.resize((self.view_w, self.view_h),
-                               Image.BILINEAR if self.tall else Image.LANCZOS)
-        self.photo = ImageTk.PhotoImage(view)
-        self.canvas.itemconfigure(self.image_item, image=self.photo)
-
-        # thin outline around each blurred area (not saved in the image)
-        self.canvas.delete("box")
-        for (x0, y0, x1, y1) in self.boxes:
-            self.canvas.create_rectangle(
-                x0 * self.scale, y0 * self.scale, x1 * self.scale, y1 * self.scale,
-                outline=ACCENT, width=1, dash=(4, 3), tags="box")
-
-        n = len(self.boxes)
-        self.info.configure(text=f"{n} area{'s' if n != 1 else ''} blurred")
-        state = "normal" if n else "disabled"
-        self.undo_button.config(state=state)
-        self.clear_button.config(state=state)
-
-    # ---- mouse ------------------------------------------------------
-
-    def _clamp(self, x, y):
-        return (min(max(x, 0), self.view_w), min(max(y, 0), self.view_h))
-
-    def _point(self, event):
-        """Mouse position in image-view coordinates (accounts for scrolling)."""
-        return self._clamp(self.canvas.canvasx(event.x), self.canvas.canvasy(event.y))
-
-    def _press(self, event):
-        self.drag_start = self._point(event)
-        self.drag_rect = self.canvas.create_rectangle(
-            *self.drag_start, *self.drag_start, outline=RED, width=2, dash=(5, 3))
-
-    def _drag(self, event):
-        if self.drag_rect is not None:
-            # scroll while dragging near the top/bottom edge of a tall image
-            if self.tall:
-                if event.y < S(24):
-                    self.canvas.yview_scroll(-1, "units")
-                elif event.y > self.canvas.winfo_height() - S(24):
-                    self.canvas.yview_scroll(1, "units")
-            x, y = self._point(event)
-            self.canvas.coords(self.drag_rect, *self.drag_start, x, y)
-
-    def _release(self, event):
-        if self.drag_rect is None:
-            return
-        self.canvas.delete(self.drag_rect)
-        self.drag_rect = None
-        x0, y0 = self.drag_start
-        x1, y1 = self._point(event)
-
-        # canvas -> image coordinates
-        iw, ih = self.original.size
-        box = (int(min(x0, x1) / self.scale), int(min(y0, y1) / self.scale),
-               int(round(max(x0, x1) / self.scale)), int(round(max(y0, y1) / self.scale)))
-        box = (max(0, box[0]), max(0, box[1]), min(iw, box[2]), min(ih, box[3]))
-        if box[2] - box[0] < 3 or box[3] - box[1] < 3:
-            return
-
-        self.boxes.append(box)
-        blur_region(self.working, box, self.radius_var.get())
-        self.redraw()
-
-    # ---- controls ---------------------------------------------------
-
-    def _slider_moved(self, value):
-        radius = int(round(float(value)))
-        if radius != self.radius_var.get():
-            self.radius_var.set(radius)
-            self.radius_label.configure(text=str(radius))
-            # live preview for normal-size screenshots
-            if self.boxes and self.original.width * self.original.height <= 2_500_000:
-                self.rebuild()
-                self.redraw()
-
-    def _strength_changed(self):
-        self.radius_label.configure(text=str(self.radius_var.get()))
-        if self.boxes:
-            self.rebuild()
-            self.redraw()
-
-    def undo(self):
-        if self.boxes:
-            self.boxes.pop()
-            self.rebuild()
-            self.redraw()
-
-    def clear(self):
-        if self.boxes:
-            self.boxes.clear()
-            self.rebuild()
-            self.redraw()
-
-    def save(self):
-        result = self.working.copy()
-        self.win.grab_release()
-        if self.on_save(result) is False:     # e.g. user cancelled "Save as"
-            self.win.grab_set()
-            return
-        n = len(self.boxes)
-        print(f"Saved with {n} blurred area(s)")
-        self.win.destroy()
-
-    def cancel(self):
-        if self.boxes and not messagebox.askyesno(
-                "Discard screenshot?",
-                "Close without saving? The screenshot will be discarded.",
-                parent=self.win):
-            return
-        self.win.grab_release()
-        self.win.destroy()
-        status_var.set("Screenshot discarded")
+    """Every new screenshot opens in the Review window (annotate, blur,
+    crop...) and is saved only when the user clicks Save."""
+    annotate_then_save(image, kind, taken_at)
 
 
 # ============================================================
 # Review & Annotate window (opens after every capture)
 # ============================================================
 # After each screenshot (Capture Screen, Capture Region, Full Page) the
-# captured image is shown in the Review window - after the Blur window, if
-# "Review & blur before saving" is on. There the user can highlight, draw
-# and add shapes, then:
+# captured image is shown in the Review window. There the user can
+# highlight, draw, add shapes and text, blur sensitive areas and crop, then:
 #   Copy   - put the image on the clipboard (paste into Teams, Outlook ...)
 #   Save   - save it to the folder / Word document
 #   Cancel - discard it
@@ -1690,7 +1402,9 @@ class AnnotateEditor:
 
     Tools (keyboard shortcut):
       Highlighter (H)  Pen (P)  Eraser (X)  Rectangle (R)  Line (L)
-      Text (T)  Crop (C)
+      Text (T)  Blur (B)  Crop (C)
+    Blur: drag a box over sensitive information; it blurs the screenshot
+    itself (annotations stay sharp on top). Strength has five levels.
     Text: click where the note should go and type; Enter finishes,
     Shift+Enter starts a new line, Esc removes the note being typed.
     Hold Shift while drawing for a perfect square, or a line snapped to
@@ -1708,6 +1422,7 @@ class AnnotateEditor:
         ("rect", "Rectangle", "R"),
         ("line", "Line", "L"),
         ("text", "Text", "T"),
+        ("blur", "Blur", "B"),
         ("crop", "Crop", "C"),
     ]
     COLORS = ["#E5484D", "#F97316", "#FACC15", "#22C55E", "#3B82F6",
@@ -1732,6 +1447,7 @@ class AnnotateEditor:
             "rect": {"color": "#E5484D", "size": 1},
             "line": {"color": "#E5484D", "size": 1},
             "text": {"color": "#E5484D", "size": 2},
+            "blur": {"color": None, "size": BLUR_RADII.index(BLUR_DEFAULT_RADIUS)},
             "crop": {"color": None, "size": 0},
         }
         self.text_edit = None            # note being typed: (widget, canvas item, image pos)
@@ -1931,12 +1647,12 @@ class AnnotateEditor:
             self.crop_frame.pack(side="left", padx=S(10), pady=S(5))
             self._update_crop_buttons()
         else:
-            if key != "eraser":
+            if key not in ("eraser", "blur"):
                 self.color_frame.pack(side="left", padx=S(10), pady=S(7))
             self.size_frame.pack(side="left", padx=S(14), pady=S(7))
             if key == "text":
                 self.text_box_toggle.pack(side="left", padx=(S(4), S(10)), pady=S(7))
-        self.size_label.configure(text="Size" if key == "text" else "Thickness")
+        self.size_label.configure(text={"text": "Size", "blur": "Strength"}.get(key, "Thickness"))
         self.canvas.configure(cursor={"eraser": "circle", "text": "xterm"}.get(key, "crosshair"))
         self._show_color_and_size()
 
@@ -1991,6 +1707,7 @@ class AnnotateEditor:
     def _reset_layers(self):
         size = self.original.size
         self.crop_box = (0, 0) + size
+        self.base = self.original.copy()     # the screenshot itself (blur changes this)
         self.hl_layer = Image.new("RGBA", size, (0, 0, 0, 0))
         self.ink_layer = Image.new("RGBA", size, (0, 0, 0, 0))
         self.shape_layer = Image.new("RGBA", size, (0, 0, 0, 0))
@@ -2015,6 +1732,8 @@ class AnnotateEditor:
             draw_line(self.shape_layer, op["points"], op["color"], op["width"])
         elif kind == "crop":
             self.crop_box = op["box"]     # annotations stay; only the view is cut
+        elif kind == "blur":
+            blur_region(self.base, op["box"], op["radius"])
         elif kind == "text":
             draw_text(self.shape_layer, op["pos"], op["text"], op["color"],
                       op["size"], op["box"])
@@ -2022,8 +1741,9 @@ class AnnotateEditor:
             draw_shape(self.shape_layer, kind, op["box"], op["color"], op["width"])
 
     def _compose(self):
-        """Screenshot + highlight (multiply) + ink + shapes -> self.working."""
-        image = self.original.copy()
+        """Screenshot (with any blur) + highlight (multiply) + ink + shapes
+        -> self.working."""
+        image = self.base.copy()
         box = self.hl_layer.getbbox()
         if box:
             region = image.crop(box)
@@ -2235,6 +1955,10 @@ class AnnotateEditor:
         if tool == "line":
             item = self.canvas.create_line(x0, y0, x1, y1, fill=setting["color"],
                                            width=width, capstyle="round")
+        elif tool == "blur":
+            # dashed outline of the area that will be blurred
+            self.preview.append(self.canvas.create_rectangle(x0, y0, x1, y1, outline="#FFFFFF", width=2))
+            item = self.canvas.create_rectangle(x0, y0, x1, y1, outline=ACCENT, width=2, dash=(6, 4))
         else:
             item = self.canvas.create_rectangle(x0, y0, x1, y1, outline=setting["color"], width=width)
         self.preview.append(item)
@@ -2287,8 +2011,11 @@ class AnnotateEditor:
             if box[2] - box[0] < 3 or box[3] - box[1] < 3:
                 return
             setting = self.settings[tool]
-            op = {"type": tool, "box": box, "color": setting["color"],
-                  "width": max(1, round(self._screen_width() / s))}
+            if tool == "blur":
+                op = {"type": "blur", "box": box, "radius": BLUR_RADII[setting["size"]]}
+            else:
+                op = {"type": tool, "box": box, "color": setting["color"],
+                      "width": max(1, round(self._screen_width() / s))}
 
         self.drag_start = None
         self.stroke = []
@@ -3093,9 +2820,8 @@ def start_scrolling_capture(x1, y1, x2, y2):
             return
         print(f"Full-page capture: {message}")
         deliver_capture(image, "Full page", capture.taken_at)
-        if not blur_review_var.get():
-            root.after(300, lambda: status_var.set(
-                f"{status_var.get()}\nFull page: {message}"))
+        root.after(300, lambda: status_var.set(
+            f"{status_var.get()}\nFull page: {message}"))
 
     capture = ScrollingCapture((x1, y1, x2, y2), done, progress)
     scroll_stop_button.config(command=capture.stop, state="normal")
@@ -5838,17 +5564,6 @@ compare_button.grid(row=1, column=3, columnspan=3, sticky="nsew", padx=(S(5), 0)
 if not OCR_AVAILABLE:
     ocr_button.sub.configure(text="Needs Windows OCR\n(see console)")
 
-blur_review_var = tk.BooleanVar(value=False)
-
-blur_row = tk.Frame(shot_card.body, bg=CARD)
-blur_row.pack(fill="x", pady=(S(10), 0))
-
-blur_toggle = Toggle(blur_row, "Review & blur before saving", blur_review_var,
-                     image=icon("blur", MUTED, 16))
-blur_toggle.pack(side="left")
-
-blur_file_button = FlatButton(blur_row, "Blur an image...", blur_existing_image)
-blur_file_button.pack(side="right")
 
 
 # ============================================================
