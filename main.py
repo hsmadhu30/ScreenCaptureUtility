@@ -1146,7 +1146,7 @@ class OcrWindow:
         text_frame = tk.Frame(body, bg=CARD, highlightthickness=S(2) if S(2) > 1 else 1,
                               highlightbackground=FIELD_BORDER)
         text_frame.pack(fill="both", expand=True)
-        self.text = tk.Text(text_frame, wrap="word", font=("Segoe UI", 11),
+        self.text = tk.Text(text_frame, wrap="word", font=font(11),
                             fg=TEXT, bg=CARD, relief="flat", bd=0,
                             padx=S(12), pady=S(10), undo=True,
                             width=72, height=18, insertbackground=TEXT,
@@ -2833,35 +2833,61 @@ def start_scrolling_capture(x1, y1, x2, y2):
 # ============================================================
 # Compare Images
 # ============================================================
-# Load or capture two images (Image 1 and Image 2) and highlight every
-# difference in red: changed text, moved or recoloured graphics, added or
-# removed items.
+# Image 1 is the SOURCE; Image 2 is checked against it. Every difference is
+# highlighted in red in BOTH images: changed text, changed or moved
+# graphics, content that is missing from Image 2 and content that was added.
 #
-#   1. If the images are almost the same shape but a different size (e.g.
-#      captured at another zoom level), Image 1 is resized to match Image 2.
-#   2. Auto-align: separately captured regions are often a few pixels
-#      apart, so the best small shift between them is found first
-#      (coarse search on a small copy, then refined at full resolution).
-#   3. Pixels whose colour differs by more than the tolerance are marked.
-#   4. Nearby changed pixels are grouped into numbered regions, each drawn
-#      with a red box; the changed pixels themselves are tinted red.
+#   1. If the images are the same shape but a different size (e.g. captured
+#      at another zoom level), Image 2 is resized to match Image 1.
+#   2. Auto-align: separately captured regions are often a few pixels apart,
+#      so the best small shift between them is found first.
+#   3. Line by line: both images are cut into horizontal bands (lines of
+#      text, rows of controls) and the bands of Image 2 are matched to those
+#      of Image 1 in order, like a text compare. So when a line is removed or
+#      added, the lines below it are still matched with their counterparts
+#      instead of all being reported as changed.
+#   4. Matched lines are compared pixel by pixel (with a tolerance, so
+#      anti-aliasing and JPEG noise are ignored). Lines found in only one
+#      image are reported as missing from / added in Image 2.
+#   5. The changed pixels are tinted red and grouped into numbered boxes.
+#      Each difference has a box in Image 1 and one in Image 2; when content
+#      is missing, a dashed red line marks the spot where it should be.
+#   Pictures without clear lines (photos, charts) are compared pixel by
+#   pixel; whichever method explains the differences with less red wins.
 # Pure Pillow - no extra packages.
 
 COMPARE_RED = (230, 0, 0)
 COMPARE_HEX = "#E60000"
-COMPARE_NEUTRAL = (229, 231, 235)    # canvas area covered by only one image
 COMPARE_MIN_PIXELS = 3               # smaller specks are ignored (noise)
+COMPARE_SIG = (96, 8)                # size of the small "fingerprint" of a line
+KIND_CHANGED = "Changed"
+KIND_MISSING = "Missing in Image 2"
+KIND_ADDED = "Added in Image 2"
+
+
+@dataclass
+class Difference:
+    kind: str                    # KIND_CHANGED / KIND_MISSING / KIND_ADDED
+    box1: tuple                  # (x0, y0, x1, y1) in Image 1
+    box2: tuple                  # (x0, y0, x1, y1) in Image 2
+    marker1: bool = False        # True: not in Image 1 - box1 is a line where it would be
+    marker2: bool = False        # True: not in Image 2 - box2 is a line where it should be
 
 
 @dataclass
 class CompareResult:
-    before: Image.Image          # Image 1 on the common canvas
-    after: Image.Image           # Image 2 on the common canvas
-    mask: Image.Image            # "L": 255 where the images differ
-    regions: list                # [(x0, y0, x1, y1), ...] in reading order
+    image1: Image.Image          # Image 1 (the source)
+    image2: Image.Image          # Image 2 (resized to Image 1 if needed)
+    mask1: Image.Image           # "L": 255 = differing pixel in Image 1
+    mask2: Image.Image           # "L": 255 = differing pixel in Image 2
+    diffs: list                  # [Difference, ...] in reading order of Image 1
     changed_pixels: int
     compared_pixels: int
     notes: list
+    method: str = "pixels"       # "pixels" or "lines"
+
+    def count(self, kind):
+        return sum(1 for d in self.diffs if d.kind == kind)
 
 
 def _max_channel_diff(a, b):
@@ -3038,115 +3064,444 @@ def find_regions(mask):
     return boxes
 
 
+def _count(mask):
+    return mask.histogram()[255]
+
+
+def _paint(mask, part, xy):
+    """mask = mask OR part, with part placed at xy."""
+    x, y = xy
+    box = (x, y, x + part.width, y + part.height)
+    mask.paste(ImageChops.lighter(mask.crop(box), part), box[:2])
+
+
+def _row_flags(mask):
+    """For each row of an "L" mask: True if any pixel in it is set."""
+    w, h = mask.size
+    m = mask
+    while w > 1:                       # fold the columns in half until one is left
+        half = (w + 1) // 2
+        m = ImageChops.lighter(m.crop((0, 0, half, h)), m.crop((w - half, 0, w, h)))
+        w = half
+    return [v > 0 for v in m.tobytes()]
+
+
+def _content_pixels(gray, tol):
+    """255 on everything that isn't the background (the most common shade)."""
+    hist = gray.histogram()
+    bg = max(range(256), key=lambda v: hist[v])
+    return gray.point(lambda v: 255 if abs(v - bg) > tol else 0)
+
+
+def find_bands(gray, tol=12):
+    """Horizontal bands of content - lines of text, rows of buttons -
+    separated by rows that just repeat the row above (background, or the
+    plain middle of a panel). [(y0, y1), ...]"""
+    W, H = gray.size
+    if H < 3 or W < 1:
+        return [(0, H)]
+    step = ImageChops.difference(gray.crop((0, 1, W, H)), gray.crop((0, 0, W, H - 1)))
+    busy = [False] + _row_flags(step.point(lambda v: 255 if v > tol else 0))
+    bands = []
+    y = 0
+    while y < H:
+        if not busy[y]:
+            y += 1
+            continue
+        s = 0 if y == 1 else y
+        while y < H and busy[y]:
+            y += 1
+        if bands and s - bands[-1][1] <= 2:      # thick stroke inside a line, not a gap
+            bands[-1][1] = y
+        else:
+            bands.append([s, y])
+    return [tuple(b) for b in bands]
+
+
+def _band_matches(ba, bb, sa, sb):
+    """Match the bands of Image 1 (ba) and Image 2 (bb) in order, like a
+    text compare: first the lines that look the same (longest common
+    sequence), then, between those, lines that changed. [(i, j), ...]"""
+    na, nb = len(ba), len(bb)
+    means_a = [ImageStat.Stat(s).mean[0] for s in sa]
+    means_b = [ImageStat.Stat(s).mean[0] for s in sb]
+    cache = {}
+
+    def diff(i, j):
+        k = (i, j)
+        if k not in cache:
+            cache[k] = ImageStat.Stat(ImageChops.difference(sa[i], sb[j])).mean[0]
+        return cache[k]
+
+    def height(bands, i):
+        return bands[i][1] - bands[i][0]
+
+    def same(i, j):
+        return (abs(height(ba, i) - height(bb, j)) <= 1 and abs(means_a[i] - means_b[j]) <= 4
+                and diff(i, j) <= 4)
+
+    # 1) lines that look the same: longest common sequence
+    L = [[0] * (nb + 1) for _ in range(na + 1)]
+    S = [[False] * nb for _ in range(na)]
+    for i in range(na - 1, -1, -1):
+        Li, Ln, Si = L[i], L[i + 1], S[i]
+        for j in range(nb - 1, -1, -1):
+            if same(i, j):
+                Si[j] = True
+                Li[j] = Ln[j + 1] + 1
+            else:
+                Li[j] = Ln[j] if Ln[j] >= Li[j + 1] else Li[j + 1]
+    anchors = []
+    i = j = 0
+    while i < na and j < nb:
+        if S[i][j] and L[i][j] == L[i + 1][j + 1] + 1:
+            anchors.append((i, j))
+            i += 1
+            j += 1
+        elif L[i + 1][j] >= L[i][j + 1]:
+            i += 1
+        else:
+            j += 1
+
+    # 2) between two matched lines: pair up lines of a similar height (changed lines)
+    def pair_gap(ai, bj):
+        n, m = len(ai), len(bj)
+
+        def score(p, q):
+            ha, hb = height(ba, ai[p]), height(bb, bj[q])
+            if abs(ha - hb) > max(3, 0.5 * max(ha, hb)):
+                return 0
+            return 2 - min(diff(ai[p], bj[q]), 100) / 100
+        D = [[0.0] * (m + 1) for _ in range(n + 1)]
+        for p in range(n - 1, -1, -1):
+            for q in range(m - 1, -1, -1):
+                s = score(p, q)
+                D[p][q] = max(D[p + 1][q], D[p][q + 1], (D[p + 1][q + 1] + s) if s else 0)
+        out, p, q = [], 0, 0
+        while p < n and q < m:
+            s = score(p, q)
+            if s and abs(D[p][q] - (D[p + 1][q + 1] + s)) < 1e-9:
+                out.append((ai[p], bj[q]))
+                p += 1
+                q += 1
+            elif D[p + 1][q] >= D[p][q + 1]:
+                p += 1
+            else:
+                q += 1
+        return out
+
+    pairs = []
+    for (i0, j0), (i1, j1) in zip([(-1, -1)] + anchors, anchors + [(na, nb)]):
+        ai, bj = list(range(i0 + 1, i1)), list(range(j0 + 1, j1))
+        if ai and bj:
+            pairs += pair_gap(ai, bj)
+        if i1 < na:
+            pairs.append((i1, j1))
+    return sorted(pairs)
+
+
+def _mapper(spans, h_from, h_to):
+    """Map a y in one image to the matching y in the other, using matched
+    row spans [(from_y0, from_y1, to_y0, to_y1), ...]."""
+    def f(y):
+        if not spans:
+            return max(0, min(h_to, round(y * h_to / max(1, h_from))))
+        prev = None
+        for s0, s1, d0, d1 in spans:
+            if y < s0:
+                if prev is None:
+                    return max(0, min(d0, y + d0 - s0))
+                return max(prev[3], min(d0, y + prev[3] - prev[1]))
+            if y < s1:
+                return min(d1, d0 + (y - s0))
+            prev = (s0, s1, d0, d1)
+        return max(prev[3], min(h_to, y + prev[3] - prev[1]))
+    return f
+
+
+class _Match:
+    """How Image 2 lines up with Image 1, and which pixels differ."""
+
+    def __init__(self, a, b):
+        self.mask1 = Image.new("L", a.size, 0)     # differences, in Image 1
+        self.mask2 = Image.new("L", b.size, 0)     # differences, in Image 2
+        self.missing1 = Image.new("L", a.size, 0)  # content not found in Image 2
+        self.added2 = Image.new("L", b.size, 0)    # content not found in Image 1
+        self.dx = 0
+        self.map12 = self.map21 = None
+        self.moved = False
+        self.compared = a.width * a.height
+
+    @property
+    def area(self):
+        return _count(self.mask1) + _count(self.mask2)
+
+
+def _compare_pixels(a, b, tolerance, dx, dy, resized):
+    """Straight pixel compare: (x, y) of Image 1 <-> (x + dx, y + dy) of Image 2."""
+    m = _Match(a, b)
+    m.dx = dx
+    Wa, Ha = a.size
+    Wb, Hb = b.size
+    ov = (max(0, -dx), max(0, -dy), min(Wa, Wb - dx), min(Ha, Hb - dy))
+    if ov[2] > ov[0] and ov[3] > ov[1]:
+        part = _changed_mask(a.crop(ov), b.crop((ov[0] + dx, ov[1] + dy, ov[2] + dx, ov[3] + dy)),
+                             tolerance)
+        if resized and part.width > 8 and part.height > 8:
+            # resizing blurs the outermost pixels - don't report them
+            inner = Image.new("L", part.size, 0)
+            inner.paste(255, (2, 2, part.width - 2, part.height - 2))
+            part = ImageChops.darker(part, inner)
+        _paint(m.mask1, part, ov[:2])
+        _paint(m.mask2, part, (ov[0] + dx, ov[1] + dy))
+    if a.size != b.size:
+        # content outside the shared area exists in only one of the images
+        tol = max(10, tolerance // 2)
+        out1 = Image.new("L", a.size, 255)
+        out2 = Image.new("L", b.size, 255)
+        if ov[2] > ov[0] and ov[3] > ov[1]:
+            out1.paste(0, ov)
+            out2.paste(0, (ov[0] + dx, ov[1] + dy, ov[2] + dx, ov[3] + dy))
+        m.missing1 = ImageChops.darker(out1, _content_pixels(a.convert("L"), tol))
+        m.added2 = ImageChops.darker(out2, _content_pixels(b.convert("L"), tol))
+        m.mask1 = ImageChops.lighter(m.mask1, m.missing1)
+        m.mask2 = ImageChops.lighter(m.mask2, m.added2)
+    m.map12 = lambda y: max(0, min(Hb, y + dy))
+    m.map21 = lambda y: max(0, min(Ha, y - dy))
+    return m
+
+
+def _compare_lines(a, b, tolerance, dx):
+    """Line-by-line compare (see the notes at the top of this section).
+    None if the images don't consist of lines."""
+    Wa, Ha = a.size
+    Wb, Hb = b.size
+    xa0, xa1 = max(0, -dx), min(Wa, Wb - dx)
+    if xa1 - xa0 < 0.5 * min(Wa, Wb):
+        return None
+    ga, gb = a.convert("L"), b.convert("L")
+    ca, cb = ga.crop((xa0, 0, xa1, Ha)), gb.crop((xa0 + dx, 0, xa1 + dx, Hb))
+    tol = max(10, tolerance // 2)
+    ba, bb = find_bands(ca, tol), find_bands(cb, tol)
+    if len(ba) < 2 or len(bb) < 2 or len(ba) * len(bb) > 600 * 600:
+        return None
+    sa = [ca.crop((0, s, ca.width, e)).resize(COMPARE_SIG, Image.BOX) for s, e in ba]
+    sb = [cb.crop((0, s, cb.width, e)).resize(COMPARE_SIG, Image.BOX) for s, e in bb]
+    pairs = _band_matches(ba, bb, sa, sb)
+    if not pairs:
+        return None
+
+    m = _Match(a, b)
+    m.dx = dx
+    spans = []
+
+    def compare_rows(ya, yb, h):
+        part = _changed_mask(a.crop((xa0, ya, xa1, ya + h)), b.crop((xa0 + dx, yb, xa1 + dx, yb + h)),
+                             tolerance)
+        _paint(m.mask1, part, (xa0, ya))
+        _paint(m.mask2, part, (xa0 + dx, yb))
+
+    for i, j in pairs:
+        (a0, a1), (b0, b1) = ba[i], bb[j]
+        h = max(a1 - a0, b1 - b0)
+        best = None
+        for d in (0, -1, 1, -2, 2):                  # line up the rows exactly
+            y2 = b0 + d
+            hh = min(h, Ha - a0, Hb - y2)
+            if y2 < 0 or hh <= 0:
+                continue
+            s = ImageStat.Stat(ImageChops.difference(ca.crop((0, a0, ca.width, a0 + hh)),
+                                                     cb.crop((0, y2, cb.width, y2 + hh)))).mean[0]
+            if best is None or s < best[0] - 0.01:
+                best = (s, y2, hh)
+        if best is None:
+            continue
+        _, y2, hh = best
+        compare_rows(a0, y2, hh)
+        spans.append((a0, a0 + hh, y2, y2 + hh))
+        if y2 != a0:
+            m.moved = True
+
+    # the plain rows between two matched lines (same height in both images)
+    edges = [(0, 0, 0, 0)] + spans + [(Ha, Ha, Hb, Hb)]
+    for p, q in zip(edges, edges[1:]):
+        ha, hb = q[0] - p[1], q[2] - p[3]
+        if ha > 0 and ha == hb:
+            compare_rows(p[1], p[3], ha)
+
+    # lines found in only one of the images
+    paired_a = {i for i, _ in pairs}
+    paired_b = {j for _, j in pairs}
+    for i, (s, e) in enumerate(ba):
+        if i not in paired_a:
+            part = _content_pixels(ca.crop((0, s, ca.width, e)), tol)
+            _paint(m.missing1, part, (xa0, s))
+    for j, (s, e) in enumerate(bb):
+        if j not in paired_b:
+            part = _content_pixels(cb.crop((0, s, cb.width, e)), tol)
+            _paint(m.added2, part, (xa0 + dx, s))
+    m.mask1 = ImageChops.lighter(m.mask1, m.missing1)
+    m.mask2 = ImageChops.lighter(m.mask2, m.added2)
+
+    m.map12 = _mapper(spans, Ha, Hb)
+    m.map21 = _mapper([(s2, e2, s1, e1) for s1, e1, s2, e2 in spans], Hb, Ha)
+    if any(i not in paired_a for i in range(len(ba))) or any(j not in paired_b for j in range(len(bb))):
+        m.moved = True
+    return m
+
+
+def _plain(img, box):
+    if box[2] - box[0] < 1 or box[3] - box[1] < 1:
+        return True
+    return ImageStat.Stat(img.crop(box).convert("L")).stddev[0] < 4
+
+
+def _differences(a, b, m):
+    """Turn the masks into numbered differences, each with a box in both images."""
+    Wa, Ha = a.size
+    Wb, Hb = b.size
+    dx = m.dx
+    diffs = []
+    claimed = Image.new("L", b.size, 0)          # parts of Image 2 already explained
+    for box in find_regions(m.mask1):
+        x0, y0, x1, y1 = box
+        total = _count(m.mask1.crop(box))
+        missing = _count(m.missing1.crop(box))
+        bx0, bx1 = max(0, min(Wb, x0 + dx)), max(0, min(Wb, x1 + dx))
+        by0 = m.map12(y0)
+        by1 = m.map12(y1 - 1) + 1
+        if (total and missing >= total * 0.5) or bx1 <= bx0 or by0 >= Hb:
+            y = max(0, min(by0, Hb) - 3)              # in the gap just above the next line
+            diffs.append(Difference(KIND_MISSING, box, (bx0, y, max(bx1, bx0 + 1), y), marker2=True))
+            continue
+        by1 = max(by0 + 1, min(Hb, by1))
+        # include the differing pixels of Image 2 right around it (e.g. a longer word)
+        pad = 4
+        near = (max(0, bx0 - pad), max(0, by0 - pad), min(Wb, bx1 + pad), min(Hb, by1 + pad))
+        tight = m.mask2.crop(near).getbbox()
+        if tight:
+            bx0, by0 = min(bx0, near[0] + tight[0]), min(by0, near[1] + tight[1])
+            bx1, by1 = max(bx1, near[0] + tight[2]), max(by1, near[1] + tight[3])
+        box2 = (bx0, by0, bx1, by1)
+        claimed.paste(255, (max(0, bx0 - pad), max(0, by0 - pad), min(Wb, bx1 + pad), min(Hb, by1 + pad)))
+        p1, p2 = _plain(a, box), _plain(b, box2)
+        kind = KIND_MISSING if (p2 and not p1) else KIND_ADDED if (p1 and not p2) else KIND_CHANGED
+        diffs.append(Difference(kind, box, box2))
+    rest = ImageChops.darker(ImageChops.lighter(m.added2, m.mask2), ImageChops.invert(claimed))
+    for box in find_regions(rest):
+        x0, y0, x1, y1 = box
+        ax0, ax1 = max(0, min(Wa, x0 - dx)), max(0, min(Wa, x1 - dx))
+        y = max(0, min(m.map21(y0), Ha) - 3)
+        diffs.append(Difference(KIND_ADDED, (ax0, y, max(ax1, ax0 + 1), y), box, marker1=True))
+    diffs.sort(key=lambda d: (d.box1[1], d.box1[0], d.box2[1]))
+    return diffs
+
+
 def compare_images(a, b, tolerance=30, align=True):
-    """Compare Image 1 (a) with Image 2 (b). tolerance: 0-255 colour change
-    that is still treated as 'the same'."""
+    """Compare Image 2 (b) against Image 1 (a, the source). tolerance: 0-255
+    colour change that is still treated as 'the same'."""
     a, b = a.convert("RGB"), b.convert("RGB")
     notes = []
-
+    resized = False
     if a.size != b.size:
         ra, rb = a.width / a.height, b.width / b.height
-        if abs(ra - rb) / rb < 0.01 and 0.4 < a.width / b.width < 2.5:
-            a = a.resize(b.size, Image.LANCZOS)
-            notes.append("Image 1 was resized to match Image 2")
-
-    resized = bool(notes)
+        if abs(ra - rb) / ra < 0.01 and 0.4 < b.width / a.width < 2.5:
+            b = b.resize(a.size, Image.LANCZOS)
+            resized = True
+            notes.append("Image 2 was resized to match Image 1")
     dx, dy = find_alignment(a, b) if align else (0, 0)
-    if (dx, dy) != (0, 0):
+
+    best = _compare_pixels(a, b, tolerance, dx, dy, resized)
+    method = "pixels"
+    if not (a.size == b.size and best.area < 0.004 * a.width * a.height):
+        lines = _compare_lines(a, b, tolerance, dx)
+        if lines is not None and lines.area < best.area * 0.9:
+            best, method = lines, "lines"
+    if method == "pixels" and (dx, dy) != (0, 0):
         notes.append(f"aligned by {dx:+d}, {dy:+d} px")
-
-    # common canvas holding both images
-    left, top = min(0, dx), min(0, dy)
-    W = max(b.width, dx + a.width) - left
-    H = max(b.height, dy + a.height) - top
-    ax, ay, bx, by = dx - left, dy - top, -left, -top
-    before = Image.new("RGB", (W, H), COMPARE_NEUTRAL)
-    before.paste(a, (ax, ay))
-    after = Image.new("RGB", (W, H), COMPARE_NEUTRAL)
-    after.paste(b, (bx, by))
-
-    mask = Image.new("L", (W, H), 0)
-    ov = (max(ax, bx), max(ay, by), min(ax + a.width, bx + b.width), min(ay + a.height, by + b.height))
-    compared = 0
-    if ov[2] > ov[0] and ov[3] > ov[1]:
-        changed = _changed_mask(before.crop(ov), after.crop(ov), tolerance)
-        if resized and changed.width > 8 and changed.height > 8:
-            # resizing blurs the outermost pixels - don't report them
-            inner = Image.new("L", changed.size, 0)
-            inner.paste(255, (2, 2, changed.width - 2, changed.height - 2))
-            changed = ImageChops.darker(changed, inner)
-        mask.paste(changed, ov[:2])
-        compared = (ov[2] - ov[0]) * (ov[3] - ov[1])
-
+    if method == "lines" and best.moved:
+        notes.append("lines matched up (content moved up or down)")
     if a.size != b.size:
-        # content that exists in only one of the images is a difference too
-        pa = Image.new("L", (W, H), 0)
-        pa.paste(255, (ax, ay, ax + a.width, ay + a.height))
-        pb = Image.new("L", (W, H), 0)
-        pb.paste(255, (bx, by, bx + b.width, by + b.height))
-        only_one = ImageChops.difference(pa, pb)
-        mask = ImageChops.lighter(mask, only_one)
-        compared = W * H
         notes.append(f"sizes differ ({a.width}×{a.height} vs {b.width}×{b.height})")
-    else:
-        # with the same size, the thin strips left by aligning are not changes
-        keep = Image.new("L", (W, H), 0)
-        keep.paste(255, ov)
-        mask = ImageChops.darker(mask, keep)
-        before, after, mask = before.crop((bx, by, bx + b.width, by + b.height)), \
-            after.crop((bx, by, bx + b.width, by + b.height)), mask.crop((bx, by, bx + b.width, by + b.height))
 
-    regions = find_regions(mask)
-    return CompareResult(before=before, after=after, mask=mask, regions=regions,
-                         changed_pixels=mask.histogram()[255], compared_pixels=max(1, compared),
-                         notes=notes)
+    diffs = _differences(a, b, best)
+    return CompareResult(image1=a, image2=b, mask1=best.mask1, mask2=best.mask2, diffs=diffs,
+                         changed_pixels=_count(best.mask1), compared_pixels=max(1, best.compared),
+                         notes=notes, method=method)
 
 
-def emphasise_changes(image, result, dim=True):
-    """Spotlight the differences: unchanged areas are faded out, changed
-    areas keep their true, full colour. (Boxes and numbers are drawn
-    separately, at screen size.)"""
+def highlight_differences(image, mask, boxes=()):
+    """The image with its differing pixels tinted red (like a highlighter).
+    Inside each box only this image's own content is tinted - not the
+    places where the other image has something."""
     out = image.copy()
-    W, H = out.size
-    if dim and result.regions:
-        faded = Image.blend(out, Image.new("RGB", out.size, (255, 255, 255)), 0.62)
-        keep = Image.new("L", out.size, 0)
-        d = ImageDraw.Draw(keep)
-        pad = max(6, round(max(W, H) / 300))
-        for x0, y0, x1, y1 in result.regions:
-            d.rectangle([x0 - pad, y0 - pad, x1 + pad, y1 + pad], fill=255)
-        out = Image.composite(out, faded, keep)
+    keep = Image.new("L", out.size, 0)
+    gray = out.convert("L")
+    for x0, y0, x1, y1 in boxes:
+        box = (max(0, x0 - 2), max(0, y0 - 2), min(out.width, x1 + 2), min(out.height, y1 + 2))
+        if box[2] <= box[0] or box[3] <= box[1]:
+            continue
+        keep.paste(_content_pixels(gray.crop(box), 24), box[:2])
+    tint = ImageChops.darker(mask, keep).filter(ImageFilter.MaxFilter(3)).point(lambda v: 120 if v else 0)
+    out.paste(COMPARE_RED, (0, 0, out.width, out.height), tint)
     return out
 
 
-def side_by_side(before, after):
+def highlighted_pair(result):
+    """(Image 1, Image 2) with their differences tinted red."""
+    return (highlight_differences(result.image1, result.mask1,
+                                  [d.box1 for d in result.diffs if not d.marker1]),
+            highlight_differences(result.image2, result.mask2,
+                                  [d.box2 for d in result.diffs if not d.marker2]))
+
+
+def side_by_side(image1, image2):
     """Image 1 | Image 2 with a label above each. Returns the image and the
     offset of each half."""
     gap, bar = 24, 34
-    W, H = before.width + gap + after.width, max(before.height, after.height) + bar
+    W, H = image1.width + gap + image2.width, max(image1.height, image2.height) + bar
     out = Image.new("RGB", (W, H), (255, 255, 255))
-    out.paste(before, (0, bar))
-    out.paste(after, (before.width + gap, bar))
+    out.paste(image1, (0, bar))
+    out.paste(image2, (image1.width + gap, bar))
     d = ImageDraw.Draw(out)
+    d.rectangle([image1.width, 0, image1.width + gap - 1, H], fill=(201, 206, 216))
     font = text_font(16)
-    d.text((4, 8), "IMAGE 1", fill=(27, 31, 42), font=font)
-    d.text((before.width + gap + 4, 8), "IMAGE 2", fill=(27, 31, 42), font=font)
-    return out, [(0, bar), (before.width + gap, bar)]
+    d.text((4, 8), "IMAGE 1  (SOURCE)", fill=(27, 31, 42), font=font)
+    d.text((image1.width + gap + 4, 8), "IMAGE 2", fill=(27, 31, 42), font=font)
+    return out, [(0, bar), (image1.width + gap, bar)]
 
 
-def draw_difference_boxes(image, regions, offsets, selected=None):
-    """Numbered red boxes drawn into the image itself (for Copy / Save)."""
+def _dashed_line(d, x0, x1, y, color, width, dash=10):
+    x = x0
+    while x < x1:
+        d.line([x, y, min(x1, x + dash), y], fill=color, width=width)
+        x += dash * 2
+
+
+def draw_difference_boxes(image, diffs, offsets, selected=None):
+    """Numbered red boxes drawn into the image itself (for Copy / Save).
+    offsets: [where Image 1 is, where Image 2 is] - None if not shown."""
     out = image.copy()
     W, H = out.size
     d = ImageDraw.Draw(out)
     lw = max(3, round(max(W, H) / 450))
     pad = lw + 4
     font = text_font(max(14, lw * 5))
-    for n, (x0, y0, x1, y1) in enumerate(regions, 1):
-        for ox, oy in offsets:
-            bx0, by0, bx1, by1 = x0 + ox - pad, y0 + oy - pad, x1 + ox + pad, y1 + oy + pad
+    for n, diff in enumerate(diffs, 1):
+        for k, off in enumerate(offsets):
+            if off is None:
+                continue
+            x0, y0, x1, y1 = diff.box1 if k == 0 else diff.box2
+            marker = diff.marker1 if k == 0 else diff.marker2
+            ox, oy = off
             width = lw * 2 if n == selected else lw
-            d.rectangle([bx0, by0, bx1, by1], outline=COMPARE_RED, width=width)
+            if marker:
+                x1 = max(x1, x0 + 40)
+                bx0, by0, bx1, by1 = x0 + ox, y0 + oy - pad, x1 + ox, y0 + oy + pad
+                _dashed_line(d, bx0, bx1, y0 + oy, COMPARE_RED, width)
+            else:
+                bx0, by0, bx1, by1 = x0 + ox - pad, y0 + oy - pad, x1 + ox + pad, y1 + oy + pad
+                d.rectangle([bx0, by0, bx1, by1], outline=COMPARE_RED, width=width)
             label = str(n)
             tb = d.textbbox((0, 0), label, font=font)
             tw, th = tb[2] - tb[0], tb[3] - tb[1]
@@ -3156,41 +3511,59 @@ def draw_difference_boxes(image, regions, offsets, selected=None):
     return out
 
 
-def classify_difference(result, box):
-    """'Changed', 'Only in Image 1' or 'Only in Image 2'."""
-    def plain(img):
-        return ImageStat.Stat(img.crop(box).convert("L")).stddev[0] < 4
-    p1, p2 = plain(result.before), plain(result.after)
-    if p1 and not p2:
-        return "Only in Image 2"
-    if p2 and not p1:
-        return "Only in Image 1"
-    return "Changed"
+def zoom_rects(result, diff, ratio=None):
+    """Close-up areas around one difference: (rect in Image 1, rect in Image 2),
+    the same size so the two can be shown next to each other."""
+    boxes = [diff.box1, diff.box2]
+    sizes = [(max(1, b[2] - b[0]), max(1, b[3] - b[1])) for b in boxes]
+    w = max(s[0] for s in sizes)
+    h = max(s[1] for s in sizes)
+    ctx = max(30, int(max(w, h) * 0.35))
+    rw, rh = w + 2 * ctx, h + 2 * ctx
+    if ratio:                                   # widen / heighten to the display's shape
+        if rw / rh < ratio:
+            rw = int(rh * ratio)
+        else:
+            rh = int(rw / ratio)
+    rects = []
+    for box, img in zip(boxes, (result.image1, result.image2)):
+        W, H = img.size
+        cw, ch = min(rw, W), min(rh, H)
+        cx, cy = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
+        x0 = int(max(0, min(W - cw, cx - cw / 2)))
+        y0 = int(max(0, min(H - ch, cy - ch / 2)))
+        rects.append((x0, y0, x0 + cw, y0 + ch))
+    return rects
 
 
-def difference_thumbnail(result, box, size):
+def difference_thumbnail(result, diff, size, images=None):
     """Zoomed close-up of one difference: Image 1 | arrow | Image 2."""
     max_w, max_h = size
-    W, H = result.after.size
-    x0, y0, x1, y1 = box
-    ctx = max(14, int(max(x1 - x0, y1 - y0) * 0.35))
-    cx0, cy0 = max(0, x0 - ctx), max(0, y0 - ctx)
-    cx1, cy1 = min(W, x1 + ctx), min(H, y1 + ctx)
-    cw, ch = cx1 - cx0, cy1 - cy0
-    scale = min(4.0, max_w / cw, max_h / ch)
-    tw, th = max(1, int(cw * scale)), max(1, int(ch * scale))
-    method = Image.NEAREST if scale >= 2 else (Image.BICUBIC if scale >= 1 else Image.LANCZOS)
+    imgs = images or (result.image1, result.image2)
+    rects = zoom_rects(result, diff, ratio=max_w / max_h)
     arrow_w = 26
     out = Image.new("RGB", (max_w * 2 + arrow_w, max_h), (255, 255, 255))
-    for k, img in enumerate((result.before, result.after)):
-        crop = img.crop((cx0, cy0, cx1, cy1)).resize((tw, th), method)
+    rw = max(r[2] - r[0] for r in rects)
+    rh = max(r[3] - r[1] for r in rects)
+    scale = min(4.0, max_w / rw, max_h / rh)
+    method = Image.NEAREST if scale >= 2 else (Image.BICUBIC if scale >= 1 else Image.LANCZOS)
+    for k, (img, r) in enumerate(zip(imgs, rects)):
+        crop = img.crop(r)
+        tw, th = max(1, int(crop.width * scale)), max(1, int(crop.height * scale))
+        crop = crop.resize((tw, th), method)
         d = ImageDraw.Draw(crop)
-        d.rectangle([(x0 - cx0) * scale - 2, (y0 - cy0) * scale - 2,
-                     (x1 - cx0) * scale + 1, (y1 - cy0) * scale + 1], outline=COMPARE_RED, width=2)
+        box = diff.box1 if k == 0 else diff.box2
+        marker = diff.marker1 if k == 0 else diff.marker2
+        bx0, by0 = (box[0] - r[0]) * scale, (box[1] - r[1]) * scale
+        bx1, by1 = (box[2] - r[0]) * scale, (box[3] - r[1]) * scale
+        if marker:
+            _dashed_line(d, bx0, max(bx1, bx0 + 20), by0, COMPARE_RED, 2, dash=5)
+        else:
+            d.rectangle([bx0 - 2, by0 - 2, bx1 + 1, by1 + 1], outline=COMPARE_RED, width=2)
         px = k * (max_w + arrow_w) + (max_w - tw) // 2
-        out.paste(crop, (px, (max_h - th) // 2))
-        ImageDraw.Draw(out).rectangle([px - 1, (max_h - th) // 2 - 1, px + tw, (max_h - th) // 2 + th],
-                                      outline=(201, 206, 216))
+        py = (max_h - th) // 2
+        out.paste(crop, (px, py))
+        ImageDraw.Draw(out).rectangle([px - 1, py - 1, px + tw, py + th], outline=(201, 206, 216))
     d = ImageDraw.Draw(out)
     ax, ay = max_w + 5, max_h // 2
     d.line([ax, ay, ax + 14, ay], fill=(75, 85, 99), width=3)
@@ -3202,8 +3575,8 @@ class CompareWindow:
     """Load or capture two images, compare them, and show the differences."""
 
     current = None
-    SLOT_TITLES = ("IMAGE 1", "IMAGE 2")
-    VIEWS = (("before", "Image 1"), ("after", "Image 2"), ("side", "Side by side"), ("blink", "Blink"))
+    SLOT_TITLES = ("IMAGE 1  ·  SOURCE", "IMAGE 2  ·  CHECKED AGAINST IMAGE 1")
+    VIEWS = (("side", "Side by side"), ("image1", "Image 1"), ("image2", "Image 2"))
     MAX_LISTED = 150
 
     def __init__(self):
@@ -3214,18 +3587,16 @@ class CompareWindow:
         self.images = [None, None]
         self.names = ["", ""]
         self.result = None
-        self.bases = {}           # view -> (image, [offset per copy of each region])
-        self.kinds = []
+        self.bases = {}           # view -> (image, [offset of Image 1, offset of Image 2])
+        self.highlighted = None   # (Image 1, Image 2) with the differences tinted red
         self.selected = None      # number of the selected difference (1-based)
-        self.zoom = None          # (x0, y0, x1, y1) in view-image coordinates
+        self.zoom = None          # number of the difference zoomed in on
         self.photo = None
         self.thumbs = [None, None]
         self.item_photos = []
         self.items = []
         self.busy = False
         self._resize_job = None
-        self._blink_job = None
-        self.blink_state = 0
         self.transform = None     # (scale, ox, oy, vx0, vy0) of the current drawing
 
         self.win = tk.Toplevel(root)
@@ -3242,8 +3613,8 @@ class CompareWindow:
         titles = tk.Frame(inner, bg=HEADER_BG)
         titles.pack(side="left", padx=(S(10), 0))
         tk.Label(titles, text="Compare images", font=F_TILE, fg="white", bg=HEADER_BG).pack(anchor="w")
-        tk.Label(titles, text="Open or capture two images, then click Compare. "
-                              "Differences are boxed in red; click one to zoom in.",
+        tk.Label(titles, text="Image 1 is the source; Image 2 is checked against it. Differences are "
+                              "marked in red in both images - click one to zoom in.",
                  font=F_TILE_SUB, fg=HEADER_SUB, bg=HEADER_BG).pack(anchor="w")
         tk.Frame(self.win, bg=ACCENT, height=S(3)).pack(fill="x")
 
@@ -3271,9 +3642,6 @@ class CompareWindow:
         self._tol_text()
         self.align_var = tk.BooleanVar(value=True)
         Toggle(row, "Auto-align", self.align_var).pack(side="left", padx=(S(6), 0))
-        self.dim_var = tk.BooleanVar(value=True)
-        Toggle(row, "Fade unchanged areas", self.dim_var).pack(side="left", padx=(S(16), 0))
-        self.dim_var.trace_add("write", lambda *a: self._rebuild_bases())
         self.compare_button = FlatButton(row, "Compare", self.compare, style="primary")
         self.compare_button.pack(side="right")
         self.swap_button = FlatButton(row, "Swap images", self.swap)
@@ -3285,7 +3653,9 @@ class CompareWindow:
         self.summary = tk.Label(res_head, text="", font=F_BODY_BOLD, fg=TEXT, bg=BG, anchor="w",
                                 justify="left")
         self.summary.pack(side="left", fill="x", expand=True)
-        self.view_var = tk.StringVar(value="after")
+        self.legend = tk.Label(res_head, text="", font=F_TILE_SUB, fg=MUTED, bg=BG)
+        self.legend.pack(side="left", padx=(0, S(10)))
+        self.view_var = tk.StringVar(value="side")
         self.view_buttons = []
         for value, label in reversed(self.VIEWS):
             b = tk.Radiobutton(res_head, text=label, value=value, variable=self.view_var,
@@ -3358,6 +3728,8 @@ class CompareWindow:
 
         self.win.bind("<Return>", lambda e: self.compare())
         self.win.bind("<Escape>", lambda e: self.show_all() if self.zoom else self.close())
+        self.win.bind("<Left>", lambda e: self.step(-1))
+        self.win.bind("<Right>", lambda e: self.step(1))
         self.win.bind("<Control-c>", lambda e: self.copy_result())
         self.win.bind("<Control-C>", lambda e: self.copy_result())
         self.win.bind("<Down>", lambda e: self.step(1))
@@ -3422,7 +3794,7 @@ class CompareWindow:
         self.compare_button.config(state="normal" if both and not self.busy else "disabled")
         self.swap_button.config(state="normal" if any(self.images) and not self.busy else "disabled")
         has = self.result is not None
-        n = len(self.result.regions) if has else 0
+        n = len(self.result.diffs) if has else 0
         self.copy_button.config(state="normal" if has else "disabled")
         self.save_button.config(state="normal" if has else "disabled")
         for b in self.view_buttons:
@@ -3533,16 +3905,16 @@ class CompareWindow:
         self._update_state()
         self.show_result()
         a, b = self.images
-        tol, align, dim = int(round(self.tol_var.get())), self.align_var.get(), self.dim_var.get()
+        tol, align = int(round(self.tol_var.get())), self.align_var.get()
         box = {}
 
         def work():
             try:
                 res = compare_images(a, b, tolerance=tol, align=align)
-                box["bases"] = self._make_bases(res, dim)
-                box["kinds"] = [classify_difference(res, r) for r in res.regions[:self.MAX_LISTED]]
-                box["thumbs"] = [difference_thumbnail(res, r, (S(132), S(92)))
-                                 for r in res.regions[:self.MAX_LISTED]]
+                box["highlighted"] = highlighted_pair(res)
+                box["bases"] = self._make_bases(box["highlighted"])
+                box["thumbs"] = [difference_thumbnail(res, d, (S(132), S(92)), box["highlighted"])
+                                 for d in res.diffs[:self.MAX_LISTED]]
                 box["result"] = res
             except Exception as e:
                 box["error"] = e
@@ -3560,7 +3932,8 @@ class CompareWindow:
                 print(f"Compare failed: {box['error']}")
                 self.summary.configure(text=f"Could not compare the images: {box['error']}", fg=RED)
             else:
-                self.result, self.bases, self.kinds = box["result"], box["bases"], box["kinds"]
+                self.result, self.bases = box["result"], box["bases"]
+                self.highlighted = box["highlighted"]
                 self._summarise()
                 self._fill_list(box["thumbs"])
             self._update_state()
@@ -3568,40 +3941,40 @@ class CompareWindow:
         poll()
 
     @staticmethod
-    def _make_bases(res, dim):
-        b1 = emphasise_changes(res.before, res, dim)
-        b2 = emphasise_changes(res.after, res, dim)
-        side, offsets = side_by_side(b1, b2)
-        return {"before": (b1, [(0, 0)]), "after": (b2, [(0, 0)]), "side": (side, offsets)}
-
-    def _rebuild_bases(self):
-        if self.result is not None:
-            self.bases = self._make_bases(self.result, self.dim_var.get())
-            self.show_result()
+    def _make_bases(highlighted):
+        h1, h2 = highlighted
+        side, offsets = side_by_side(h1, h2)
+        return {"image1": (h1, [(0, 0), None]), "image2": (h2, [None, (0, 0)]), "side": (side, offsets)}
 
     def _summarise(self):
         r = self.result
-        n = len(r.regions)
+        n = len(r.diffs)
         extra = ("   ·   " + "; ".join(r.notes)) if r.notes else ""
         if n == 0:
-            self.summary.configure(text="No differences found - the images match." + extra, fg=GREEN)
+            self.summary.configure(text="No differences - Image 2 matches Image 1." + extra, fg=GREEN)
+            self.legend.configure(text="")
             status_var.set("Compare images: no differences found")
-        else:
-            pct = 100 * r.changed_pixels / r.compared_pixels
-            pct_text = f"{pct:.2f}" if pct < 10 else f"{pct:.0f}"
-            self.summary.configure(
-                text=f"{n} difference{'s' if n != 1 else ''} found   ·   "
-                     f"{pct_text}% of the image changed{extra}", fg=COMPARE_HEX)
-            status_var.set(f"Compare images: {n} difference{'s' if n != 1 else ''} found")
+            return
+        parts = []
+        for kind, word in ((KIND_CHANGED, "changed"), (KIND_MISSING, "missing in Image 2"),
+                           (KIND_ADDED, "added in Image 2")):
+            k = r.count(kind)
+            if k:
+                parts.append(f"{k} {word}")
+        self.summary.configure(
+            text=f"{n} difference{'s' if n != 1 else ''}:  " + ",  ".join(parts) + extra, fg=COMPARE_HEX)
+        self.legend.configure(text="- - -  = missing here")
+        status_var.set(f"Compare images: {n} difference{'s' if n != 1 else ''} found")
 
     def clear_result(self):
-        self._stop_blink()
         self.result = None
         self.bases = {}
-        self.kinds = []
+        self.highlighted = None
         self.selected = None
         self.zoom = None
         self.summary.configure(text="", fg=TEXT)
+        if hasattr(self, "legend"):
+            self.legend.configure(text="")
         if hasattr(self, "list_frame"):
             self._fill_list()
         if hasattr(self, "all_button"):
@@ -3614,17 +3987,19 @@ class CompareWindow:
         for w in self.list_frame.winfo_children():
             w.destroy()
         self.items, self.item_photos = [], []
-        if self.result is None or not self.result.regions:
+        if self.result is None or not self.result.diffs:
             self.count_label.configure(text="")
             msg = ("Comparing..." if self.busy else
                    "No differences - the images match." if self.result is not None else
-                   "The differences will be listed here, each one zoomed in so it's easy to see.")
+                   "The differences will be listed here - each one shown close up, Image 1 next to Image 2.")
             tk.Label(self.list_frame, text=msg, font=F_BODY, fg=MUTED, bg=CARD, wraplength=S(280),
                      justify="left").pack(anchor="w", padx=S(12), pady=S(12))
             return
-        regions = self.result.regions
-        self.count_label.configure(text=str(len(regions)))
-        for n, (box, kind) in enumerate(zip(regions, self.kinds), 1):
+        diffs = self.result.diffs
+        shown = diffs[:self.MAX_LISTED]
+        self.count_label.configure(text=str(len(diffs)))
+        for n, diff in enumerate(shown, 1):
+            kind = diff.kind
             item = tk.Frame(self.list_frame, bg=CARD, cursor="hand2", highlightthickness=1,
                             highlightbackground=CARD)
             item.pack(fill="x", padx=S(6), pady=(S(4), 0))
@@ -3635,8 +4010,7 @@ class CompareWindow:
             badge.pack(side="left")
             title = tk.Label(head, text=kind, font=F_BODY_BOLD, fg=TEXT, bg=CARD)
             title.pack(side="left", padx=(S(8), 0))
-            size = tk.Label(head, text=f"{box[2] - box[0]} × {box[3] - box[1]} px",
-                            font=F_TILE_SUB, fg=MUTED, bg=CARD)
+            size = tk.Label(head, text=self._where(diff), font=F_TILE_SUB, fg=MUTED, bg=CARD)
             size.pack(side="right")
             widgets = [item, head, badge, title, size]
             if thumbs is not None and n - 1 < len(thumbs):
@@ -3655,10 +4029,18 @@ class CompareWindow:
                 w.bind("<Button-1>", lambda e, n=n: self.select(n, zoom=True))
                 w.bind("<MouseWheel>", self._list_wheel)
             self.items.append((item, widgets))
-        if len(regions) > len(self.kinds):
-            tk.Label(self.list_frame, text=f"+ {len(regions) - len(self.kinds)} more (boxed in the picture)",
+        if len(diffs) > len(shown):
+            tk.Label(self.list_frame, text=f"+ {len(diffs) - len(shown)} more (boxed in the picture)",
                      font=F_TILE_SUB, fg=MUTED, bg=CARD).pack(anchor="w", padx=S(12), pady=S(6))
         self.list_canvas.yview_moveto(0)
+
+    def _where(self, diff):
+        """Short position hint, e.g. 'line at y 120'."""
+        if diff.marker2:
+            return "not in Image 2"
+        if diff.marker1:
+            return "not in Image 1"
+        return f"{diff.box1[2] - diff.box1[0]} × {diff.box1[3] - diff.box1[1]} px"
 
     def _list_wheel(self, event):
         self.list_canvas.yview_scroll(int(-event.delta / 120) * 3, "units")
@@ -3681,29 +4063,21 @@ class CompareWindow:
                 self.list_canvas.yview_moveto(max(0.0, top - 0.02))
 
     def select(self, n, zoom=True):
-        if self.result is None or not (1 <= n <= len(self.result.regions)):
+        if self.result is None or not (1 <= n <= len(self.result.diffs)):
             return
         self.selected = n
         if zoom:
-            self.zoom_to(n)
+            self.zoom = n
         self._highlight_item()
         self._update_state()
         self.show_result()
 
     def step(self, delta):
-        if self.result is None or not self.result.regions:
+        if self.result is None or not self.result.diffs:
             return
-        n = len(self.result.regions)
+        n = len(self.result.diffs)
         cur = self.selected or (0 if delta > 0 else n + 1)
         self.select((cur - 1 + delta) % n + 1, zoom=True)
-
-    def zoom_to(self, n):
-        """Zoom the picture onto difference n (with some context around it)."""
-        base = self.bases["after"][0]
-        bx0, by0, bx1, by1 = self.result.regions[n - 1]
-        ctx = max(60, int(max(bx1 - bx0, by1 - by0) * 0.8))
-        self.zoom = (max(0, bx0 - ctx), max(0, by0 - ctx),
-                     min(base.width, bx1 + ctx), min(base.height, by1 + ctx))
 
     def show_all(self):
         self.zoom = None
@@ -3713,89 +4087,73 @@ class CompareWindow:
     # ---- showing the result -------------------------------------------
 
     def _view_changed(self):
-        self._stop_blink()
-        if self.view_var.get() == "blink" and self.result is not None:
-            self._blink_job = self.win.after(650, self._blink_tick)
-        if self.selected and self.zoom:
-            self.zoom_to(self.selected)
-        else:
-            self.zoom = None
         self._update_state()
         self.show_result()
-
-    def _blink_tick(self):
-        self.blink_state ^= 1
-        self.show_result()
-        self._blink_job = self.win.after(650, self._blink_tick)
-
-    def _stop_blink(self):
-        if self._blink_job:
-            self.win.after_cancel(self._blink_job)
-            self._blink_job = None
-        self.blink_state = 0
 
     def _schedule_redraw(self):
         if self._resize_job:
             self.win.after_cancel(self._resize_job)
         self._resize_job = self.win.after(60, self.show_result)
 
-    def _current_base(self):
+    def _zoomed_view(self, cw, ch):
+        """Close-up of the selected difference for the current view:
+        (image, offsets, clips)."""
+        diff = self.result.diffs[self.zoom - 1]
         view = self.view_var.get()
-        if view == "blink":
-            return self.bases.get("before" if self.blink_state else "after")
-        return self.bases.get(view)
+        h1, h2 = self.highlighted
+        if view == "side":
+            r1, r2 = zoom_rects(self.result, diff)
+            zw, zh = max(r1[2] - r1[0], r2[2] - r2[0]), max(r1[3] - r1[1], r2[3] - r2[1])
+            gap, bar = max(12, zw // 25), max(22, zh // 12)
+            comp = Image.new("RGB", (zw * 2 + gap, zh + bar), (255, 255, 255))
+            comp.paste(h1.crop(r1), (0, bar))
+            comp.paste(h2.crop(r2), (zw + gap, bar))
+            d = ImageDraw.Draw(comp)
+            d.rectangle([zw, 0, zw + gap - 1, zh + bar], fill=(201, 206, 216))
+            font = text_font(min(18, max(11, bar - 10)))
+            d.text((4, 3), "IMAGE 1  (SOURCE)", fill=(27, 31, 42), font=font)
+            d.text((zw + gap + 4, 3), "IMAGE 2", fill=(27, 31, 42), font=font)
+            offsets = [(-r1[0], bar - r1[1]), (zw + gap - r2[0], bar - r2[1])]
+            clips = [(0, bar, zw, bar + zh), (zw + gap, bar, zw * 2 + gap, bar + zh)]
+            return comp, offsets, clips
+        k = 0 if view == "image1" else 1
+        r = zoom_rects(self.result, diff, ratio=cw / max(1, ch))[k]
+        img = (h1, h2)[k]
+        offsets = [None, None]
+        offsets[k] = (-r[0], -r[1])
+        return img.crop(r), offsets, None
 
     def show_result(self):
         self._resize_job = None
         c = self.canvas
         c.delete("all")
         cw, ch = max(20, c.winfo_width()), max(20, c.winfo_height())
-        current = self._current_base()
+        current = self.bases.get(self.view_var.get())
         if current is None:
             self.scroll.pack_forget()
             self.transform = None
             msg = ("Comparing..." if self.busy else
-                   "Click Compare to find the differences" if all(img is not None for img in self.images) else
-                   "Load Image 1 and Image 2 above")
+                   "Click Compare to check Image 2 against Image 1" if all(img is not None for img in self.images) else
+                   "Load Image 1 (the source) and Image 2 above")
             c.create_text(cw // 2, ch // 2, text=msg, fill="#9AA3B2", font=F_TILE)
             c.configure(scrollregion=(0, 0, cw, ch))
             return
         base, offsets = current
         clips = None
-        if self.zoom and self.view_var.get() == "side":
-            # zoomed side by side: the same close-up of Image 1 and Image 2
-            zx0, zy0, zx1, zy1 = self.zoom
-            zw, zh = zx1 - zx0, zy1 - zy0
-            gap, bar = max(12, zw // 25), max(22, zh // 12)
-            comp = Image.new("RGB", (zw * 2 + gap, zh + bar), (255, 255, 255))
-            comp.paste(self.bases["before"][0].crop(self.zoom), (0, bar))
-            comp.paste(self.bases["after"][0].crop(self.zoom), (zw + gap, bar))
-            d = ImageDraw.Draw(comp)
-            d.rectangle([zw, 0, zw + gap - 1, zh + bar], fill=(201, 206, 216))
-            font = text_font(min(18, max(11, bar - 10)))
-            d.text((4, 3), "IMAGE 1", fill=(27, 31, 42), font=font)
-            d.text((zw + gap + 4, 3), "IMAGE 2", fill=(27, 31, 42), font=font)
-            base, offsets = comp, [(-zx0, bar - zy0), (zw + gap - zx0, bar - zy0)]
-            clips = [(0, bar, zw, bar + zh), (zw + gap, bar, zw * 2 + gap, bar + zh)]
-            vx0, vy0, vw, vh = 0, 0, comp.width, comp.height
-            scale = min(4.0, (cw - 8) / vw, (ch - 8) / vh)
-            tall = False
-        elif self.zoom:
-            vx0, vy0, vx1, vy1 = self.zoom
-            vw, vh = vx1 - vx0, vy1 - vy0
+        if self.zoom:
+            base, offsets, clips = self._zoomed_view(cw, ch)
+            vw, vh = base.size
             scale = min(4.0, (cw - 8) / vw, (ch - 8) / vh)
             tall = False
         else:
-            vx0, vy0, vw, vh = 0, 0, base.width, base.height
+            vw, vh = base.size
             fit_w = min(1.0, (cw - 4) / vw)
             fit_both = min(fit_w, (ch - 4) / vh)
             tall = vh > vw and fit_both < fit_w * 0.6
             scale = min(1.0, (cw - 20) / vw) if tall else fit_both
-        crop = base.crop((vx0, vy0, vx0 + vw, vy0 + vh))
         size = (max(1, int(vw * scale)), max(1, int(vh * scale)))
-        if size != crop.size:
-            crop = crop.resize(size, Image.LANCZOS if scale < 1 else Image.BICUBIC)
-        self.photo = ImageTk.PhotoImage(crop)
+        shown = base if size == base.size else base.resize(size, Image.LANCZOS if scale < 1 else Image.BICUBIC)
+        self.photo = ImageTk.PhotoImage(shown)
         if tall:
             if not self.scroll.winfo_ismapped():
                 self.scroll.pack(side="right", fill="y", before=c)
@@ -3807,57 +4165,79 @@ class CompareWindow:
             c.configure(scrollregion=(0, 0, cw, ch))
             c.yview_moveto(0)
         c.create_image(ox, oy, anchor="nw", image=self.photo)
-        self.transform = (scale, ox, oy, vx0, vy0)
+        self.transform = (scale, ox, oy, 0, 0)
         self.drawn_offsets = offsets
         self._draw_boxes(offsets, clips)
-        if self.view_var.get() == "blink":
-            label = "Image 1" if self.blink_state else "Image 2"
-            c.create_rectangle(10, 10, 10 + S(90), 10 + S(28), fill="#141824", outline="")
-            c.create_text(10 + S(45), 10 + S(14), text=label, fill="white", font=F_BODY_BOLD)
+
+    def _screen_box(self, diff, k, off):
+        """Where difference box k (0 = Image 1, 1 = Image 2) is on the canvas."""
+        scale, ox, oy, vx0, vy0 = self.transform
+        x0, y0, x1, y1 = diff.box1 if k == 0 else diff.box2
+        dx, dy = off
+        return (ox + (x0 + dx - vx0) * scale, oy + (y0 + dy - vy0) * scale,
+                ox + (x1 + dx - vx0) * scale, oy + (y1 + dy - vy0) * scale)
 
     def _draw_boxes(self, offsets, clips=None):
-        """Red boxes + numbers drawn at screen size (always clearly visible)."""
-        if not self.result or not self.result.regions:
+        """Red boxes + numbers drawn at screen size (always clearly visible);
+        a dashed red line where content is missing."""
+        if not self.result or not self.result.diffs:
             return
-        scale, ox, oy, vx0, vy0 = self.transform
+        scale = self.transform[0]
         c = self.canvas
         min_px = S(18)
-        badge_font = ("Segoe UI", 9, "bold")
-        for n, (x0, y0, x1, y1) in enumerate(self.result.regions, 1):
+        badge_font = font(9, "Segoe UI", "bold")
+        for n, diff in enumerate(self.result.diffs, 1):
             sel = n == self.selected
-            for k, (dx, dy) in enumerate(offsets):
-                bx = (x0 + dx, y0 + dy, x1 + dx, y1 + dy)
+            for k, off in enumerate(offsets):
+                if off is None:
+                    continue
+                marker = diff.marker1 if k == 0 else diff.marker2
+                box = diff.box1 if k == 0 else diff.box2
                 if clips:                      # zoomed side by side: keep each box in its half
                     cl = clips[k]
-                    if bx[2] <= cl[0] or bx[0] >= cl[2] or bx[3] <= cl[1] or bx[1] >= cl[3]:
+                    bx = (box[0] + off[0], box[1] + off[1], box[2] + off[0], box[3] + off[1])
+                    if bx[2] < cl[0] or bx[0] > cl[2] or bx[3] < cl[1] or bx[1] > cl[3]:
                         continue
-                sx0 = ox + (x0 + dx - vx0) * scale
-                sy0 = oy + (y0 + dy - vy0) * scale
-                sx1 = ox + (x1 + dx - vx0) * scale
-                sy1 = oy + (y1 + dy - vy0) * scale
-                # tiny changes still get a box you can see
-                if sx1 - sx0 < min_px:
-                    m = (sx0 + sx1) / 2
-                    sx0, sx1 = m - min_px / 2, m + min_px / 2
-                if sy1 - sy0 < min_px:
-                    m = (sy0 + sy1) / 2
-                    sy0, sy1 = m - min_px / 2, m + min_px / 2
-                pad = 4
-                bx0, by0, bx1, by1 = sx0 - pad, sy0 - pad, sx1 + pad, sy1 + pad
-                if sel:
-                    c.create_rectangle(bx0 - 3, by0 - 3, bx1 + 3, by1 + 3, outline="white", width=3)
-                c.create_rectangle(bx0, by0, bx1, by1, outline=COMPARE_HEX, width=5 if sel else 3,
-                                   tags=(f"diff{n}",))
+                sx0, sy0, sx1, sy1 = self._screen_box(diff, k, off)
+                tags = (f"diff{n}",)
+                if marker:
+                    sx1 = max(sx1, sx0 + S(40))
+                    if sel:
+                        c.create_line(sx0, sy0, sx1, sy0, fill="white", width=7)
+                    c.create_line(sx0, sy0, sx1, sy0, fill=COMPARE_HEX, width=5 if sel else 3,
+                                  dash=(6, 4), tags=tags)
+                    c.create_rectangle(sx0 - 4, sy0 - 6, sx1 + 4, sy0 + 6, outline="", fill="",
+                                       tags=tags)
+                    bx0, by0, by1 = sx0, sy0 - 4, sy0 + 4
+                else:
+                    # tiny changes still get a box you can see
+                    if sx1 - sx0 < min_px:
+                        m = (sx0 + sx1) / 2
+                        sx0, sx1 = m - min_px / 2, m + min_px / 2
+                    if sy1 - sy0 < min_px:
+                        m = (sy0 + sy1) / 2
+                        sy0, sy1 = m - min_px / 2, m + min_px / 2
+                    pad = 4
+                    bx0, by0, bx1, by1 = sx0 - pad, sy0 - pad, sx1 + pad, sy1 + pad
+                    if sel:
+                        c.create_rectangle(bx0 - 3, by0 - 3, bx1 + 3, by1 + 3, outline="white", width=3)
+                    c.create_rectangle(bx0, by0, bx1, by1, outline=COMPARE_HEX, width=5 if sel else 3,
+                                       tags=tags)
                 bw, bh = S(10) + 7 * len(str(n)), S(20)
-                ty = by0 - bh if by0 - bh > 0 else by1
-                c.create_rectangle(bx0 - (3 if sel else 1), ty, bx0 + bw, ty + bh, fill=COMPARE_HEX,
-                                   outline="white" if sel else COMPARE_HEX, tags=(f"diff{n}",))
-                c.create_text(bx0 + bw / 2, ty + bh / 2, text=str(n), fill="white", font=badge_font,
-                              tags=(f"diff{n}",))
+                if marker:                         # number to the left of the line
+                    lx, ty = bx0 - bw - 2, sy0 - bh / 2
+                    if lx < 0:
+                        lx, ty = bx0, by0 - bh
+                else:
+                    lx, ty = bx0 - (3 if sel else 1), (by0 - bh if by0 - bh > 0 else by1)
+                c.create_rectangle(lx, ty, lx + bw, ty + bh, fill=COMPARE_HEX,
+                                   outline="white" if sel else COMPARE_HEX, tags=tags)
+                c.create_text(lx + bw / 2, ty + bh / 2, text=str(n), fill="white", font=badge_font,
+                              tags=tags)
 
     def _canvas_click(self, event):
         """Click a red box to select (and zoom to) that difference."""
-        if not self.result or not self.result.regions or not self.transform:
+        if not self.result or not self.result.diffs or not self.transform:
             return
         x, y = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
         for item in reversed(self.canvas.find_overlapping(x - 3, y - 3, x + 3, y + 3)):
@@ -3866,12 +4246,12 @@ class CompareWindow:
                     self.select(int(tag[4:]), zoom=True)
                     return
         # otherwise: inside a box?
-        scale, ox, oy, vx0, vy0 = self.transform
-        offsets = self.drawn_offsets
-        ix, iy = (x - ox) / scale + vx0, (y - oy) / scale + vy0
-        for n, (x0, y0, x1, y1) in enumerate(self.result.regions, 1):
-            for dx, dy in offsets:
-                if x0 + dx - 8 <= ix <= x1 + dx + 8 and y0 + dy - 8 <= iy <= y1 + dy + 8:
+        for n, diff in enumerate(self.result.diffs, 1):
+            for k, off in enumerate(self.drawn_offsets):
+                if off is None:
+                    continue
+                sx0, sy0, sx1, sy1 = self._screen_box(diff, k, off)
+                if sx0 - 8 <= x <= sx1 + 8 and sy0 - 8 <= y <= sy1 + 8:
                     self.select(n, zoom=True)
                     return
 
@@ -3883,12 +4263,11 @@ class CompareWindow:
 
     def result_image(self):
         """The current view as an image, with numbered boxes drawn in."""
-        view = self.view_var.get()
-        current = self.bases.get("after" if view == "blink" else view)
+        current = self.bases.get(self.view_var.get())
         if current is None:
             return None
         base, offsets = current
-        return draw_difference_boxes(base, self.result.regions, offsets, self.selected)
+        return draw_difference_boxes(base, self.result.diffs, offsets, self.selected)
 
     def copy_result(self):
         img = self.result_image()
@@ -3920,7 +4299,6 @@ class CompareWindow:
                        save_label=f"Save to {doc_app()}" if word_doc_path is not None else "Save")
 
     def close(self):
-        self._stop_blink()
         CompareWindow.current = None
         self.win.destroy()
 
@@ -3993,7 +4371,7 @@ def create_selection_overlay(on_selected, hint=None, on_cancel=None):
     if hint:
         overlay.update_idletasks()
         canvas.create_text(overlay.winfo_width() // 2, S(40), text=hint,
-                           fill="white", font=("Segoe UI Semibold", 14))
+                           fill="white", font=font(14, "Segoe UI Semibold"))
 
     start_x = 0
     start_y = 0
@@ -5005,6 +5383,35 @@ status_var = tk.StringVar(value="Choose a folder to save screenshots and recordi
 # Theme
 # ============================================================
 
+def screen_work_area():
+    """(left, top, width, height) of the usable area (without the taskbar)
+    of the monitor the mouse is on - the one the user is looking at."""
+    try:
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+
+        class MONITORINFO(ctypes.Structure):
+            _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT),
+                        ("rcWork", wintypes.RECT), ("dwFlags", wintypes.DWORD)]
+
+        user32.MonitorFromPoint.argtypes = [wintypes.POINT, wintypes.DWORD]
+        user32.MonitorFromPoint.restype = ctypes.c_void_p
+        user32.GetMonitorInfoW.argtypes = [ctypes.c_void_p, ctypes.POINTER(MONITORINFO)]
+
+        cursor = wintypes.POINT()
+        user32.GetCursorPos(ctypes.byref(cursor))
+        monitor = user32.MonitorFromPoint(cursor, 2)   # 2 = nearest monitor
+        info = MONITORINFO()
+        info.cbSize = ctypes.sizeof(MONITORINFO)
+        if monitor and user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+            r = info.rcWork
+            return r.left, r.top, r.right - r.left, r.bottom - r.top
+    except Exception:
+        pass
+    return 0, 0, root.winfo_screenwidth(), root.winfo_screenheight()
+
+
+
 from PIL import ImageDraw, ImageTk
 
 # Colours
@@ -5028,22 +5435,44 @@ HEADER_BG = "#141824"
 HEADER_SUB = "#C5CAD6"
 BAR_BG = "#141824"
 
-# Fonts (Segoe UI on Windows; Tk falls back elsewhere)
-F_TITLE = ("Segoe UI Semibold", 16)
-F_SUB = ("Segoe UI", 10)
-F_SECTION = ("Segoe UI Semibold", 9)
-F_BODY = ("Segoe UI", 10)
-F_BODY_BOLD = ("Segoe UI Semibold", 10)
-F_TILE = ("Segoe UI Semibold", 11)
-F_TILE_SUB = ("Segoe UI", 9)
-F_TIMER = ("Consolas", 13, "bold")
+# Size of everything follows the screen:
+#   DPI_SCALE - Windows display scaling (100% = 1.0, 150% = 1.5)
+#   UI_FIT    - how much room the screen has: the layout is designed for a
+#               screen a bit bigger than 1920 x 1080; on smaller screens (laptops, 1366 x 768)
+#               everything shrinks, on large ones it grows a little, so the
+#               window always takes up a similar share of the screen.
+DPI_SCALE = max(1.0, root.winfo_fpixels("1i") / 96.0)
 
-# Scale pixel sizes with Windows display scaling (fonts scale by themselves)
-UI_SCALE = max(1.0, root.winfo_fpixels("1i") / 96.0)
+
+def _screen_fit():
+    _, _, width, height = screen_work_area()
+    logical_w, logical_h = width / DPI_SCALE, height / DPI_SCALE
+    return max(0.72, min(1.1, logical_w / 1900, logical_h / 1150))
+
+
+UI_FIT = _screen_fit()
+UI_SCALE = DPI_SCALE * UI_FIT
+FONT_SCALE = DPI_SCALE * max(0.86, UI_FIT)      # text never gets too small to read
 
 
 def S(pixels):
     return int(round(pixels * UI_SCALE))
+
+
+def font(points, family="Segoe UI", *style):
+    """A font sized for this screen (Tk: negative size = pixels)."""
+    return (family, -max(9, int(round(points * 4 / 3 * FONT_SCALE))), *style)
+
+
+# Fonts (Segoe UI on Windows; Tk falls back elsewhere)
+F_TITLE = font(15, "Segoe UI Semibold")
+F_SUB = font(9.5)
+F_SECTION = font(9, "Segoe UI Semibold")
+F_BODY = font(10)
+F_BODY_BOLD = font(10, "Segoe UI Semibold")
+F_TILE = font(10.5, "Segoe UI Semibold")
+F_TILE_SUB = font(9)
+F_TIMER = font(13, "Consolas", "bold")
 
 
 root.configure(bg=BG)
@@ -5255,7 +5684,7 @@ class FlatButton(tk.Button):
             disabledforeground=FAINT, relief="flat", bd=0, cursor="hand2",
             highlightthickness=1, highlightbackground=st["border"],
             highlightcolor=st["border"], font=F_BODY_BOLD,
-            padx=S(14), pady=S(6),
+            padx=S(12), pady=S(5),
         )
         if text in self._icons:
             options.update(image=self._icons[text], compound="left")
@@ -5293,14 +5722,14 @@ class Tile(tk.Frame):
         self._hover_border = hover_border
 
         self.icon_box = tk.Label(self, image=image, bg=ACCENT_SOFT if hover_border == ACCENT else RED_SOFT,
-                                 width=S(44), height=S(44))
-        self.icon_box.grid(row=0, column=0, rowspan=2, padx=(S(14), S(12)), pady=S(11))
+                                 width=S(38), height=S(38))
+        self.icon_box.grid(row=0, column=0, rowspan=2, padx=(S(11), S(10)), pady=S(8))
 
         self.title = tk.Label(self, text=title, font=F_TILE, fg=TEXT, bg=CARD, anchor="w")
-        self.title.grid(row=0, column=1, sticky="sw", pady=(S(11), 0), padx=(0, S(14)))
+        self.title.grid(row=0, column=1, sticky="sw", pady=(S(8), 0), padx=(0, S(10)))
         self.sub = tk.Label(self, text=subtitle, font=F_TILE_SUB, fg=MUTED, bg=CARD, anchor="w",
                             justify="left")
-        self.sub.grid(row=1, column=1, sticky="nw", pady=(S(1), S(11)), padx=(0, S(14)))
+        self.sub.grid(row=1, column=1, sticky="nw", pady=(S(1), S(8)), padx=(0, S(10)))
 
         for widget in (self, self.icon_box, self.title, self.sub):
             widget.bind("<Enter>", lambda e: self._hover(True))
@@ -5387,19 +5816,19 @@ class Card(tk.Frame):
     def __init__(self, parent, title, badge=None, required=False):
         super().__init__(parent, bg=CARD, highlightthickness=1, highlightbackground=BORDER)
         head = tk.Frame(self, bg=CARD)
-        head.pack(fill="x", padx=S(20), pady=(S(11), S(8)))
+        head.pack(fill="x", padx=S(16), pady=(S(8), S(6)))
         tk.Frame(head, bg=ACCENT, width=S(4), height=S(16)).pack(side="left", padx=(0, S(8)))
         tk.Label(head, text=title.upper(), font=F_SECTION, fg=TEXT, bg=CARD).pack(side="left")
         if required:   # red asterisk = must be filled in
-            tk.Label(head, text="*", font=(F_SECTION[0], F_SECTION[1] + 3, "bold"),
+            tk.Label(head, text="*", font=font(12, "Segoe UI", "bold"),
                      fg=RED, bg=CARD).pack(side="left", padx=(S(3), 0))
         self.badge = tk.Label(head, font=F_SECTION, bg=ACCENT_SOFT, fg=ACCENT, padx=S(8), pady=S(1))
         if badge:
             self.set_badge(badge)
         # divider between heading and content
-        tk.Frame(self, bg="#E3E6EC", height=1).pack(fill="x", padx=S(20))
+        tk.Frame(self, bg="#E3E6EC", height=1).pack(fill="x", padx=S(16))
         self.body = tk.Frame(self, bg=CARD)
-        self.body.pack(fill="x", padx=S(20), pady=(S(11), S(14)))
+        self.body.pack(fill="x", padx=S(16), pady=(S(8), S(11)))
 
     def set_badge(self, text, warn=False):
         self.badge.configure(text=text, bg=RED_SOFT if warn else ACCENT_SOFT,
@@ -5439,9 +5868,9 @@ header = tk.Frame(main_frame, bg=HEADER_BG)
 header.pack(fill="x")
 
 header_inner = tk.Frame(header, bg=HEADER_BG)
-header_inner.pack(fill="x", padx=S(24), pady=S(14))
+header_inner.pack(fill="x", padx=S(18), pady=S(10))
 
-tk.Label(header_inner, image=icon("logo", size=40), bg=HEADER_BG).pack(side="left")
+tk.Label(header_inner, image=icon("logo", size=34), bg=HEADER_BG).pack(side="left")
 
 header_text = tk.Frame(header_inner, bg=HEADER_BG)
 header_text.pack(side="left", padx=(S(12), 0))
@@ -5456,7 +5885,7 @@ header_subtitle.pack(anchor="w")
 tk.Frame(main_frame, bg=ACCENT, height=S(3)).pack(fill="x")
 
 content = tk.Frame(main_frame, bg=BG)
-content.pack(fill="both", padx=S(24), pady=(S(16), S(4)))
+content.pack(fill="both", padx=S(16), pady=(S(12), S(4)))
 
 
 # ============================================================
@@ -5464,7 +5893,7 @@ content.pack(fill="both", padx=S(24), pady=(S(16), S(4)))
 # ============================================================
 
 folder_card = Card(content, "Save location", required=True)
-folder_card.pack(fill="x", pady=(0, S(12)))
+folder_card.pack(fill="x", pady=(0, S(9)))
 
 entry_row = tk.Frame(folder_card.body, bg=CARD)
 entry_row.pack(fill="x")
@@ -5472,7 +5901,7 @@ entry_row.pack(fill="x")
 tk.Label(entry_row, image=icon("folder", ACCENT, 18), bg=CARD).pack(side="left", padx=(0, S(8)))
 
 folder_entry = styled_entry(entry_row, folder_var)
-folder_entry.configure(width=62)
+folder_entry.configure(width=40)
 folder_entry.pack(side="left", fill="x", expand=True, ipady=S(5), ipadx=S(4))
 
 browse_button = FlatButton(entry_row, "Browse", browse_folder, style="primary")
@@ -5484,7 +5913,7 @@ browse_button.pack(side="left", padx=(S(8), 0))
 # ============================================================
 
 word_frame = Card(content, "Document  (Word / Excel / PowerPoint)", badge="Optional")
-word_frame.pack(fill="x", pady=(0, S(12)))
+word_frame.pack(fill="x", pady=(0, S(9)))
 
 word_hint_label = tk.Label(
     word_frame.body,
@@ -5533,12 +5962,12 @@ if not OFFICE_AVAILABLE:
 # ============================================================
 
 shot_card = Card(content, "Screenshot & text", badge="PNG / Office / Text")
-shot_card.pack(fill="x", pady=(0, S(12)))
+shot_card.pack(fill="x", pady=(0, S(9)))
 
 shot_tiles = tk.Frame(shot_card.body, bg=CARD)
 shot_tiles.pack(fill="x")
 # keeps the window as wide as before the tiles moved to two rows
-tk.Frame(shot_card.body, bg=CARD, width=S(860), height=1).pack()
+tk.Frame(shot_card.body, bg=CARD, width=S(700), height=1).pack()
 shot_tiles.columnconfigure((0, 1, 2, 3, 4, 5), weight=1, uniform="tiles")
 
 capture_button = Tile(shot_tiles, icon("screen", ACCENT, 24), "Capture Screen",
@@ -5555,11 +5984,11 @@ fullpage_button.grid(row=0, column=4, columnspan=2, sticky="nsew", padx=(S(5), 0
 
 ocr_button = Tile(shot_tiles, icon("ocr", ACCENT, 24), "Extract Text",
                   "Copy text (OCR)\nCtrl+Shift+T", extract_text_region)
-ocr_button.grid(row=1, column=0, columnspan=3, sticky="nsew", padx=(0, S(5)), pady=(S(10), 0))
+ocr_button.grid(row=1, column=0, columnspan=3, sticky="nsew", padx=(0, S(5)), pady=(S(8), 0))
 
 compare_button = Tile(shot_tiles, icon("compare", ACCENT, 24), "Compare Images",
                       "Highlight differences\nCtrl+Shift+C", open_compare_window)
-compare_button.grid(row=1, column=3, columnspan=3, sticky="nsew", padx=(S(5), 0), pady=(S(10), 0))
+compare_button.grid(row=1, column=3, columnspan=3, sticky="nsew", padx=(S(5), 0), pady=(S(8), 0))
 
 if not OCR_AVAILABLE:
     ocr_button.sub.configure(text="Needs Windows OCR\n(see console)")
@@ -5571,7 +6000,7 @@ if not OCR_AVAILABLE:
 # ============================================================
 
 record_frame = Card(content, "Screen recording", badge="MP4")
-record_frame.pack(fill="x", pady=(0, S(12)))
+record_frame.pack(fill="x", pady=(0, S(9)))
 
 record_tiles = tk.Frame(record_frame.body, bg=CARD)
 record_tiles.pack(fill="x")
@@ -5592,7 +6021,7 @@ mic_var = tk.BooleanVar(value=AUDIO_AVAILABLE)
 system_audio_var = tk.BooleanVar(value=AUDIO_AVAILABLE)
 
 audio_row = tk.Frame(record_frame.body, bg=CARD)
-audio_row.pack(fill="x", pady=(S(10), 0))
+audio_row.pack(fill="x", pady=(S(8), 0))
 
 tk.Label(audio_row, text="Sound", font=F_BODY_BOLD, fg=TEXT, bg=CARD).pack(side="left", padx=(0, S(12)))
 
@@ -5622,8 +6051,8 @@ status_bar = tk.Frame(main_frame, bg=CARD, highlightthickness=1, highlightbackgr
 status_bar.pack(fill="x", side="bottom")
 
 status_dot = tk.Label(status_bar, bg=CARD, fg=RED, bd=0, padx=0, pady=0,
-                      font=(F_BODY[0], F_BODY[1] + 3, "bold"))
-status_dot.pack(side="left", anchor="n", padx=(S(16), S(8)), pady=(S(13), 0))
+                      font=font(13, "Segoe UI", "bold"))
+status_dot.pack(side="left", anchor="n", padx=(S(16), S(8)), pady=(S(9), 0))
 
 status_label = tk.Label(
     status_bar,
@@ -5631,11 +6060,11 @@ status_label = tk.Label(
     font=F_BODY,
     fg=TEXT,
     bg=CARD,
-    height=3,
+    height=2,
     justify="left",
     anchor="w"
 )
-status_label.pack(side="left", fill="x", expand=True, padx=(0, S(16)), pady=S(6))
+status_label.pack(side="left", fill="x", expand=True, padx=(0, S(16)), pady=S(4))
 
 
 def update_status_dot(*args):
@@ -5648,7 +6077,7 @@ def update_status_dot(*args):
         status_dot.pack_configure(anchor="center", pady=0)
         return
     status_dot.configure(text="")
-    status_dot.pack_configure(anchor="n", pady=(S(13), 0))
+    status_dot.pack_configure(anchor="n", pady=(S(9), 0))
     if (text.startswith(("recording failed", "could not", "error"))
             or "cancelled" in text or "too small" in text):
         color = RED
@@ -5670,34 +6099,6 @@ def fit_status_wrap(event=None):
 
 
 root.after(100, fit_status_wrap)
-
-
-def screen_work_area():
-    """(left, top, width, height) of the usable area (without the taskbar)
-    of the monitor the mouse is on - the one the user is looking at."""
-    try:
-        from ctypes import wintypes
-        user32 = ctypes.windll.user32
-
-        class MONITORINFO(ctypes.Structure):
-            _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT),
-                        ("rcWork", wintypes.RECT), ("dwFlags", wintypes.DWORD)]
-
-        user32.MonitorFromPoint.argtypes = [wintypes.POINT, wintypes.DWORD]
-        user32.MonitorFromPoint.restype = ctypes.c_void_p
-        user32.GetMonitorInfoW.argtypes = [ctypes.c_void_p, ctypes.POINTER(MONITORINFO)]
-
-        cursor = wintypes.POINT()
-        user32.GetCursorPos(ctypes.byref(cursor))
-        monitor = user32.MonitorFromPoint(cursor, 2)   # 2 = nearest monitor
-        info = MONITORINFO()
-        info.cbSize = ctypes.sizeof(MONITORINFO)
-        if monitor and user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
-            r = info.rcWork
-            return r.left, r.top, r.right - r.left, r.bottom - r.top
-    except Exception:
-        pass
-    return 0, 0, root.winfo_screenwidth(), root.winfo_screenheight()
 
 
 def fit_to_screen():

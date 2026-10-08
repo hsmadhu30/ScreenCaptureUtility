@@ -226,36 +226,36 @@ Small selections are enlarged automatically before reading, which improves accur
 
 *Shortcut: **Ctrl+Shift+C***
 
-Find what changed between two screenshots, such as a screen before and after an update, two versions of a report, or a test run against the expected screen. Every difference is **highlighted in red**: changed text, recoloured or moved graphics, and added or removed items.
+Check one screenshot against another, such as a screen after an update against the screen before it, a new version of a report against the approved one, or a test run against the expected screen. **Image 1 is the source** (the reference); **Image 2 is checked against it**. Every difference is **highlighted in red in both images**: changed text, recoloured or moved graphics, content that is missing from Image 2, and content that was added.
 
 ![Compare Images window](docs/images/compare-window.png)
 
 1. Click **Compare Images**.
-2. Fill the **Image 1** and **Image 2** slots. Each slot has four ways to load an image:
+2. Fill the **Image 1 (source)** and **Image 2** slots. Each slot has four ways to load an image:
    - **Open...** an image file (PNG, JPG, BMP, GIF, TIFF, WebP).
    - **Capture region**: drag over part of the screen. The Compare window hides while you drag; press **Esc** to cancel.
    - **Full screen**: capture the whole screen.
    - **Paste** an image you copied, for example with the Review window's **Copy**, or a file copied in File Explorer.
+
+   Put the image you trust in **Image 1**. If you loaded them the wrong way round, click **Swap images**.
 3. Click **Compare**, or press **Enter**.
 
-**The result:**
-- **Spotlight:** everything that did *not* change is faded out, so the changed areas stand out in their true colours.
-- **Numbered red boxes** mark each difference. They stay thick and clear even when a large screenshot is shrunk to fit, and even a one-character change gets a box you can see.
-- The line above the result says how many differences were found and how much of the image changed. If nothing changed, it says **"No differences found - the images match."**
+**The result** shows the two images side by side, Image 1 on the left:
+- The **differing pixels are tinted red**, like a highlighter, in each image. In Image 1 you see what was there; in Image 2 you see what is there now.
+- **Numbered red boxes** mark each difference in both images, with the same number in each. They stay thick and clear even when a large screenshot is shrunk to fit, and even a one-character change gets a box you can see.
+- When something is **missing from Image 2**, its box is in Image 1, and a **dashed red line** in Image 2 shows the spot where it should be. Content **added in Image 2** works the other way round: the box is in Image 2 and the dashed line in Image 1.
+- **Lines are matched up.** If a line of text or a row of a form was removed or added, the lines below it have moved up or down. The comparison matches each line with its counterpart, so only the removed or added line is reported, not everything below it. The summary then says "lines matched up".
+- The line above the result counts the differences by kind, for example "3 differences: 1 changed, 1 missing in Image 2, 1 added in Image 2". If nothing changed, it says **"No differences - Image 2 matches Image 1."**
 
-**The Differences list** (right side) shows every difference as a **zoomed-in close-up of Image 1 next to Image 2**, so you can see exactly what changed. Each one is labelled:
-- **Changed:** something is different in both images, such as edited text, a new colour, or a moved item.
-- **Only in Image 2:** it was added.
-- **Only in Image 1:** it was removed.
+**The Differences list** (right side) shows every difference as a **close-up of Image 1 next to Image 2**, so you can see exactly what changed. Each one is labelled:
+- **Changed:** both images have something here, but it's different (edited text, a new colour, a moved item).
+- **Missing in Image 2:** it's in Image 1 but not in Image 2.
+- **Added in Image 2:** it's in Image 2 but not in Image 1.
 
 **Looking closer:**
-- **Click a difference** in the list, or click its box in the picture, to **zoom in** on it. **Previous** / **Next** (or the **Up** / **Down** arrow keys) step through them one by one.
+- **Click a difference** in the list, or click its box or dashed line in the picture, to **zoom in** on it. **Previous** / **Next** (or the arrow keys) step through them one by one.
 - **Show all**, **Esc** or double-clicking the picture zooms back out.
-- **Views:**
-  - **Image 1** shows what was there before each change; **Image 2** shows what is there now.
-  - **Side by side** shows both images. While zoomed, it shows the same close-up of each.
-  - **Blink** flips between the two images about every half second, so changes catch your eye as flicker.
-- **Fade unchanged areas** *(on)* can be turned off to see the images at full strength, still with the boxes.
+- **Views:** **Side by side** *(default)* shows both images; while zoomed, it shows a close-up of the same spot in each. **Image 1** or **Image 2** shows just one image, bigger.
 
 **Options:**
 
@@ -266,8 +266,9 @@ Find what changed between two screenshots, such as a screen before and after an 
 | **Swap images** | Exchange Image 1 and Image 2. |
 
 **Images of different sizes:**
-- If one image is just a zoomed copy of the other (same shape, different size), it is resized to match.
-- Otherwise, anything that exists in only one image is marked as a difference.
+- If Image 2 is just a zoomed copy of Image 1 (same shape, different size), it is resized to match Image 1.
+- If one is longer (for example, a page where lines were added or removed), the lines are matched up as described above.
+- Otherwise, anything that exists in only one image is marked as missing in, or added in, Image 2.
 
 **Keep or share the result:**
 - **Copy result** (or **Ctrl+C**) puts the current view, with its numbered boxes, on the clipboard, ready to paste into Teams, Outlook or Word.
@@ -479,7 +480,7 @@ That single `.exe` contains everything, including ffmpeg, the Word, Excel and Po
 
 ---
 
-*Browser edition:* `ScreenCaptureUtility.html` is a separate, no-install version that runs in Edge or Chrome. Double-click it to open it. It has the same Review window (Highlighter, Pen, Eraser, Rectangle, Line, Text, Crop, Copy / Save / Cancel, Minimize / Maximize), saves into **Word, Excel or PowerPoint** files the same way, and has **Compare Images** (shortcut **C**) with the same highlighting, Differences list, zoom and Blink view. The differences:
+*Browser edition:* `ScreenCaptureUtility.html` is a separate, no-install version that runs in Edge or Chrome. Double-click it to open it. It has the same Review window (Highlighter, Pen, Eraser, Rectangle, Line, Text, Blur, Crop, Copy / Save / Cancel, Minimize / Maximize), saves into **Word, Excel or PowerPoint** files the same way, and has **Compare Images** (shortcut **C**) with the same source-vs-Image 2 comparison, red highlighting in both images, Differences list and zoom. The differences:
 - There is no Full Page capture. Use the browser's own full-page screenshot, then **Annotate an image...**.
 - If no folder is chosen, files go to your Downloads folder.
 - Recordings are saved as `.webm` or `.mp4`, depending on the browser.
