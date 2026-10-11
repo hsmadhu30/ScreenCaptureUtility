@@ -2834,7 +2834,7 @@ def start_scrolling_capture(x1, y1, x2, y2):
 # Compare Images
 # ============================================================
 # Image 1 is the SOURCE; Image 2 is checked against it. Every difference is
-# highlighted in red in BOTH images: changed text, changed or moved
+# marked in red in BOTH images: changed text, changed or moved
 # graphics, content that is missing from Image 2 and content that was added.
 #
 #   1. If the images are the same shape but a different size (e.g. captured
@@ -2849,9 +2849,12 @@ def start_scrolling_capture(x1, y1, x2, y2):
 #   4. Matched lines are compared pixel by pixel (with a tolerance, so
 #      anti-aliasing and JPEG noise are ignored). Lines found in only one
 #      image are reported as missing from / added in Image 2.
-#   5. The changed pixels are tinted red and grouped into numbered boxes.
-#      Each difference has a box in Image 1 and one in Image 2; when content
-#      is missing, a dashed red line marks the spot where it should be.
+#   5. The changed pixels are grouped into numbered differences. The images
+#      are shown exactly as they are (nothing is painted over the content):
+#      each difference gets a red outline with a small gap around it, a bar
+#      in the margin beside the same rows and its number in that margin, in
+#      Image 1 and in Image 2. When content is missing, a dashed red line
+#      marks the spot where it should be.
 #   Pictures without clear lines (photos, charts) are compared pixel by
 #   pixel; whichever method explains the differences with less red wins.
 # Pure Pillow - no extra packages.
@@ -3430,45 +3433,41 @@ def compare_images(a, b, tolerance=30, align=True):
                          notes=notes, method=method)
 
 
-def highlight_differences(image, mask, boxes=()):
-    """The image with its differing pixels tinted red (like a highlighter).
-    Inside each box only this image's own content is tinted - not the
-    places where the other image has something."""
-    out = image.copy()
-    keep = Image.new("L", out.size, 0)
-    gray = out.convert("L")
-    for x0, y0, x1, y1 in boxes:
-        box = (max(0, x0 - 2), max(0, y0 - 2), min(out.width, x1 + 2), min(out.height, y1 + 2))
-        if box[2] <= box[0] or box[3] <= box[1]:
-            continue
-        keep.paste(_content_pixels(gray.crop(box), 24), box[:2])
-    tint = ImageChops.darker(mask, keep).filter(ImageFilter.MaxFilter(3)).point(lambda v: 120 if v else 0)
-    out.paste(COMPARE_RED, (0, 0, out.width, out.height), tint)
-    return out
+COMPARE_GUTTER_BG = (238, 240, 245)    # the margin strip beside each image
 
 
-def highlighted_pair(result):
-    """(Image 1, Image 2) with their differences tinted red."""
-    return (highlight_differences(result.image1, result.mask1,
-                                  [d.box1 for d in result.diffs if not d.marker1]),
-            highlight_differences(result.image2, result.mask2,
-                                  [d.box2 for d in result.diffs if not d.marker2]))
+def gutter_width(*images):
+    """Width of the margin strip where the change bars and numbers go."""
+    return max(48, round(max(im.width for im in images) * 0.09))
 
 
 def side_by_side(image1, image2):
-    """Image 1 | Image 2 with a label above each. Returns the image and the
-    offset of each half."""
+    """[margin | Image 1]  [margin | Image 2] with a label above each. The
+    images are shown exactly as they are - nothing is drawn over them.
+    Returns the picture, where each image is, and where each margin is."""
+    g = gutter_width(image1, image2)
     gap, bar = 24, 34
-    W, H = image1.width + gap + image2.width, max(image1.height, image2.height) + bar
+    x2 = g + image1.width + gap
+    W, H = x2 + g + image2.width, max(image1.height, image2.height) + bar
     out = Image.new("RGB", (W, H), (255, 255, 255))
-    out.paste(image1, (0, bar))
-    out.paste(image2, (image1.width + gap, bar))
     d = ImageDraw.Draw(out)
-    d.rectangle([image1.width, 0, image1.width + gap - 1, H], fill=(201, 206, 216))
+    d.rectangle([0, bar, g - 1, H], fill=COMPARE_GUTTER_BG)
+    d.rectangle([x2, bar, x2 + g - 1, H], fill=COMPARE_GUTTER_BG)
+    out.paste(image1, (g, bar))
+    out.paste(image2, (x2 + g, bar))
+    d.rectangle([g + image1.width, 0, x2 - 1, H], fill=(201, 206, 216))
     font = text_font(16)
     d.text((4, 8), "IMAGE 1  (SOURCE)", fill=(27, 31, 42), font=font)
-    d.text((image1.width + gap + 4, 8), "IMAGE 2", fill=(27, 31, 42), font=font)
-    return out, [(0, bar), (image1.width + gap, bar)]
+    d.text((x2 + 4, 8), "IMAGE 2", fill=(27, 31, 42), font=font)
+    return out, [(g, bar), (x2 + g, bar)], [(0, g), (x2, x2 + g)]
+
+
+def with_margin(image):
+    """One image with the margin strip on its left."""
+    g = gutter_width(image)
+    out = Image.new("RGB", (g + image.width, image.height), COMPARE_GUTTER_BG)
+    out.paste(image, (g, 0))
+    return out, (g, 0), (0, g)
 
 
 def _dashed_line(d, x0, x1, y, color, width, dash=10):
@@ -3478,15 +3477,19 @@ def _dashed_line(d, x0, x1, y, color, width, dash=10):
         x += dash * 2
 
 
-def draw_difference_boxes(image, diffs, offsets, selected=None):
-    """Numbered red boxes drawn into the image itself (for Copy / Save).
-    offsets: [where Image 1 is, where Image 2 is] - None if not shown."""
+def draw_difference_boxes(image, diffs, offsets, gutters=None, selected=None):
+    """The marks drawn into the picture itself (for Copy / Save): an outline
+    around each difference (with a gap, so it never covers the content), a
+    bar in the margin over the same rows, and the number in the margin.
+    offsets / gutters: [Image 1, Image 2], None where that image isn't shown."""
     out = image.copy()
     W, H = out.size
     d = ImageDraw.Draw(out)
-    lw = max(3, round(max(W, H) / 450))
-    pad = lw + 4
-    font = text_font(max(14, lw * 5))
+    lw = max(2, round(max(W, H) / 700))
+    pad = lw + 5
+    font = text_font(max(13, lw * 6))
+    gutters = gutters or [None, None]
+    next_free = [0, 0]                           # stack numbers that would overlap
     for n, diff in enumerate(diffs, 1):
         for k, off in enumerate(offsets):
             if off is None:
@@ -3497,17 +3500,29 @@ def draw_difference_boxes(image, diffs, offsets, selected=None):
             width = lw * 2 if n == selected else lw
             if marker:
                 x1 = max(x1, x0 + 40)
-                bx0, by0, bx1, by1 = x0 + ox, y0 + oy - pad, x1 + ox, y0 + oy + pad
-                _dashed_line(d, bx0, bx1, y0 + oy, COMPARE_RED, width)
+                _dashed_line(d, x0 + ox, x1 + ox, y0 + oy, "white", width + 2)
+                _dashed_line(d, x0 + ox, x1 + ox, y0 + oy, COMPARE_RED, width)
+                by0, by1 = y0 + oy - pad, y0 + oy + pad
             else:
                 bx0, by0, bx1, by1 = x0 + ox - pad, y0 + oy - pad, x1 + ox + pad, y1 + oy + pad
+                d.rectangle([bx0 - 1, by0 - 1, bx1 + 1, by1 + 1], outline="white", width=width + 2)
                 d.rectangle([bx0, by0, bx1, by1], outline=COMPARE_RED, width=width)
             label = str(n)
             tb = d.textbbox((0, 0), label, font=font)
             tw, th = tb[2] - tb[0], tb[3] - tb[1]
-            ty = by0 - th - 10 if by0 - th - 10 >= 0 else by1 + 2
-            d.rectangle([bx0, ty, bx0 + tw + 10, ty + th + 10], fill=COMPARE_RED)
-            d.text((bx0 + 5 - tb[0], ty + 5 - tb[1]), label, fill="white", font=font)
+            gut = gutters[k] if k < len(gutters) else None
+            if gut:
+                gx0, gx1 = gut
+                bw = max(4, round((gx1 - gx0) * 0.12))
+                d.rectangle([gx1 - bw - 3, max(by0, oy), gx1 - 4, max(by1, by0 + 6)], fill=COMPARE_RED)
+                lx = gx0 + 3
+                ty = max(by0, next_free[k], oy)
+                next_free[k] = ty + th + 12
+            else:
+                lx = (x0 + ox - pad)
+                ty = by0 - th - 10 if by0 - th - 10 >= 0 else by1 + 2
+            d.rectangle([lx, ty, lx + tw + 10, ty + th + 10], fill=COMPARE_RED)
+            d.text((lx + 5 - tb[0], ty + 5 - tb[1]), label, fill="white", font=font)
     return out
 
 
@@ -3588,7 +3603,8 @@ class CompareWindow:
         self.names = ["", ""]
         self.result = None
         self.bases = {}           # view -> (image, [offset of Image 1, offset of Image 2])
-        self.highlighted = None   # (Image 1, Image 2) with the differences tinted red
+        self.hover = None         # number of the difference under the mouse
+        self.drawn = ([None, None], None, [None, None])   # offsets, clips, margins on screen now
         self.selected = None      # number of the selected difference (1-based)
         self.zoom = None          # number of the difference zoomed in on
         self.photo = None
@@ -3613,8 +3629,8 @@ class CompareWindow:
         titles = tk.Frame(inner, bg=HEADER_BG)
         titles.pack(side="left", padx=(S(10), 0))
         tk.Label(titles, text="Compare images", font=F_TILE, fg="white", bg=HEADER_BG).pack(anchor="w")
-        tk.Label(titles, text="Image 1 is the source; Image 2 is checked against it. Differences are "
-                              "marked in red in both images - click one to zoom in.",
+        tk.Label(titles, text="Image 1 is the source. Differences are outlined in red in both images "
+                              "(- - - = missing). Point at one to see its match; click to zoom in.",
                  font=F_TILE_SUB, fg=HEADER_SUB, bg=HEADER_BG).pack(anchor="w")
         tk.Frame(self.win, bg=ACCENT, height=S(3)).pack(fill="x")
 
@@ -3724,6 +3740,8 @@ class CompareWindow:
         self.canvas.bind("<Configure>", lambda e: self._schedule_redraw())
         self.canvas.bind("<MouseWheel>", self._canvas_wheel)
         self.canvas.bind("<Button-1>", self._canvas_click)
+        self.canvas.bind("<Motion>", self._canvas_motion)
+        self.canvas.bind("<Leave>", lambda e: self._canvas_motion(type("E", (), {"x": -999, "y": -999})()))
         self.canvas.bind("<Double-Button-1>", lambda e: self.show_all())
 
         self.win.bind("<Return>", lambda e: self.compare())
@@ -3911,9 +3929,8 @@ class CompareWindow:
         def work():
             try:
                 res = compare_images(a, b, tolerance=tol, align=align)
-                box["highlighted"] = highlighted_pair(res)
-                box["bases"] = self._make_bases(box["highlighted"])
-                box["thumbs"] = [difference_thumbnail(res, d, (S(132), S(92)), box["highlighted"])
+                box["bases"] = self._make_bases(res)
+                box["thumbs"] = [difference_thumbnail(res, d, (S(132), S(92)))
                                  for d in res.diffs[:self.MAX_LISTED]]
                 box["result"] = res
             except Exception as e:
@@ -3933,7 +3950,6 @@ class CompareWindow:
                 self.summary.configure(text=f"Could not compare the images: {box['error']}", fg=RED)
             else:
                 self.result, self.bases = box["result"], box["bases"]
-                self.highlighted = box["highlighted"]
                 self._summarise()
                 self._fill_list(box["thumbs"])
             self._update_state()
@@ -3941,10 +3957,14 @@ class CompareWindow:
         poll()
 
     @staticmethod
-    def _make_bases(highlighted):
-        h1, h2 = highlighted
-        side, offsets = side_by_side(h1, h2)
-        return {"image1": (h1, [(0, 0), None]), "image2": (h2, [None, (0, 0)]), "side": (side, offsets)}
+    def _make_bases(res):
+        """Each view: (picture, [where Image 1 is, where Image 2 is], [their margins])."""
+        side, offsets, gutters = side_by_side(res.image1, res.image2)
+        m1, o1, g1 = with_margin(res.image1)
+        m2, o2, g2 = with_margin(res.image2)
+        return {"side": (side, offsets, gutters),
+                "image1": (m1, [o1, None], [g1, None]),
+                "image2": (m2, [None, o2], [None, g2])}
 
     def _summarise(self):
         r = self.result
@@ -3963,13 +3983,13 @@ class CompareWindow:
                 parts.append(f"{k} {word}")
         self.summary.configure(
             text=f"{n} difference{'s' if n != 1 else ''}:  " + ",  ".join(parts) + extra, fg=COMPARE_HEX)
-        self.legend.configure(text="- - -  = missing here")
+        self.legend.configure(text="")
         status_var.set(f"Compare images: {n} difference{'s' if n != 1 else ''} found")
 
     def clear_result(self):
         self.result = None
         self.bases = {}
-        self.highlighted = None
+        self.hover = None
         self.selected = None
         self.zoom = None
         self.summary.configure(text="", fg=TEXT)
@@ -4100,7 +4120,7 @@ class CompareWindow:
         (image, offsets, clips)."""
         diff = self.result.diffs[self.zoom - 1]
         view = self.view_var.get()
-        h1, h2 = self.highlighted
+        h1, h2 = self.result.image1, self.result.image2
         if view == "side":
             r1, r2 = zoom_rects(self.result, diff)
             zw, zh = max(r1[2] - r1[0], r2[2] - r2[0]), max(r1[3] - r1[1], r2[3] - r2[1])
@@ -4138,9 +4158,10 @@ class CompareWindow:
             c.create_text(cw // 2, ch // 2, text=msg, fill="#9AA3B2", font=F_TILE)
             c.configure(scrollregion=(0, 0, cw, ch))
             return
-        base, offsets = current
+        base, offsets, gutters = current
         clips = None
         if self.zoom:
+            gutters = [None, None]
             base, offsets, clips = self._zoomed_view(cw, ch)
             vw, vh = base.size
             scale = min(4.0, (cw - 8) / vw, (ch - 8) / vh)
@@ -4167,7 +4188,8 @@ class CompareWindow:
         c.create_image(ox, oy, anchor="nw", image=self.photo)
         self.transform = (scale, ox, oy, 0, 0)
         self.drawn_offsets = offsets
-        self._draw_boxes(offsets, clips)
+        self.drawn = (offsets, clips, gutters)
+        self._draw_boxes()
 
     def _screen_box(self, diff, k, off):
         """Where difference box k (0 = Image 1, 1 = Image 2) is on the canvas."""
@@ -4177,17 +4199,25 @@ class CompareWindow:
         return (ox + (x0 + dx - vx0) * scale, oy + (y0 + dy - vy0) * scale,
                 ox + (x1 + dx - vx0) * scale, oy + (y1 + dy - vy0) * scale)
 
-    def _draw_boxes(self, offsets, clips=None):
-        """Red boxes + numbers drawn at screen size (always clearly visible);
-        a dashed red line where content is missing."""
-        if not self.result or not self.result.diffs:
-            return
-        scale = self.transform[0]
+    def _draw_boxes(self):
+        """The marks, drawn at screen size so they stay clear at any zoom and
+        never cover the content: a red outline with a gap and a white edge
+        around each difference, a bar in the margin beside the same rows,
+        and the number in the margin. Missing content: a dashed red line.
+        The selected difference, and the one under the mouse, are drawn
+        bolder - in both images, so you can see which parts belong together."""
         c = self.canvas
-        min_px = S(18)
-        badge_font = font(9, "Segoe UI", "bold")
+        c.delete("marks")
+        if not self.result or not self.result.diffs or not self.transform:
+            return
+        offsets, clips, gutters = self.drawn
+        scale, ox, oy = self.transform[:3]
+        min_px = S(16)
+        badge_font = font(8.5, "Segoe UI", "bold")
+        bw_base, bh = S(8), S(18)
+        next_free = [-1e9, -1e9]
         for n, diff in enumerate(self.result.diffs, 1):
-            sel = n == self.selected
+            strong = n in (self.selected, self.hover)
             for k, off in enumerate(offsets):
                 if off is None:
                     continue
@@ -4199,61 +4229,79 @@ class CompareWindow:
                     if bx[2] < cl[0] or bx[0] > cl[2] or bx[3] < cl[1] or bx[1] > cl[3]:
                         continue
                 sx0, sy0, sx1, sy1 = self._screen_box(diff, k, off)
-                tags = (f"diff{n}",)
+                tags = ("marks", f"diff{n}")
+                w = 4 if strong else 2
                 if marker:
                     sx1 = max(sx1, sx0 + S(40))
-                    if sel:
-                        c.create_line(sx0, sy0, sx1, sy0, fill="white", width=7)
-                    c.create_line(sx0, sy0, sx1, sy0, fill=COMPARE_HEX, width=5 if sel else 3,
-                                  dash=(6, 4), tags=tags)
-                    c.create_rectangle(sx0 - 4, sy0 - 6, sx1 + 4, sy0 + 6, outline="", fill="",
-                                       tags=tags)
-                    bx0, by0, by1 = sx0, sy0 - 4, sy0 + 4
+                    c.create_line(sx0, sy0, sx1, sy0, fill="white", width=w + 3, tags=("marks",))
+                    c.create_line(sx0, sy0, sx1, sy0, fill=COMPARE_HEX, width=w + 1, dash=(6, 4), tags=tags)
+                    c.create_rectangle(sx0 - 4, sy0 - 7, sx1 + 4, sy0 + 7, outline="", fill="", tags=tags)
+                    by0, by1 = sy0 - 3, sy0 + 3
+                    bx0 = sx0
                 else:
-                    # tiny changes still get a box you can see
-                    if sx1 - sx0 < min_px:
+                    if sx1 - sx0 < min_px:         # tiny changes still get a box you can see
                         m = (sx0 + sx1) / 2
                         sx0, sx1 = m - min_px / 2, m + min_px / 2
                     if sy1 - sy0 < min_px:
                         m = (sy0 + sy1) / 2
                         sy0, sy1 = m - min_px / 2, m + min_px / 2
-                    pad = 4
-                    bx0, by0, bx1, by1 = sx0 - pad, sy0 - pad, sx1 + pad, sy1 + pad
-                    if sel:
-                        c.create_rectangle(bx0 - 3, by0 - 3, bx1 + 3, by1 + 3, outline="white", width=3)
-                    c.create_rectangle(bx0, by0, bx1, by1, outline=COMPARE_HEX, width=5 if sel else 3,
-                                       tags=tags)
-                bw, bh = S(10) + 7 * len(str(n)), S(20)
-                if marker:                         # number to the left of the line
-                    lx, ty = bx0 - bw - 2, sy0 - bh / 2
-                    if lx < 0:
-                        lx, ty = bx0, by0 - bh
+                    gap = 5                          # keep the outline off the content
+                    bx0, by0, bx1, by1 = sx0 - gap, sy0 - gap, sx1 + gap, sy1 + gap
+                    c.create_rectangle(bx0, by0, bx1, by1, outline="white", width=w + 3, tags=("marks",))
+                    c.create_rectangle(bx0, by0, bx1, by1, outline=COMPARE_HEX, width=w, tags=tags)
+                # number + bar in the margin, or (no margin / too narrow) just above the box
+                bw = bw_base + 7 * len(str(n))
+                gut = gutters[k] if gutters and gutters[k] else None
+                if gut:
+                    gx0, gx1 = ox + gut[0] * scale, ox + gut[1] * scale
                 else:
-                    lx, ty = bx0 - (3 if sel else 1), (by0 - bh if by0 - bh > 0 else by1)
+                    gx0 = gx1 = None
+                if gut and gx1 - gx0 >= bw + 8:
+                    c.create_rectangle(gx1 - (7 if strong else 5), by0, gx1 - 2, max(by1, by0 + 6),
+                                       fill=COMPARE_HEX, outline="", tags=tags)
+                    lx = gx0 + max(1, (gx1 - gx0 - 8 - bw) / 2)
+                    ty = max(by0, next_free[k])
+                    next_free[k] = ty + bh + 2
+                elif marker:
+                    lx, ty = bx0 - bw - 4, sy0 - bh / 2
+                    if lx < 0:
+                        lx, ty = bx0, by0 - bh - 2
+                else:
+                    lx, ty = bx0, (by0 - bh - 1 if by0 - bh - 1 > 0 else by1 + 1)
                 c.create_rectangle(lx, ty, lx + bw, ty + bh, fill=COMPARE_HEX,
-                                   outline="white" if sel else COMPARE_HEX, tags=tags)
-                c.create_text(lx + bw / 2, ty + bh / 2, text=str(n), fill="white", font=badge_font,
-                              tags=tags)
+                                   outline="white" if strong else COMPARE_HEX, width=2 if strong else 1, tags=tags)
+                c.create_text(lx + bw / 2, ty + bh / 2, text=str(n), fill="white", font=badge_font, tags=tags)
 
-    def _canvas_click(self, event):
-        """Click a red box to select (and zoom to) that difference."""
+    def _diff_at(self, x, y):
+        """Number of the difference at canvas point (x, y), or None."""
         if not self.result or not self.result.diffs or not self.transform:
-            return
-        x, y = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
+            return None
         for item in reversed(self.canvas.find_overlapping(x - 3, y - 3, x + 3, y + 3)):
             for tag in self.canvas.gettags(item):
                 if tag.startswith("diff"):
-                    self.select(int(tag[4:]), zoom=True)
-                    return
-        # otherwise: inside a box?
+                    return int(tag[4:])
         for n, diff in enumerate(self.result.diffs, 1):
             for k, off in enumerate(self.drawn_offsets):
                 if off is None:
                     continue
                 sx0, sy0, sx1, sy1 = self._screen_box(diff, k, off)
                 if sx0 - 8 <= x <= sx1 + 8 and sy0 - 8 <= y <= sy1 + 8:
-                    self.select(n, zoom=True)
-                    return
+                    return n
+        return None
+
+    def _canvas_motion(self, event):
+        """Pointing at a difference outlines it boldly in both images."""
+        n = self._diff_at(self.canvas.canvasx(event.x), self.canvas.canvasy(event.y))
+        if n != self.hover:
+            self.hover = n
+            self.canvas.configure(cursor="hand2" if n else "")
+            self._draw_boxes()
+
+    def _canvas_click(self, event):
+        """Click a difference to select (and zoom to) it."""
+        n = self._diff_at(self.canvas.canvasx(event.x), self.canvas.canvasy(event.y))
+        if n:
+            self.select(n, zoom=True)
 
     def _canvas_wheel(self, event):
         if self.scroll.winfo_ismapped():
@@ -4266,8 +4314,8 @@ class CompareWindow:
         current = self.bases.get(self.view_var.get())
         if current is None:
             return None
-        base, offsets = current
-        return draw_difference_boxes(base, self.result.diffs, offsets, self.selected)
+        base, offsets, gutters = current
+        return draw_difference_boxes(base, self.result.diffs, offsets, gutters, self.selected)
 
     def copy_result(self):
         img = self.result_image()
