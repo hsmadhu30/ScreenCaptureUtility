@@ -11,10 +11,5 @@ winrt-Windows.Globalization; sys_platform == "win32"
 winrt-Windows.Graphics.Imaging; sys_platform == "win32"
 winrt-Windows.Media.Ocr; sys_platform == "win32"
 winrt-Windows.Storage.Streams; sys_platform == "win32"
-pyobjc-core
-pyobjc-framework-Cocoa
-pyobjc-framework-Quartz
-pyobjc-framework-Vision
-pyobjc-framework-ApplicationServices
 pyinstaller
 

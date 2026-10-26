@@ -1,0 +1,11 @@
+pillow
+python-docx
+openpyxl
+python-pptx
+imageio-ffmpeg
+pyobjc-core
+pyobjc-framework-Cocoa
+pyobjc-framework-Quartz
+pyobjc-framework-Vision
+pyobjc-framework-ApplicationServices
+pyinstaller
