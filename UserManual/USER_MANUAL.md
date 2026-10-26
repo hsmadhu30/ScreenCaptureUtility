@@ -33,7 +33,7 @@ A Windows desktop tool for taking screenshots (whole screen, a region, or a full
 
 | | |
 |---|---|
-| **Operating system** | Windows 10 or Windows 11 |
+| **Operating system** | Windows 10 or Windows 11, or macOS 11 or later (Mac version, see below) |
 | **Python** (only when running from source) | Python 3.10 or newer |
 | **For text extraction** | At least one language installed in Windows (normally already there) |
 | **For hiding the recording controls from videos** | Windows 10 version 2004 or newer |
@@ -50,6 +50,8 @@ The Python packages the app needs are listed in `requirements.txt`:
 | `PyAudioWPatch` | Recording the microphone and the computer's sound |
 | `winrt-*` packages | Windows' built-in OCR for **Extract Text** |
 | `pyinstaller` | Building the `.exe` (only needed for `build.bat`) |
+
+**Mac version.** The same `main.py` also runs on macOS. It is built on a Mac into `Screen Capture Utility.app` with `build_mac.sh`, and uses the Mac's own tools: screenshots, Apple's text recognition and screen recording. Everything works as on Windows except recording the computer's own sound, and Capture Screen takes the main display only. Shortcuts use **Cmd** instead of Ctrl. Building, permissions and signing are explained in `MAC_README.md`. The utility doesn't run on iPad: iPadOS doesn't let apps capture other apps' screens.
 
 ---
 
@@ -99,7 +101,7 @@ The window opens in the middle of the screen you're working on, and is made up o
 |---|---|
 | **Save location** <span style="color:#E5484D">\*</span> *(required)* | The folder where screenshots, recordings and text files are saved. The red asterisk means you must choose one before capturing or recording. |
 | **Document** *(optional)* | A Word `.docx`, Excel `.xlsx` or PowerPoint `.pptx` file that screenshots are added to automatically |
-| **Screenshot & text** | Capture Screen, Capture Region, Full Page, Extract Text, Compare Images, and the blur option |
+| **Screenshot & text** | Capture Screen, Capture Region, Full Page, Extract Text and Compare Images |
 | **Screen recording** | Record the whole screen or a region, with sound |
 | **Status bar** (bottom) | What just happened |
 
@@ -217,45 +219,57 @@ In the Extracted Text window:
 | **Copy text** | Copy the (edited) text again |
 | **Save as .txt** | Save the text to a file |
 | **Language** | Re-read the text in another installed Windows language |
+| **Keep layout** | On (default): indentation, table columns and spacing are kept as on screen, shown in a fixed-width font so columns line up — best for code, logs, tables and forms. Off: plain flowing text — best for paragraphs you'll paste into an email or a document. Switching re-formats the text instantly, without reading it again. |
 | **Open image...** | Read text from an image file, such as a screenshot you saved earlier |
 
-Small selections are enlarged automatically before reading, which improves accuracy, and paragraph breaks are kept.
+**How the text is kept accurate:**
+
+- **Symbols:** the selection is enlarged so each line of text is about 40 pixels tall and sharpened slightly before reading. Small screen text is what makes symbols such as `_ # @ { } [ ] < > & % $ € £` come out wrong, so they are read far more reliably.
+- **Dark mode:** light text on a dark background (dark themes, dark title bars and headers) is turned into dark-on-light first, band by band, so a dark header above a light page is read as well as the page.
+- **Layout:** the text is rebuilt from the position of each word: lines of code keep their indentation, table cells stay on the same row in aligned columns, bullet points come out as `•`, and a clear gap between paragraphs becomes a blank line.
+- **Typographic look-alikes:** curly quotes become the plain `"` and `'` that code, URLs and data use; ligatures (ﬁ, ﬂ) become separate letters; unusual hyphens and spaces become plain ones.
+- **Symbols checked against the image:** after reading, each line is checked against the picture itself for the marks OCR engines most often get wrong. Bullets (`•` `◦` `▪`), asterisks (`*`, `**`) and quote marks (`"` `'`) that were left out are put back in place. A mark read as a letter is corrected, such as `*` read as `x`, `"` read as `''`, or a bullet read as `e` or `o`.
+- **Zero and the letter O:** a 0 read as O inside a number is corrected (`1O.5O` → `10.50`, `$2,OOO` → `$2,000`, `Ox00FF` → `0x00FF`, `(O%)` → `(0%)`), and so is a 0 inside a word (`C0NTACT` → `CONTACT`). A lone 0 or O is judged by its shape, because the digit is narrower than the letter. IDs such as `O-1001` keep their letter.
+
+Tips: select only the text you need, at 100% zoom or larger. Very small text (below about 10 px), thin symbols such as `·`, and a lone O or 0 in a fixed-width font (where both are the same width) can still be misread. Check them before using the text.
 
 
 ### Compare Images
 
 *Shortcut: **Ctrl+Shift+C***
 
-Find what changed between two screenshots, such as a screen before and after an update, two versions of a report, or a test run against the expected screen. Every difference is **highlighted in red**: changed text, recoloured or moved graphics, and added or removed items.
+Check one screenshot against another, such as a screen after an update against the screen before it, a new version of a report against the approved one, or a test run against the expected screen. **Image 1 is the source** (the reference); **Image 2 is checked against it**. Every difference is **highlighted in red in both images**: changed text, recoloured or moved graphics, content that is missing from Image 2, and content that was added.
 
 ![Compare Images window](docs/images/compare-window.png)
 
 1. Click **Compare Images**.
-2. Fill the **Image 1** and **Image 2** slots. Each slot has four ways to load an image:
+2. Fill the **Image 1 (source)** and **Image 2** slots. Each slot has four ways to load an image:
    - **Open...** an image file (PNG, JPG, BMP, GIF, TIFF, WebP).
    - **Capture region**: drag over part of the screen. The Compare window hides while you drag; press **Esc** to cancel.
    - **Full screen**: capture the whole screen.
    - **Paste** an image you copied, for example with the Review window's **Copy**, or a file copied in File Explorer.
+
+   Put the image you trust in **Image 1**. If you loaded them the wrong way round, click **Swap images**.
 3. Click **Compare**, or press **Enter**.
 
-**The result:**
-- **Spotlight:** everything that did *not* change is faded out, so the changed areas stand out in their true colours.
-- **Numbered red boxes** mark each difference. They stay thick and clear even when a large screenshot is shrunk to fit, and even a one-character change gets a box you can see.
-- The line above the result says how many differences were found and how much of the image changed. If nothing changed, it says **"No differences found - the images match."**
+**The result** shows the two images side by side, Image 1 on the left:
+- Both images are shown **exactly as they are**. Nothing is painted over the content, so every word stays readable.
+- Each difference gets a **red outline** with a small gap around it, so the line never touches the text. A thin white edge keeps it visible on dark backgrounds too.
+- A **red bar in the margin** beside each image marks the same rows, and the difference's **number** sits in that margin, the same number in both images. The marks stay clear even when a large screenshot is shrunk to fit, and even a one-character change gets an outline you can see.
+- **Point at a difference** with the mouse and it is drawn bolder in **both** images, so you can see straight away which part of Image 2 matches which part of Image 1.
+- When something is **missing from Image 2**, its box is in Image 1, and a **dashed red line** in Image 2 shows the spot where it should be. Content **added in Image 2** works the other way round: the box is in Image 2 and the dashed line in Image 1.
+- **Lines are matched up.** If a line of text or a row of a form was removed or added, the lines below it have moved up or down. The comparison matches each line with its counterpart, so only the removed or added line is reported, not everything below it. The summary then says "lines matched up".
+- The line above the result counts the differences by kind, for example "3 differences: 1 changed, 1 missing in Image 2, 1 added in Image 2". If nothing changed, it says **"No differences - Image 2 matches Image 1."**
 
-**The Differences list** (right side) shows every difference as a **zoomed-in close-up of Image 1 next to Image 2**, so you can see exactly what changed. Each one is labelled:
-- **Changed:** something is different in both images, such as edited text, a new colour, or a moved item.
-- **Only in Image 2:** it was added.
-- **Only in Image 1:** it was removed.
+**The Differences list** (right side) shows every difference as a **close-up of Image 1 next to Image 2**, so you can see exactly what changed. Each one is labelled:
+- **Changed:** both images have something here, but it's different (edited text, a new colour, a moved item).
+- **Missing in Image 2:** it's in Image 1 but not in Image 2.
+- **Added in Image 2:** it's in Image 2 but not in Image 1.
 
 **Looking closer:**
-- **Click a difference** in the list, or click its box in the picture, to **zoom in** on it. **Previous** / **Next** (or the **Up** / **Down** arrow keys) step through them one by one.
+- **Click a difference** in the list, or click its box or dashed line in the picture, to **zoom in** on it. **Previous** / **Next** (or the arrow keys) step through them one by one.
 - **Show all**, **Esc** or double-clicking the picture zooms back out.
-- **Views:**
-  - **Image 1** shows what was there before each change; **Image 2** shows what is there now.
-  - **Side by side** shows both images. While zoomed, it shows the same close-up of each.
-  - **Blink** flips between the two images about every half second, so changes catch your eye as flicker.
-- **Fade unchanged areas** *(on)* can be turned off to see the images at full strength, still with the boxes.
+- **Views:** **Side by side** *(default)* shows both images; while zoomed, it shows a close-up of the same spot in each. **Image 1** or **Image 2** shows just one image, bigger.
 
 **Options:**
 
@@ -266,8 +280,9 @@ Find what changed between two screenshots, such as a screen before and after an 
 | **Swap images** | Exchange Image 1 and Image 2. |
 
 **Images of different sizes:**
-- If one image is just a zoomed copy of the other (same shape, different size), it is resized to match.
-- Otherwise, anything that exists in only one image is marked as a difference.
+- If Image 2 is just a zoomed copy of Image 1 (same shape, different size), it is resized to match Image 1.
+- If one is longer (for example, a page where lines were added or removed), the lines are matched up as described above.
+- Otherwise, anything that exists in only one image is marked as missing in, or added in, Image 2.
 
 **Keep or share the result:**
 - **Copy result** (or **Ctrl+C**) puts the current view, with its numbered boxes, on the clipboard, ready to paste into Teams, Outlook or Word.
@@ -278,35 +293,29 @@ Find what changed between two screenshots, such as a screen before and after an 
 
 ## 7. Blur sensitive information
 
-Hide passwords, account numbers, names and other sensitive details before a screenshot is saved.
+Hide passwords, account numbers, names and other sensitive details before a screenshot is saved. Blurring is done in the [Review window](#8-review-window-annotate-copy-save), which opens after every capture.
 
-**Blur every screenshot before saving:**
-1. Turn on **Review & blur before saving**, in the Screenshot & text section.
-2. Take a screenshot. The **Blur sensitive information** window opens.
-3. **Drag a box** over each thing you want to hide. It is blurred immediately.
-4. Click **Save**. The blurred screenshot then opens in the [Review window](#8-review-window-annotate-copy-save).
+1. Take a screenshot. It opens in the Review window.
+2. Click **Blur**, or press **B**.
+3. Choose a **Strength** from the five dots, from light to strongest. The middle one is the default.
+4. **Drag a box** over each thing you want to hide. It is blurred as soon as you let go.
+5. Carry on annotating if you like, then click **Copy** or **Save**.
 
-![Blur window](docs/images/blur-window.png)
+![Blurring in the Review window](docs/images/blur-window.png)
 
-| Control | What it does |
-|---|---|
-| **Blur strength** (4–40) | How strong the blur is; it applies to all boxes |
-| **Undo** / **Ctrl+Z** | Remove the last box |
-| **Clear all** | Remove all boxes |
-| **Save** / **Enter** | Save the screenshot |
-| **Cancel** / **Esc** | Discard the screenshot (asks first if you blurred something) |
+**Good to know:**
+- The blur changes the **screenshot itself**. Pen, highlighter, shapes and text notes you draw stay sharp on top of it.
+- The **Eraser** can't undo a blur. Use **Undo** (Ctrl+Z) or **Clear all**.
+- Each box can have its own strength. Change the strength between boxes.
+- **Crop** keeps the blur, and **Copy**, **Save** and **Save to Word / Excel / PowerPoint** always include it.
 
-The dashed outlines only show you what's blurred. They are **not** saved in the image.
-
-**Blur an existing image:** click **Blur an image...**, pick a file, blur it, and save. A copy named `<name>_blurred.png` is created, and the original isn't changed.
-
-> **Tip:** For very sensitive data, make the box a little bigger than the text and use a strength of 20 or more. Light blur on large text can sometimes still be guessed.
+> **Tip:** For very sensitive data, make the box a little bigger than the text and use one of the two strongest settings. Light blur on large text can sometimes still be guessed.
 
 ---
 
 ## 8. Review window: annotate, copy, save
 
-After **every** capture (Capture Screen, Capture Region and Full Page), the screenshot opens in the **Review & annotate** window. Nothing is saved until you choose to. If **Review & blur before saving** is on, the Blur window comes first.
+After **every** capture (Capture Screen, Capture Region and Full Page), the screenshot opens in the **Review & annotate** window. Nothing is saved until you choose to.
 
 ![Review window](docs/images/review-window.png)
 
@@ -331,6 +340,7 @@ Annotating is optional; you can just click Copy or Save straight away.
 | **Eraser** | X | Drag over pen or highlighter marks to rub them out, fully or partly. Rectangles, lines, text notes and the screenshot itself are never erased. |
 | **Rectangle** | R | Drag to draw a box |
 | **Line** | L | Drag from one end to the other to draw a straight line. Pick the thickness from the five sizes. |
+| **Blur** | B | Drag a box over sensitive information to blur it. Pick the **Strength** from the five dots. See [Blur sensitive information](#7-blur-sensitive-information). |
 | **Text** | T | Click where the note should go and type. **Enter** finishes it, **Shift+Enter** starts a new line, and **Esc** removes the note you're typing. Clicking elsewhere on the screenshot also finishes it. |
 | **Crop** | C | Drag over the part you want to keep. The rest is dimmed and the selection size is shown. Click **Apply crop** (or press **Enter**) to cut the screenshot down to it. Drag again to change the selection, or click **Clear selection** (or press **Esc**). |
 
@@ -360,7 +370,7 @@ Annotating is optional; you can just click Copy or Save straight away.
 **Quick recipes:**
 - **Share in Teams or email without saving:** capture, then **Copy**, then **Cancel**. Paste it into the chat or email with **Ctrl+V**.
 - **Save and share:** capture, then **Copy**, then **Save**.
-- **Blur and annotate:** turn on **Review & blur before saving**. Each screenshot goes Blur window, then Review window, then Save.
+- **Hide something, then share:** capture, then **Blur** (B) over it, then **Copy** or **Save**.
 
 ---
 
@@ -418,15 +428,15 @@ These work while the Screen Capture Utility window is active.
 | **Ctrl+Shift+P** | Pause / resume recording |
 | **Esc** | Cancel a selection, or stop a Full Page capture (saves what was captured) |
 
-In the **Blur** and **Review** windows:
+In the **Review** window:
 
 | Shortcut | Action |
 |---|---|
-| **Ctrl+C** | Copy the screenshot to the clipboard (Review window) |
+| **Ctrl+C** | Copy the screenshot to the clipboard |
 | **Ctrl+Z** | Undo |
-| **Enter** | Save (in the Review window, applies the crop instead while a crop area is selected) |
-| **Esc** | Cancel (in the Review window, clears the crop selection instead while one is selected) |
-| **H / P / X / R / L / T / C** | Review window tools: Highlighter / Pen / Eraser / Rectangle / Line / Text / Crop |
+| **Enter** | Save (applies the crop instead while a crop area is selected) |
+| **Esc** | Cancel (clears the crop selection instead while one is selected) |
+| **H / P / X / R / L / T / B / C** | Tools: Highlighter / Pen / Eraser / Rectangle / Line / Text / Blur / Crop |
 | **Shift** (while drawing) | Perfect square, or a straight horizontal / vertical / 45° line |
 
 ---
@@ -440,7 +450,6 @@ Files are saved in the **Save location** folder. If two files would get the same
 | Screenshot | `Screenshot_YYYY-MM-DD_HH-MM-SS.png` |
 | Recording | `Recording_YYYY-MM-DD_HH-MM-SS.mp4` |
 | Extracted text | `Text_YYYY-MM-DD_HH-MM-SS.txt` (you can rename it when saving) |
-| Blurred copy of an image | `<original name>_blurred.png` |
 
 ---
 
@@ -485,4 +494,8 @@ That single `.exe` contains everything, including ffmpeg, the Word, Excel and Po
 
 ---
 
-*Browser edition:* `ScreenCaptureUtility.html` is a separate, no-install version that runs in Edge or Chrome. Double-click it to open it. It has the same Review window as this app (Highlighter, Pen, Eraser, Rectangle, Line, Text, Crop, Copy / Save / Cancel, Minimize / Maximize). The differences: there is no Full Page capture (use the browser's own full-page screenshot, then **Annotate an image...**); if no folder is chosen, files go to your Downloads folder; and recordings are saved as `.webm` or `.mp4`, depending on the browser.
+*Browser edition:* `ScreenCaptureUtility.html` is a separate, no-install version that runs in Edge or Chrome. Double-click it to open it. It has the same Review window (Highlighter, Pen, Eraser, Rectangle, Line, Text, Blur, Crop, Copy / Save / Cancel, Minimize / Maximize), saves into **Word, Excel or PowerPoint** files the same way, and has **Compare Images** (shortcut **C**) with the same source-vs-Image 2 comparison, red outlines and margin numbers in both images, Differences list and zoom. The differences:
+- There is no Full Page capture. Use the browser's own full-page screenshot, then **Annotate an image...**. Click **Tips** on the page to see how.
+- If no folder is chosen, files go to your Downloads folder.
+- Recordings are saved as `.webm` or `.mp4`, depending on the browser.
+- **Extract Text** uses Tesseract, downloaded once from the internet (about 10–15 MB), instead of Windows OCR. It has the same **Keep layout** switch and the same accuracy steps (enlarging, dark-mode handling, layout rebuilt from word positions).

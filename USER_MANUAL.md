@@ -33,7 +33,7 @@ A Windows desktop tool for taking screenshots (whole screen, a region, or a full
 
 | | |
 |---|---|
-| **Operating system** | Windows 10 or Windows 11 |
+| **Operating system** | Windows 10 or Windows 11, or macOS 11 or later (Mac version, see below) |
 | **Python** (only when running from source) | Python 3.10 or newer |
 | **For text extraction** | At least one language installed in Windows (normally already there) |
 | **For hiding the recording controls from videos** | Windows 10 version 2004 or newer |
@@ -50,6 +50,8 @@ The Python packages the app needs are listed in `requirements.txt`:
 | `PyAudioWPatch` | Recording the microphone and the computer's sound |
 | `winrt-*` packages | Windows' built-in OCR for **Extract Text** |
 | `pyinstaller` | Building the `.exe` (only needed for `build.bat`) |
+
+**Mac version.** The same `main.py` also runs on macOS. It is built on a Mac into `Screen Capture Utility.app` with `build_mac.sh`, and uses the Mac's own tools: screenshots, Apple's text recognition and screen recording. Everything works as on Windows except recording the computer's own sound, and Capture Screen takes the main display only. Shortcuts use **Cmd** instead of Ctrl. Building, permissions and signing are explained in `MAC_README.md`. The utility doesn't run on iPad: iPadOS doesn't let apps capture other apps' screens.
 
 ---
 
@@ -217,9 +219,19 @@ In the Extracted Text window:
 | **Copy text** | Copy the (edited) text again |
 | **Save as .txt** | Save the text to a file |
 | **Language** | Re-read the text in another installed Windows language |
+| **Keep layout** | On (default): indentation, table columns and spacing are kept as on screen, shown in a fixed-width font so columns line up — best for code, logs, tables and forms. Off: plain flowing text — best for paragraphs you'll paste into an email or a document. Switching re-formats the text instantly, without reading it again. |
 | **Open image...** | Read text from an image file, such as a screenshot you saved earlier |
 
-Small selections are enlarged automatically before reading, which improves accuracy, and paragraph breaks are kept.
+**How the text is kept accurate:**
+
+- **Symbols:** the selection is enlarged so each line of text is about 40 pixels tall and sharpened slightly before reading. Small screen text is what makes symbols such as `_ # @ { } [ ] < > & % $ € £` come out wrong, so they are read far more reliably.
+- **Dark mode:** light text on a dark background (dark themes, dark title bars and headers) is turned into dark-on-light first, band by band, so a dark header above a light page is read as well as the page.
+- **Layout:** the text is rebuilt from the position of each word: lines of code keep their indentation, table cells stay on the same row in aligned columns, bullet points come out as `•`, and a clear gap between paragraphs becomes a blank line.
+- **Typographic look-alikes:** curly quotes become the plain `"` and `'` that code, URLs and data use; ligatures (ﬁ, ﬂ) become separate letters; unusual hyphens and spaces become plain ones.
+- **Symbols checked against the image:** after reading, each line is checked against the picture itself for the marks OCR engines most often get wrong. Bullets (`•` `◦` `▪`), asterisks (`*`, `**`) and quote marks (`"` `'`) that were left out are put back in place. A mark read as a letter is corrected, such as `*` read as `x`, `"` read as `''`, or a bullet read as `e` or `o`.
+- **Zero and the letter O:** a 0 read as O inside a number is corrected (`1O.5O` → `10.50`, `$2,OOO` → `$2,000`, `Ox00FF` → `0x00FF`, `(O%)` → `(0%)`), and so is a 0 inside a word (`C0NTACT` → `CONTACT`). A lone 0 or O is judged by its shape, because the digit is narrower than the letter. IDs such as `O-1001` keep their letter.
+
+Tips: select only the text you need, at 100% zoom or larger. Very small text (below about 10 px), thin symbols such as `·`, and a lone O or 0 in a fixed-width font (where both are the same width) can still be misread. Check them before using the text.
 
 
 ### Compare Images
@@ -241,8 +253,10 @@ Check one screenshot against another, such as a screen after an update against t
 3. Click **Compare**, or press **Enter**.
 
 **The result** shows the two images side by side, Image 1 on the left:
-- The **differing pixels are tinted red**, like a highlighter, in each image. In Image 1 you see what was there; in Image 2 you see what is there now.
-- **Numbered red boxes** mark each difference in both images, with the same number in each. They stay thick and clear even when a large screenshot is shrunk to fit, and even a one-character change gets a box you can see.
+- Both images are shown **exactly as they are**. Nothing is painted over the content, so every word stays readable.
+- Each difference gets a **red outline** with a small gap around it, so the line never touches the text. A thin white edge keeps it visible on dark backgrounds too.
+- A **red bar in the margin** beside each image marks the same rows, and the difference's **number** sits in that margin, the same number in both images. The marks stay clear even when a large screenshot is shrunk to fit, and even a one-character change gets an outline you can see.
+- **Point at a difference** with the mouse and it is drawn bolder in **both** images, so you can see straight away which part of Image 2 matches which part of Image 1.
 - When something is **missing from Image 2**, its box is in Image 1, and a **dashed red line** in Image 2 shows the spot where it should be. Content **added in Image 2** works the other way round: the box is in Image 2 and the dashed line in Image 1.
 - **Lines are matched up.** If a line of text or a row of a form was removed or added, the lines below it have moved up or down. The comparison matches each line with its counterpart, so only the removed or added line is reported, not everything below it. The summary then says "lines matched up".
 - The line above the result counts the differences by kind, for example "3 differences: 1 changed, 1 missing in Image 2, 1 added in Image 2". If nothing changed, it says **"No differences - Image 2 matches Image 1."**
@@ -480,7 +494,8 @@ That single `.exe` contains everything, including ffmpeg, the Word, Excel and Po
 
 ---
 
-*Browser edition:* `ScreenCaptureUtility.html` is a separate, no-install version that runs in Edge or Chrome. Double-click it to open it. It has the same Review window (Highlighter, Pen, Eraser, Rectangle, Line, Text, Blur, Crop, Copy / Save / Cancel, Minimize / Maximize), saves into **Word, Excel or PowerPoint** files the same way, and has **Compare Images** (shortcut **C**) with the same source-vs-Image 2 comparison, red highlighting in both images, Differences list and zoom. The differences:
-- There is no Full Page capture. Use the browser's own full-page screenshot, then **Annotate an image...**.
+*Browser edition:* `ScreenCaptureUtility.html` is a separate, no-install version that runs in Edge or Chrome. Double-click it to open it. It has the same Review window (Highlighter, Pen, Eraser, Rectangle, Line, Text, Blur, Crop, Copy / Save / Cancel, Minimize / Maximize), saves into **Word, Excel or PowerPoint** files the same way, and has **Compare Images** (shortcut **C**) with the same source-vs-Image 2 comparison, red outlines and margin numbers in both images, Differences list and zoom. The differences:
+- There is no Full Page capture. Use the browser's own full-page screenshot, then **Annotate an image...**. Click **Tips** on the page to see how.
 - If no folder is chosen, files go to your Downloads folder.
 - Recordings are saved as `.webm` or `.mp4`, depending on the browser.
+- **Extract Text** uses Tesseract, downloaded once from the internet (about 10–15 MB), instead of Windows OCR. It has the same **Keep layout** switch and the same accuracy steps (enlarging, dark-mode handling, layout rebuilt from word positions).
