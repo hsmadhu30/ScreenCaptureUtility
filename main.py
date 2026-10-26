@@ -6,6 +6,7 @@ from pathlib import Path
 from dataclasses import dataclass
 from io import BytesIO
 import threading
+import re
 import math
 import time
 import ctypes
@@ -17,6 +18,9 @@ import importlib.util
 import wave
 import asyncio
 import concurrent.futures
+import tempfile
+import signal
+from types import SimpleNamespace
 
 
 # ============================================================
@@ -65,6 +69,432 @@ docx = ensure_package("docx", "python-docx")
 openpyxl = ensure_package("openpyxl", "openpyxl")
 pptx = ensure_package("pptx", "python-pptx")
 
+
+# ============================================================
+# Platform (Windows and macOS)
+# ============================================================
+# The same file runs on Windows and on macOS. The Windows-only parts
+# (Win32 calls, Windows OCR, WASAPI audio) have macOS counterparts:
+#   screenshots      -> the built-in `screencapture` command
+#   clipboard image  -> NSPasteboard (pyobjc), AppleScript as a fallback
+#   text extraction  -> Apple's Vision framework (pyobjc)
+#   Full Page        -> Quartz scroll-wheel events + Esc key state (pyobjc)
+#   recording        -> `screencapture -v` (+ microphone), joined into an
+#                       .mp4 by ffmpeg
+# macOS asks the user once to allow Screen Recording (all captures) and
+# Accessibility (Full Page scrolling) in System Settings.
+
+IS_WINDOWS = sys.platform == "win32"
+IS_MAC = sys.platform == "darwin"
+KEY = "Cmd" if IS_MAC else "Ctrl"          # the shortcut key named in the window
+
+
+def _mac_tool(name, folder):
+    """Full path of a built-in macOS tool (apps opened from Finder get a
+    minimal PATH)."""
+    path = os.path.join(folder, name)
+    return path if os.path.exists(path) else name
+
+
+SCREENCAPTURE = _mac_tool("screencapture", "/usr/sbin")
+OSASCRIPT = _mac_tool("osascript", "/usr/bin")
+
+MAC_PACKAGES = [("objc", "pyobjc-core"),
+                ("AppKit", "pyobjc-framework-Cocoa"),
+                ("Quartz", "pyobjc-framework-Quartz"),
+                ("Vision", "pyobjc-framework-Vision"),
+                ("ApplicationServices", "pyobjc-framework-ApplicationServices")]
+mac = {}
+if IS_MAC:
+    for _module, _pip_name in MAC_PACKAGES:
+        mac[_module] = ensure_package(_module, _pip_name)
+
+
+def mac_screen_capture_allowed(ask=False):
+    """macOS 10.15+: has the user allowed Screen Recording for this app?
+    ask=True shows the system prompt (macOS shows it only once)."""
+    quartz = mac.get("Quartz")
+    try:
+        if quartz is None or quartz.CGPreflightScreenCaptureAccess():
+            return True
+        if ask:
+            quartz.CGRequestScreenCaptureAccess()
+        return False
+    except Exception:
+        return True                              # older macOS: no such check
+
+
+def mac_accessibility_allowed(ask=False):
+    """Needed to send scroll-wheel events (Full Page)."""
+    services = mac.get("ApplicationServices")
+    try:
+        if services is None:
+            return False
+        if ask:
+            return bool(services.AXIsProcessTrustedWithOptions(
+                {services.kAXTrustedCheckOptionPrompt: True}))
+        return bool(services.AXIsProcessTrusted())
+    except Exception:
+        return False
+
+
+def mac_grab(bbox=None):
+    """Screenshot with macOS's own `screencapture`. bbox in screen points;
+    on a Retina display the image has the full pixel resolution."""
+    fd, path = tempfile.mkstemp(suffix=".png")
+    os.close(fd)
+    try:
+        command = [SCREENCAPTURE, "-x"]                # -x: no camera sound
+        if bbox:
+            left, top, right, bottom = (int(round(v)) for v in bbox)
+            command += ["-R", f"{left},{top},{max(1, right - left)},{max(1, bottom - top)}"]
+        else:
+            command += ["-m"]                          # the main display
+        subprocess.run(command + [path], check=True, timeout=30, capture_output=True)
+        with Image.open(path) as image:
+            image.load()
+            return image.convert("RGB")
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def grab_screen(bbox=None):
+    """Screenshot of bbox=(left, top, right, bottom) in screen coordinates,
+    or of the whole screen (all monitors on Windows, the main display on a Mac)."""
+    if IS_MAC:
+        return mac_grab(bbox)
+    return ImageGrab.grab(bbox=bbox, all_screens=True)
+
+
+def mac_copy_image(image):
+    """Put an image on the macOS clipboard (PNG + TIFF). True on success."""
+    rgb = image.convert("RGB")
+    png = BytesIO()
+    rgb.save(png, format="PNG")
+    data = png.getvalue()
+    appkit = mac.get("AppKit")
+    if appkit is not None:
+        try:
+            import Foundation
+            tiff = BytesIO()
+            rgb.save(tiff, format="TIFF")
+            board = appkit.NSPasteboard.generalPasteboard()
+            board.clearContents()
+            ok = board.setData_forType_(Foundation.NSData.dataWithBytes_length_(data, len(data)),
+                                        appkit.NSPasteboardTypePNG)
+            board.setData_forType_(Foundation.NSData.dataWithBytes_length_(
+                tiff.getvalue(), len(tiff.getvalue())), appkit.NSPasteboardTypeTIFF)
+            if ok:
+                return True
+        except Exception as e:
+            print(f"Clipboard (AppKit) failed: {e}")
+    # Fallback without pyobjc: AppleScript reads the PNG file
+    fd, path = tempfile.mkstemp(suffix=".png")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        script = f'set the clipboard to (read (POSIX file "{path}") as «class PNGf»)'
+        return subprocess.run([OSASCRIPT, "-e", script], capture_output=True).returncode == 0
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def mac_work_area():
+    """(left, top, width, height) of the usable part (without menu bar and
+    Dock) of the screen that has the focus, in top-left screen points."""
+    appkit = mac["AppKit"]
+    screen = appkit.NSScreen.mainScreen()
+    visible = screen.visibleFrame()
+    primary_height = appkit.NSScreen.screens()[0].frame().size.height
+    top = primary_height - (visible.origin.y + visible.size.height)
+    return (int(visible.origin.x), int(top), int(visible.size.width), int(visible.size.height))
+
+
+def mac_set_windows_shared(shared):
+    """Show/hide this app's windows in screen recordings (macOS)."""
+    appkit = mac["AppKit"]
+    for window in appkit.NSApplication.sharedApplication().windows():
+        window.setSharingType_(1 if shared else 0)     # ReadOnly / None
+    return True
+
+
+def mac_scroll(x, y, notches, move_pointer):
+    """Turn the scroll wheel at screen point (x, y). Positive = down."""
+    quartz = mac["Quartz"]
+    if move_pointer:
+        quartz.CGWarpMouseCursorPosition((x, y))
+    lines = int(round(-3 * notches))
+    while lines:
+        step = max(-30, min(30, lines))
+        lines -= step
+        event = quartz.CGEventCreateScrollWheelEvent(None, quartz.kCGScrollEventUnitLine, 1, step)
+        quartz.CGEventSetLocation(event, (x, y))
+        quartz.CGEventPost(quartz.kCGHIDEventTap, event)
+
+
+def mac_pointer():
+    quartz = mac["Quartz"]
+    point = quartz.CGEventGetLocation(quartz.CGEventCreate(None))
+    return (point.x, point.y)
+
+
+def mac_escape_down():
+    quartz = mac["Quartz"]
+    return bool(quartz.CGEventSourceKeyState(quartz.kCGEventSourceStateCombinedSessionState, 53))
+
+
+def run_mac_ocr(image, language_tag=None):
+    """Runs on the OCR thread: Apple's Vision text recognition, on the Mac.
+    Returns the same dict as run_windows_ocr."""
+    import objc
+    import Vision
+    import Foundation
+
+    def language_name(tag):
+        try:
+            name = Foundation.NSLocale.currentLocale().localizedStringForLanguageCode_(tag)
+            return str(name) if name else tag
+        except Exception:
+            return tag
+
+    with objc.autorelease_pool():
+        prepared = _prepare_for_ocr(image, 4096).convert("RGB")
+        buffer = BytesIO()
+        prepared.save(buffer, format="PNG")
+        data = buffer.getvalue()
+
+        request = Vision.VNRecognizeTextRequest.alloc().init()
+        request.setRecognitionLevel_(Vision.VNRequestTextRecognitionLevelAccurate)
+        request.setUsesLanguageCorrection_(True)
+        try:
+            supported, _error = request.supportedRecognitionLanguagesAndReturnError_(None)
+            supported = [str(t) for t in (supported or [])]
+        except Exception:
+            supported = []
+        if language_tag:
+            request.setRecognitionLanguages_([language_tag])
+        elif hasattr(request, "setAutomaticallyDetectsLanguage_"):
+            request.setAutomaticallyDetectsLanguage_(True)       # macOS 13+
+
+        handler = Vision.VNImageRequestHandler.alloc().initWithData_options_(
+            Foundation.NSData.dataWithBytes_length_(data, len(data)), None)
+        ok, error = handler.performRequests_error_([request], None)
+        if not ok:
+            raise RuntimeError(f"Text recognition failed: {error}")
+
+        width, height = prepared.size
+        lines = []
+        for observation in request.results() or []:
+            candidates = observation.topCandidates_(1)
+            if not candidates:
+                continue
+            box = observation.boundingBox()           # 0..1, origin bottom-left
+            rect = SimpleNamespace(x=box.origin.x * width,
+                                   y=(1 - box.origin.y - box.size.height) * height,
+                                   width=box.size.width * width,
+                                   height=box.size.height * height)
+            text = str(candidates[0].string())
+            lines.append(SimpleNamespace(text=text,
+                                         words=[SimpleNamespace(text=text, bounding_rect=rect)]))
+        lines.sort(key=lambda line: (round(line.words[0].bounding_rect.y / 8),
+                                     line.words[0].bounding_rect.x))
+
+    languages = [("Automatic", "")] + [(language_name(t), t) for t in supported]
+    try:
+        _repair_symbols(lines, prepared)       # bullets, *, " and 0 checked against the image
+    except Exception:
+        pass
+
+    return {
+        "text": _layout_text(lines),
+        "lines": lines,
+        "language": language_name(language_tag) if language_tag else "Automatic",
+        "language_tag": language_tag or "",
+        "languages": languages,
+    }
+
+
+def run_ocr(image, language_tag=None):
+    if IS_MAC:
+        return run_mac_ocr(image, language_tag)
+    return run_windows_ocr(image, language_tag)
+
+
+def mirror_control_keys(widget):
+    """On a Mac, make every Ctrl shortcut of a window work with Cmd too."""
+    if not IS_MAC:
+        return
+    for sequence in widget.bind():
+        if "Control-" in sequence:
+            widget.bind(sequence.replace("Control-", "Command-"), widget.bind(sequence))
+
+
+class MacScreenRecorder:
+    """macOS screen recording with the built-in `screencapture -v` (it uses
+    macOS's own screen capture, so it needs the Screen Recording permission;
+    with the microphone switched on it records the default input too).
+    Pause ends the current piece and Resume starts a new one; on Stop the
+    pieces are joined and converted to an H.264/AAC .mp4 with ffmpeg.
+    Same interface as ScreenRecorder."""
+
+    def __init__(self, filename, area, fps=None, record_mic=False, record_system=False):
+        self.filename = filename
+        self.area = dict(area)
+        self.record_mic = record_mic
+        self.notes = ["computer sound isn't available on a Mac"] if record_system else []
+        self.error = None
+        self.warning = None
+        self.parts = []
+        self.proc = None
+        self.lock = threading.Lock()
+        self.start_time = None
+        self.paused = False
+        self.pause_started = None
+        self.paused_total = 0.0
+        self.recorded_seconds = 0.0
+        self.running = False
+
+    # ---- clock (same as ScreenRecorder) ------------------------------
+
+    def elapsed(self):
+        with self.lock:
+            if self.start_time is None:
+                return 0
+            now = self.pause_started if self.paused else time.perf_counter()
+            return now - self.start_time - self.paused_total
+
+    def duration(self):
+        return self.recorded_seconds
+
+    def is_running(self):
+        """False if screencapture stopped by itself (e.g. no permission)."""
+        if not self.running:
+            return False
+        return self.paused or (self.proc is not None and self.proc.poll() is None)
+
+    # ---- pieces ------------------------------------------------------
+
+    def _start_part(self):
+        path = hidden_temp_path(self.filename, f".part{len(self.parts) + 1}.mov")
+        a = self.area
+        command = [SCREENCAPTURE, "-v", "-x", "-C",
+                   "-R", f"{int(a['left'])},{int(a['top'])},{int(a['width'])},{int(a['height'])}"]
+        if self.record_mic:
+            command.append("-g")                      # default microphone
+        self.proc = subprocess.Popen(command + [str(path)], stdin=subprocess.PIPE,
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        self.parts.append(path)
+
+    def _stop_part(self):
+        proc, self.proc = self.proc, None
+        if proc is None:
+            return
+        if proc.poll() is not None:                   # it stopped by itself: an error
+            message = proc.stderr.read().decode(errors="replace").strip() if proc.stderr else ""
+            if message and not self.error:
+                self.error = f"screencapture stopped: {message}"
+            return
+        try:                                          # "type any character to stop"
+            proc.stdin.write(b"q\n")
+            proc.stdin.flush()
+            proc.wait(timeout=3)
+        except Exception:
+            try:
+                proc.send_signal(signal.SIGINT)
+                proc.wait(timeout=5)
+            except Exception:
+                proc.terminate()
+
+    # ---- control -----------------------------------------------------
+
+    def start(self):
+        with self.lock:
+            self.start_time = time.perf_counter()
+        self._start_part()
+        self.running = True
+
+    def pause(self):
+        with self.lock:
+            if self.paused or self.start_time is None:
+                return
+            self.paused = True
+            self.pause_started = time.perf_counter()
+        self._stop_part()
+
+    def resume(self):
+        with self.lock:
+            if not self.paused:
+                return
+            self.paused_total += time.perf_counter() - self.pause_started
+            self.paused = False
+            self.pause_started = None
+        self._start_part()
+
+    def stop(self):
+        self.recorded_seconds = self.elapsed()
+        self._stop_part()
+        self.running = False
+
+    def finalize(self):
+        parts = [p for p in self.parts if p.exists() and p.stat().st_size > 0]
+        try:
+            if not parts:
+                if not self.error:
+                    self.error = ("No video was recorded. Allow Screen Recording for Screen Capture "
+                                  "Utility in System Settings > Privacy & Security, then try again.")
+                return
+            if FFMPEG_EXE is None:                     # keep macOS's own .mov
+                target = self.filename.with_suffix(".mov")
+                os.replace(parts[0], target)
+                self.filename = target
+                if len(parts) > 1:
+                    self.warning = "only the part before the first pause was kept (ffmpeg is missing)"
+                return
+            listing = hidden_temp_path(self.filename, ".parts.txt")
+            listing.write_text("".join(f"file '{p.as_posix()}'\n" for p in parts), encoding="utf-8")
+            command = [FFMPEG_EXE, "-y", "-loglevel", "error", "-f", "concat", "-safe", "0",
+                       "-i", str(listing),
+                       "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+                       "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p"]
+            command += (["-c:a", "aac", "-b:a", "192k"] if self.record_mic else ["-an"])
+            command += ["-movflags", "+faststart", str(self.filename)]
+            result = subprocess.run(command, capture_output=True)
+            try:
+                listing.unlink()
+            except OSError:
+                pass
+            if result.returncode != 0:
+                details = result.stderr.decode(errors="replace").strip()
+                print(f"Converting the recording failed: {details}")
+                target = self.filename.with_suffix(".mov")
+                os.replace(parts[0], target)
+                self.filename = target
+                self.warning = "saved as .mov (converting to .mp4 failed, see console)"
+        except Exception as e:
+            self.error = f"Could not save the recording: {e}"
+        finally:
+            for path in self.parts:
+                if path != self.filename:
+                    try:
+                        path.unlink()
+                    except OSError:
+                        pass
+
+    def audio_summary(self):
+        parts = ["with microphone"] if self.record_mic else []
+        parts += self.notes
+        if self.warning:
+            parts.append(self.warning)
+        return "; ".join(parts)
+
+
+
 # ffmpeg (bundled with imageio-ffmpeg) encodes the video as H.264 and
 # combines it with the recorded audio into one .mp4 file.
 imageio_ffmpeg = ensure_package("imageio_ffmpeg", "imageio-ffmpeg")
@@ -81,8 +511,12 @@ if imageio_ffmpeg is not None:
     except Exception as e:
         print(f"ffmpeg not available: {e}")
 
-RECORDING_AVAILABLE = FFMPEG_EXE is not None or (np is not None and cv2 is not None)
-AUDIO_AVAILABLE = FFMPEG_EXE is not None and pyaudio is not None
+# On a Mac, recording uses macOS's own `screencapture` (ffmpeg converts it
+# to .mp4) and records the microphone; the computer's own sound needs
+# Windows (WASAPI loopback).
+RECORDING_AVAILABLE = IS_MAC or FFMPEG_EXE is not None or (np is not None and cv2 is not None)
+AUDIO_AVAILABLE = FFMPEG_EXE is not None and (pyaudio is not None or IS_MAC)
+SYSTEM_AUDIO_AVAILABLE = AUDIO_AVAILABLE and not IS_MAC
 DOCX_AVAILABLE = docx is not None
 XLSX_AVAILABLE = openpyxl is not None
 PPTX_AVAILABLE = pptx is not None
@@ -98,7 +532,7 @@ if not RECORDING_AVAILABLE:
 
 if not AUDIO_AVAILABLE:
     print("Audio recording is disabled. To enable it, run:")
-    print(f'  "{sys.executable}" -m pip install imageio-ffmpeg PyAudioWPatch')
+    print(f'  "{sys.executable}" -m pip install imageio-ffmpeg' + ("" if IS_MAC else " PyAudioWPatch"))
 
 if not DOCX_AVAILABLE:
     print("Saving to Word documents is disabled. To enable it, run:")
@@ -143,9 +577,12 @@ if sys.platform == "win32":
         except Exception as e:
             print(f"Could not install OCR support: {e}")
     OCR_AVAILABLE = ocr_installed()
+elif IS_MAC:
+    OCR_AVAILABLE = mac.get("Vision") is not None and mac.get("objc") is not None
 
 if not OCR_AVAILABLE:
-    print("Text extraction (OCR) is disabled (needs Windows 10/11 and PyWinRT).")
+    print("Text extraction (OCR) is disabled (needs Windows 10/11 and PyWinRT, "
+          "or macOS 10.15+ and pyobjc-framework-Vision).")
 
 # Run ffmpeg without flashing a console window (matters for the .exe)
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -957,54 +1394,626 @@ OCR_WORKER = concurrent.futures.ThreadPoolExecutor(max_workers=1,
                                                    thread_name_prefix="ocr")
 
 
+OCR_TARGET_HEIGHT = 40      # px per line of text: the size OCR engines read most accurately
+
+
+def _ink_row_runs(gray):
+    """Heights of the bands of rows that contain text (ink differs from the
+    most common shade, the background)."""
+    hist = gray.histogram()
+    background = max(range(256), key=hist.__getitem__)
+    ink = gray.point(lambda v: 255 if abs(v - background) > 60 else 0)
+    w, h = ink.size
+    m = ink
+    while w > 1:                                   # fold columns: any ink in the row?
+        half = (w + 1) // 2
+        m = ImageChops.lighter(m.crop((0, 0, half, h)), m.crop((w - half, 0, w, h)))
+        w = half
+    rows = [v > 0 for v in m.tobytes()]
+    runs, start, gap = [], None, 0
+    for y, busy in enumerate(rows + [False, False]):
+        if busy:
+            if start is None:
+                start = y
+            gap = 0
+        elif start is not None:
+            gap += 1
+            if gap > 1:                            # allow 1 blank row inside a line (e.g. "i" dots)
+                runs.append(y - gap + 1 - start)
+                start, gap = None, 0
+    return [r for r in runs if r >= 4]
+
+
+def _text_height(gray):
+    """Typical height (px) of a line of text, or None if there's no text."""
+    runs = sorted(_ink_row_runs(gray))
+    if not runs:
+        return None
+    return runs[len(runs) // 2]
+
+
+def _dark_bands_to_light(gray):
+    """Turn light-on-dark text (dark mode, dark title bars and headers) into
+    dark-on-light, band by band, so a dark header above a light page is
+    read as well as the page."""
+    w, h = gray.size
+    if w < 2 or h < 2:
+        return gray
+    row_means = list(gray.resize((1, h), Image.BOX).tobytes())
+    dark = [m < 110 for m in row_means]
+    # smooth: a band must be at least 3 rows tall
+    bands, start = [], 0
+    for y in range(1, h + 1):
+        if y == h or dark[y] != dark[start]:
+            bands.append((start, y, dark[start]))
+            start = y
+    if not any(d for _, _, d in bands):
+        return gray
+    if all(d for _, _, d in bands):
+        return ImageOps.invert(gray)
+    out = gray.copy()
+    for y0, y1, is_dark in bands:
+        if is_dark and y1 - y0 >= 3:
+            band = ImageOps.invert(gray.crop((0, y0, w, y1)))
+            out.paste(ImageOps.autocontrast(band, cutoff=1), (0, y0))   # white background, like the page
+    return out
+
+
 def _prepare_for_ocr(image, max_dimension):
-    """RGBA image sized for best OCR results: small captures are enlarged
-    (Windows OCR reads small text better that way), huge ones reduced to
-    the engine's limit, and a white margin is added around the text."""
-    image = image.convert("RGB")
-    margin = 12
-    image = ImageOps.expand(image, border=margin, fill=(255, 255, 255))
+    """Image prepared for the most accurate OCR:
+    - grey, with light-on-dark text (dark mode) turned into dark-on-light,
+    - full contrast,
+    - enlarged so a line of text is about OCR_TARGET_HEIGHT pixels tall
+      (small screen text is what makes symbols like _ # @ { } come out
+      wrong), sharpened slightly after enlarging,
+    - with a white margin around the text.
+    Returned as RGBA (what Windows OCR expects)."""
+    gray = _dark_bands_to_light(image.convert("L"))
+    gray = ImageOps.autocontrast(gray, cutoff=1)
 
-    longest = max(image.size)
+    height = _text_height(gray)
+    scale = OCR_TARGET_HEIGHT / height if height else 2.0
+    scale = max(1.0, min(4.0, scale))
+    margin = 16
     limit = max_dimension or 4000
-    scale = 1.0
-    if longest < 1600:
-        scale = min(2.0, 1600 / longest)
-    scale = min(scale, limit / longest)
-    if abs(scale - 1.0) > 0.01:
-        image = image.resize((max(1, int(image.width * scale)),
-                              max(1, int(image.height * scale))),
-                             Image.LANCZOS)
-    return image.convert("RGBA")
+    scale = min(scale, (limit - 2 * margin) / max(gray.size))
+    if abs(scale - 1.0) > 0.02:
+        gray = gray.resize((max(1, round(gray.width * scale)), max(1, round(gray.height * scale))),
+                           Image.LANCZOS)
+        gray = gray.filter(ImageFilter.UnsharpMask(radius=1.2, percent=70, threshold=2))
+    gray = ImageOps.expand(gray, border=margin, fill=255)
+    return gray.convert("RGBA")
 
 
-def _lines_to_text(lines):
-    """Join OCR lines, adding a blank line where there's a clear vertical
-    gap (so paragraphs stay separated)."""
+def _is_cjk(text):
+    return any("぀" <= ch <= "ヿ" or "㐀" <= ch <= "鿿" or "가" <= ch <= "힯"
+               for ch in text)
+
+
+BULLET_LOOKALIKES = set("•·∙●◦○▪■*¢«»©®°eoc")
+
+
+def _layout_text(lines, keep_layout=True):
+    """Rebuild the text from the OCR's words and their positions.
+
+    - Words on the same visual row are joined even when the OCR returned
+      them as separate lines (table cells, columns), in left-to-right order.
+    - keep_layout: indentation is kept and wide gaps (table columns) become
+      several spaces, so code and tables keep their shape; otherwise words
+      are joined with single spaces.
+    - A blank line marks a clear vertical gap (a new paragraph).
+    - A small round mark at the start of a row is a bullet: written as •."""
+    words = []
+    for index, line in enumerate(lines):
+        for word in getattr(line, "words", None) or []:
+            r = word.bounding_rect
+            if word.text.strip():
+                words.append(SimpleNamespace(text=word.text, x=r.x, y=r.y, w=r.width, h=r.height,
+                                             line=index))
+    if not words:
+        return "\n".join(line.text for line in lines).strip()
+
+    heights = sorted(w.h for w in words)
+    line_h = heights[len(heights) // 2] or 1
+    # average character width, from all words of 3+ characters together
+    # (steadier than any one word, so indentation lands on the right column)
+    long_words = [w for w in words if len(w.text) >= 3] or words
+    char_w = max(1.0, sum(w.w for w in long_words) / max(1, sum(len(w.text) for w in long_words)))
+
+    # rows: the OCR's own lines, merged when they sit on the same visual row
+    groups = {}
+    for w in words:
+        groups.setdefault(w.line, []).append(w)
+    boxes = []
+    for ws in groups.values():
+        y0 = min(w.y for w in ws)
+        y1 = max(w.y + w.h for w in ws)
+        boxes.append(SimpleNamespace(words=ws, y0=y0, y1=y1, mid=(y0 + y1) / 2))
+    boxes.sort(key=lambda b: (b.mid, min(w.x for w in b.words)))
     rows = []
+    for b in boxes:
+        row = rows[-1] if rows else None
+        if row is not None and abs(b.mid - row.mid) < 0.5 * line_h:
+            overlap = any(not (w.x + w.w <= o.x or o.x + o.w <= w.x) for w in b.words for o in row.words)
+            if not overlap:
+                row.words += b.words
+                row.y0, row.y1 = min(row.y0, b.y0), max(row.y1, b.y1)
+                row.mid = (row.y0 + row.y1) / 2
+                continue
+        rows.append(SimpleNamespace(words=list(b.words), y0=b.y0, y1=b.y1, mid=b.mid))
+
+    left = min(w.x for w in words)
+    # indentation: rows starting within ~half a character of each other share
+    # one indent (glyph edges differ slightly, e.g. "r" vs "{")
+    starts = sorted({(min(w.x for w in row.words) - left) / char_w for row in rows})
+    indent_of, cluster = {}, []
+    for value in starts + [None]:
+        if cluster and (value is None or value - cluster[0] > 0.6):
+            for v in cluster:
+                indent_of[v] = round(cluster[0])
+            cluster = []
+        if value is not None:
+            cluster.append(value)
+    # paragraph gaps: clearly more space than between the lines of a paragraph
+    pitches = sorted(b.mid - a.mid for a, b in zip(rows, rows[1:]))
+    pitch = pitches[len(pitches) // 2] if len(pitches) >= 3 else None
+    out = []
+    previous = None
+    for row in rows:
+        ws = sorted(row.words, key=lambda w: w.x)
+        if previous is not None and row.y0 - previous.y1 > line_h * 1.2 and (
+                pitch is None or row.mid - previous.mid > 1.4 * pitch):
+            out.append("")                                    # paragraph gap
+        # a bullet: a small round mark, centred on the row, before the first word
+        first = ws[0]
+        if (len(ws) > 1 and len(first.text) == 1 and first.text in BULLET_LOOKALIKES
+                and first.h < 0.6 * line_h and 0.5 < first.w / max(1, first.h) < 1.8
+                and abs((first.y + first.h / 2) - row.mid) < 0.2 * line_h
+                and ws[1].x - (first.x + first.w) > 0.6 * char_w):
+            first.text = "•"
+        row_chars = sum(len(w.text) for w in ws)
+        row_char_w = (sum(w.w for w in ws) / row_chars) if row_chars >= 8 else char_w
+        parts = []
+        if keep_layout:
+            parts.append(" " * min(80, indent_of[(min(w.x for w in row.words) - left) / char_w]))
+        end = None
+        for w in ws:
+            if end is not None:
+                gap = w.x - end
+                if keep_layout and gap >= 2.2 * row_char_w:
+                    # a column: start it where it sits on screen, so columns line up
+                    column = round((w.x - left) / char_w)
+                    parts.append(" " * max(2, column - len("".join(parts))))
+                elif gap < 0.35 * row_char_w and (_is_cjk(w.text) or _is_cjk(parts[-1])):
+                    pass                                      # CJK text has no spaces
+                else:
+                    parts.append(" ")
+            parts.append(w.text)
+            end = w.x + w.w
+        out.append("".join(parts).rstrip())
+        previous = row
+    return _clean_ocr_text("\n".join(out).strip("\n"))
+
+
+OCR_REPLACEMENTS = {"“": '"', "”": '"', "„": '"', "″": '"',
+                    "‘": "'", "’": "'", "‚": "'", "′": "'",
+                    "ﬁ": "fi", "ﬂ": "fl", "ﬀ": "ff", "ﬃ": "ffi", "ﬄ": "ffl",
+                    " ": " ", "‐": "-", "‑": "-", "−": "-"}
+
+
+def _clean_ocr_text(text):
+    """Undo typographic look-alikes OCR engines invent: curly quotes become
+    the plain " and ' that screens (code, URLs, data) almost always show,
+    ligatures become separate letters, odd hyphens and spaces become plain ones."""
+    for bad, good in OCR_REPLACEMENTS.items():
+        text = text.replace(bad, good)
+    # two apostrophes against a word are a double quote read as two marks: ''Name'' -> "Name"
+    text = re.sub(r"(?<![\w'])''(?=\w)|(?<=\w)''(?![\w'])", '"', text)
+    return text
+
+
+OCR_INK = 140          # darker than this (in the prepared, dark-on-light image) is ink
+
+
+def _components(gray, box):
+    """8-connected ink blobs inside box (x0, y0, x1, y1) of the prepared image.
+    Each: x0, y0, x1, y1 (exclusive), n (ink pixels), touches (set of crop sides)."""
+    x0, y0, x1, y1 = (int(round(v)) for v in box)
+    x0, y0 = max(0, x0), max(0, y0)
+    x1, y1 = min(gray.width, x1), min(gray.height, y1)
+    w, h = x1 - x0, y1 - y0
+    if w <= 0 or h <= 0:
+        return []
+    data = gray.crop((x0, y0, x1, y1)).tobytes()
+    ink = bytearray(1 if v < OCR_INK else 0 for v in data)
+    blobs = []
+    for start in range(w * h):
+        if not ink[start]:
+            continue
+        ink[start] = 0
+        stack = [start]
+        bx0 = bx1 = start % w
+        by0 = by1 = start // w
+        n = 0
+        while stack:
+            i = stack.pop()
+            n += 1
+            x, y = i % w, i // w
+            if x < bx0: bx0 = x
+            if x > bx1: bx1 = x
+            if y < by0: by0 = y
+            if y > by1: by1 = y
+            for dy in (-1, 0, 1):
+                yy = y + dy
+                if yy < 0 or yy >= h:
+                    continue
+                for dx in (-1, 0, 1):
+                    xx = x + dx
+                    if 0 <= xx < w:
+                        j = yy * w + xx
+                        if ink[j]:
+                            ink[j] = 0
+                            stack.append(j)
+        touches = set()
+        if bx0 == 0: touches.add("left")
+        if bx1 == w - 1: touches.add("right")
+        if by0 == 0: touches.add("top")
+        if by1 == h - 1: touches.add("bottom")
+        blobs.append(SimpleNamespace(x0=x0 + bx0, y0=y0 + by0, x1=x0 + bx1 + 1, y1=y0 + by1 + 1,
+                                     n=n, touches=touches))
+    return blobs
+
+
+def _glyph_groups(blobs, min_size=2):
+    """Blobs that overlap horizontally belong to one glyph (the dot of an i,
+    an accent), left to right."""
+    groups = []
+    for b in sorted((b for b in blobs if b.n >= min_size), key=lambda b: b.x0):
+        g = groups[-1] if groups else None
+        if g is not None and b.x0 < g.x1 - 1:
+            g.parts.append(b)
+            g.x0, g.y0, g.x1, g.y1 = min(g.x0, b.x0), min(g.y0, b.y0), max(g.x1, b.x1), max(g.y1, b.y1)
+            g.n += b.n
+            g.touches |= b.touches
+        else:
+            groups.append(SimpleNamespace(parts=[b], x0=b.x0, y0=b.y0, x1=b.x1, y1=b.y1, n=b.n,
+                                          touches=set(b.touches)))
+    return groups
+
+
+def _has_hole(gray, g):
+    """True if the glyph encloses background (o, °, ◦), False for * • ▪."""
+    w, h = g.x1 - g.x0, g.y1 - g.y0
+    if w < 3 or h < 3:
+        return False
+    data = gray.crop((g.x0, g.y0, g.x1, g.y1)).tobytes()
+    bg = bytearray(1 if v >= OCR_INK else 0 for v in data)
+    stack = [i for i in range(w * h) if bg[i] and (i % w in (0, w - 1) or i // w in (0, h - 1))]
+    for i in stack:
+        bg[i] = 0
+    while stack:
+        i = stack.pop()
+        x, y = i % w, i // w
+        for j in (i - 1 if x > 0 else -1, i + 1 if x < w - 1 else -1, i - w if y > 0 else -1, i + w if y < h - 1 else -1):
+            if j >= 0 and bg[j]:
+                bg[j] = 0
+                stack.append(j)
+    return sum(bg) >= 2
+
+
+def _classify_symbol(gray, groups, top, base):
+    """What one glyph is, from its shape and where it sits on the line
+    (top = top of capital letters, base = baseline): "•", "◦", "▪", "*",
+    '"', "'", or None. Word-shaped glyphs (letters, digits) give None.
+    groups: one glyph group, or two for a double quote."""
+    H = max(4.0, base - top)
+    if len(groups) == 2:
+        a, b = groups
+        if all(_is_tick(g, top, H) for g in groups) and b.x0 - a.x1 < 0.7 * H \
+                and abs(a.y0 - b.y0) < 0.15 * H:
+            return '"'
+        return None
+    g = groups[0]
+    w, h = g.x1 - g.x0, g.y1 - g.y0
+    fill = g.n / float(max(1, w * h))
+    rel_top, rel_bottom = (g.y0 - top) / H, (g.y1 - top) / H
+    rel_mid = (rel_top + rel_bottom) / 2
+    aspect = w / float(max(1, h))
+    if _is_tick(g, top, H):
+        return "'"
+    if 0.18 * H <= h <= 0.7 * H and 0.7 <= aspect <= 1.45 and 0.3 <= rel_mid <= 0.85:
+        hole = _has_hole(gray, g)
+        corners = gray.crop((g.x0, g.y0, g.x1, g.y1))
+        cw, ch = corners.size
+        inked = sum(corners.getpixel(p) < OCR_INK for p in ((0, 0), (cw - 1, 0), (0, ch - 1), (cw - 1, ch - 1)))
+        if fill >= 0.8 and inked >= 3 and not hole:
+            return "▪"
+        if fill >= 0.6 and not hole:
+            return "•"
+        if hole and 0.3 <= fill < 0.75:
+            return "◦"
+    if (0.25 * H <= h <= 0.7 * H and 0.5 <= aspect <= 1.5 and rel_top < 0.25 and rel_bottom < 0.72
+            and 0.2 <= fill <= 0.65 and not _has_hole(gray, g)):
+        return "*"
+    return None
+
+
+def _is_tick(g, top, H):
+    """A quote mark: a short upright stroke at the top of the line."""
+    w, h = g.x1 - g.x0, g.y1 - g.y0
+    return (0.15 * H <= h <= 0.5 * H and h >= 1.3 * w and w <= 0.2 * H
+            and (g.y0 - top) / H < 0.2 and (g.y1 - top) / H < 0.6)
+
+
+BULLETS = ("•", "◦", "▪")
+QUOTE_LOOKALIKES = {"''", "``", "“", "”", "„", "″", "'", "`", "‘", "’", "*", "°", "^", "-"}
+STAR_LOOKALIKES = {"x", "X", "×", "+", "^", "°", "'", '"', "-", "#", "%", "¥"}
+SYMBOL_LOOKALIKES = set("•·∙●◦○▪■*¢«»©®°eoaOcCx×+'\"`^-—~#%")
+
+
+def _line_metrics(words):
+    """Top of capitals and baseline of a line of words (medians, so words
+    with descenders or without ascenders don't skew them)."""
+    tall = [w for w in words if len(w.text) >= 2] or words
+    tops = sorted(w.y for w in tall)
+    bottoms = sorted(w.y + w.h for w in tall)
+    return tops[len(tops) // 2], bottoms[len(bottoms) // 2]
+
+
+def _repair_symbols(lines, gray):
+    """Check the symbols OCR engines most often get wrong (Windows OCR in
+    particular) against the image itself, and fix them in place:
+    - bullets (• ◦ ▪), asterisks (*) and quote marks (" ') the engine left
+      out are added back, at their place on the line,
+    - a symbol read as a letter (* as x, " as '' , • as e or o) is corrected,
+    - a 0 read as the letter O (or O as 0) is corrected from its context.
+    lines: the OCR lines (words with text and bounding_rect, in the
+    coordinates of gray, the prepared image)."""
+    gray = gray.convert("L")
+    all_words = []
     for line in lines:
-        text = line.text
-        try:
-            rects = [w.bounding_rect for w in line.words]
-            top = min(r.y for r in rects)
-            bottom = max(r.y + r.height for r in rects)
-        except Exception:
-            top = bottom = None
-        rows.append((text, top, bottom))
+        for word in getattr(line, "words", None) or []:
+            r = word.bounding_rect
+            all_words.append((r.x, r.y, r.x + r.width, r.y + r.height))
 
-    heights = [b - t for _, t, b in rows if t is not None and b is not None and b > t]
-    typical = sorted(heights)[len(heights) // 2] if heights else None
+    def covered(g, pad=1):
+        cx, cy = (g.x0 + g.x1) / 2, (g.y0 + g.y1) / 2
+        return any(x0 - pad <= cx <= x1 + pad and y0 - pad <= cy <= y1 + pad for x0, y0, x1, y1 in all_words)
 
-    output = []
-    previous_bottom = None
-    for text, top, bottom in rows:
-        if (typical and previous_bottom is not None and top is not None
-                and top - previous_bottom > typical * 1.2):
-            output.append("")
-        output.append(text)
-        if bottom is not None:
-            previous_bottom = bottom
-    return "\n".join(output).strip()
+    for line in lines:
+        words = [w for w in (getattr(line, "words", None) or []) if w.text.strip()]
+        if not words:
+            continue
+        boxes = [SimpleNamespace(text=w.text, x=w.bounding_rect.x, y=w.bounding_rect.y,
+                                 w=w.bounding_rect.width, h=w.bounding_rect.height, word=w) for w in words]
+        top, base = _line_metrics(boxes)
+        H = max(4.0, base - top)
+
+        # 1) a symbol read as something else: one- or two-character words
+        first_box = min(boxes, key=lambda b: b.x)
+        for b in boxes:
+            at_start = b is first_box and len(boxes) > 1
+            core = b.text.strip(".,;:!?()[]\"'")
+            if core in ("O", "o", "Ø", "ø", "©", "Θ", "θ") and core != b.text:
+                # a lone 0 or O with punctuation ("Zone 0,"): judge the letter by its shape
+                groups = _glyph_groups(_components(gray, (b.x - 1, top - 0.3 * H, b.x + b.w + 1, base + 0.3 * H)))
+                tall = [g for g in groups if g.y1 - g.y0 >= 0.85 * H and not (g.touches & {"top", "bottom"})]
+                if len(tall) == 1 and tall[0].x1 - tall[0].x0 < 0.82 * (tall[0].y1 - tall[0].y0):
+                    b.word.text = b.text = b.text.replace(core, "0", 1)
+                continue
+            if len(b.text) > 2 or (b.text.isalnum() and b.text not in SYMBOL_LOOKALIKES):
+                continue
+            groups = _glyph_groups(_components(gray, (b.x - 1, top - 0.3 * H, b.x + b.w + 1, base + 0.3 * H)))
+            groups = [g for g in groups if g.x1 > b.x and g.x0 < b.x + b.w and not (g.touches & {"top", "bottom"})]
+            if not 1 <= len(groups) <= 2:
+                continue
+            symbol = _classify_symbol(gray, groups, top, base)
+            if symbol in BULLETS and not at_start:
+                symbol = None                                  # a round letter mid-line, not a bullet
+            if symbol and symbol != b.text:
+                b.word.text = b.text = symbol
+            elif symbol is None and b.text in ("O", "o", "Ø", "ø", "©", "Θ", "θ") and len(groups) == 1:
+                g = groups[0]
+                w, h = g.x1 - g.x0, g.y1 - g.y0
+                if h >= 0.85 * H and w < 0.82 * h:             # full height and narrow: the digit 0
+                    b.word.text = b.text = "0"
+
+        # 2) symbols at the start or end of a word: dropped, or read as a letter
+        for b in boxes:
+            if len(b.text) < 2 or not b.text.strip("".join(SYMBOL_LOOKALIKES)):
+                continue
+            edge = min(b.w, 1.3 * H)
+            for side in ("left", "right"):
+                x0 = b.x - 1 if side == "left" else b.x + b.w - edge
+                x1 = b.x + edge if side == "left" else b.x + b.w + 1
+                groups = _glyph_groups(_components(gray, (x0, top - 0.3 * H, x1, base + 0.35 * H)))
+                groups = [g for g in groups if g.x1 - g.x0 >= 1]
+                if not groups:
+                    continue
+                inner = "right" if side == "left" else "left"
+                ordered = groups if side == "left" else groups[::-1]
+                trailing = ""
+                if side == "right" and b.text[-1] in ":;,.!?)" and len(ordered) > 1:
+                    trailing, ordered = b.text[-1], ordered[1:]   # look before the final : , . etc.
+                first = ordered[0]
+                if inner in first.touches:
+                    continue                                   # a wide glyph: a letter
+                candidates = [[first]]
+                if len(ordered) > 1 and inner not in ordered[1].touches:
+                    pair = sorted([first, ordered[1]], key=lambda g: g.x0)
+                    candidates.insert(0, pair)
+                symbol = None
+                for c in candidates:
+                    symbol = _classify_symbol(gray, c, top, base)
+                    if symbol in ('"', "'", "*"):
+                        break
+                    symbol = None
+                if symbol is None:
+                    continue
+                text = b.text[:-1] if trailing else b.text
+                if symbol == "*":                              # ** or *** (e.g. **kwargs, **bold**)
+                    k = 1
+                    while k < 3 and len(ordered) > k and inner not in ordered[k].touches \
+                            and _classify_symbol(gray, [ordered[k]], top, base) == "*":
+                        k += 1
+                    have = len(text) - len(text.lstrip("*")) if side == "left" else len(text) - len(text.rstrip("*"))
+                    if 0 < have < k:
+                        text = ("*" * k + text[have:]) if side == "left" else (text[:-have] + "*" * k)
+                        b.word.text = b.text = text + trailing
+                        continue
+                    if have == 0 and k > 1:
+                        # replace up to k look-alike marks at that edge with k stars
+                        chars = text if side == "left" else text[::-1]
+                        i = 0
+                        while i < k and i < len(chars) - 1 and (chars[i] in STAR_LOOKALIKES or chars[i] == "*"):
+                            i += 1
+                        chars = "*" * k + chars[i:]
+                        text = chars if side == "left" else chars[::-1]
+                        b.word.text = b.text = text + trailing
+                        continue
+                if symbol == "'" and ((side == "left" and text[:2] in ("''", "``")) or
+                                      (side == "right" and text[-2:] in ("''", "``"))):
+                    symbol = '"'                               # '' is how OCR often reads "
+                quotes = "\"'`‘’“”„″′"
+                edge_char = text[0] if side == "left" else text[-1:]
+                if symbol in ('"', "'") and edge_char and edge_char in quotes and edge_char not in ("''", "``"):
+                    if not (side == "left" and text[:2] in ("''", "``")) and not (side == "right" and text[-2:] in ("''", "``")):
+                        continue                               # a quote is already there
+                if side == "left":
+                    if text.startswith(symbol):
+                        continue
+                    lookalike = next((q for q in sorted(QUOTE_LOOKALIKES | STAR_LOOKALIKES, key=len, reverse=True)
+                                      if text.startswith(q)), None)
+                    if lookalike and len(text) > len(lookalike) and (
+                            (symbol[0] == "*" and lookalike in STAR_LOOKALIKES) or
+                            (symbol[0] != "*" and lookalike in QUOTE_LOOKALIKES)):
+                        text = symbol + text[len(lookalike):]
+                    elif first.x1 <= b.x + 0.15 * H or len(text) >= 2:
+                        text = symbol + text
+                else:
+                    if text.endswith(symbol):
+                        continue
+                    lookalike = next((q for q in sorted(QUOTE_LOOKALIKES | STAR_LOOKALIKES, key=len, reverse=True)
+                                      if text.endswith(q)), None)
+                    if lookalike and len(text) > len(lookalike) and (
+                            (symbol[0] == "*" and lookalike in STAR_LOOKALIKES) or
+                            (symbol[0] != "*" and lookalike in QUOTE_LOOKALIKES)):
+                        text = text[:-len(lookalike)] + symbol
+                    else:
+                        text = text + symbol
+                b.word.text = b.text = text + trailing
+
+        # 3) symbols left out entirely: blobs on the line not inside any word
+        left = min(b.x for b in boxes)
+        right = max(b.x + b.w for b in boxes)
+        region = (max(0, left - 4 * H), top - 0.3 * H, right + 1.5 * H, base + 0.35 * H)
+        groups = [g for g in _glyph_groups(_components(gray, region))
+                  if not covered(g) and not (g.touches & {"top", "bottom"})]
+        # pair up quote ticks
+        found, i = [], 0
+        while i < len(groups):
+            g = groups[i]
+            if i + 1 < len(groups):
+                symbol = _classify_symbol(gray, [g, groups[i + 1]], top, base)
+                if symbol == '"':
+                    found.append((symbol, g.x0, groups[i + 1].x1))
+                    i += 2
+                    continue
+            symbol = _classify_symbol(gray, [g], top, base)
+            if symbol:
+                found.append((symbol, g.x0, g.x1))
+            i += 1
+        for symbol, x0, x1 in found:
+            # touching a word: part of it (*Required, "quoted"); otherwise its own word
+            before = [b for b in boxes if b.x + b.w <= x0 + 1]
+            after = [b for b in boxes if b.x >= x1 - 1]
+            near_after = min(after, key=lambda b: b.x) if after else None
+            near_before = max(before, key=lambda b: b.x + b.w) if before else None
+            limit = (0.6 if symbol in ('"', "'") else 0.25) * H
+            gap_after = near_after.x - x1 if near_after is not None else 1e9
+            gap_before = x0 - (near_before.x + near_before.w) if near_before is not None else 1e9
+            if symbol == "*" and near_after is not None and near_after.text.startswith("*") and gap_after < 0.45 * H:
+                gap_after = 0                                  # ** written as two marks
+            if symbol == "*" and near_before is not None and near_before.text.endswith("*") and gap_before < 0.45 * H:
+                gap_before = 0
+            if symbol == '"' and gap_after < limit and gap_before < limit:
+                # between two words: an opening quote if the quotes so far are balanced
+                opening = sum(bb.text.count('"') for bb in boxes if bb.x + bb.w <= x0) % 2 == 0
+                gap_after, gap_before = (0, 1) if opening else (1, 0)
+            if symbol not in BULLETS and gap_after <= gap_before and gap_after < limit \
+                    and (symbol == "*" or not near_after.text.startswith(symbol)):
+                near_after.word.text = near_after.text = symbol + near_after.text
+                r = near_after.word.bounding_rect
+                near_after.word.bounding_rect = SimpleNamespace(x=x0, y=r.y, width=r.x + r.width - x0, height=r.height)
+                near_after.x, near_after.w = x0, r.x + r.width - x0
+            elif symbol not in BULLETS and gap_before < limit and (symbol == "*" or not near_before.text.endswith(symbol)):
+                near_before.word.text = near_before.text = near_before.text + symbol
+                r = near_before.word.bounding_rect
+                near_before.word.bounding_rect = SimpleNamespace(x=r.x, y=r.y, width=x1 - r.x, height=r.height)
+                near_before.w = x1 - r.x
+            else:
+                new = SimpleNamespace(text=symbol, bounding_rect=SimpleNamespace(
+                    x=x0, y=top + 0.3 * H if symbol in "•◦▪" else top, width=x1 - x0,
+                    height=0.4 * H if symbol in "•◦▪" else 0.4 * H))
+                line.words.append(new)
+                boxes.append(SimpleNamespace(text=symbol, x=x0, y=new.bounding_rect.y, w=x1 - x0,
+                                             h=new.bounding_rect.height, word=new))
+        line.words.sort(key=lambda w: w.bounding_rect.x)
+        line.text = " ".join(w.text for w in line.words)
+    for line in lines:
+        for word in getattr(line, "words", None) or []:
+            word.text = _fix_zero_and_o(word.text)
+        line.text = _fix_zero_and_o(line.text) if not getattr(line, "words", None) else " ".join(w.text for w in line.words)
+    return lines
+
+
+_NUMERIC_CHARS = set("0123456789OoØøΘθ.,:/-+$€£¥₹%#()[]")
+_UNITS = ("°C", "°F", "°", "px", "ms", "s", "kb", "mb", "gb", "tb", "k", "m", "h", "min", "pt", "em", "rem", "x", "st", "nd", "rd", "th", "am", "pm")
+
+
+def _fix_zero_and_o(text):
+    """A 0 read as the letter O (or o, Ø, θ) inside a number becomes 0 again
+    (1O.5O → 10.50, $2,OOO → $2,000, Ox00FF → 0x00FF); a 0 inside a word
+    of letters becomes O (C0NTACT → CONTACT)."""
+    def fix(token):
+        core = token.strip("\"'“”‘’()[]{}<>,;:!?*")
+        if not core:
+            return token
+        lower = core.lower()
+        unit = ""
+        for u in _UNITS:
+            if lower.endswith(u.lower()) and len(core) > len(u):
+                unit = core[-len(u):]
+                break
+        body = core[:-len(unit)] if unit else core
+        prefix = ""
+        if len(body) > 1 and body[0] in "vV#" and body[1] in "0123456789Oo":
+            prefix, body = body[0], body[1:]
+        if len(body) >= 3 and body[0] in "Oo" and body[1] == "-":
+            return token[:token.index(core)] + core[0] + fix(core[1:]) + token[token.index(core) + len(core):]   # an ID such as O-1001
+        if len(body) > 2 and body[0] in "0Oo" and body[1] in "xX" and all(
+                c in "0123456789abcdefABCDEFOo" for c in body[2:]):
+            fixed = "0x" + body[2:].replace("O", "0").replace("o", "0")
+            return token.replace(core, prefix + fixed + unit)
+        digits = sum(c.isdigit() for c in body)
+        if body and all(c in _NUMERIC_CHARS for c in body) and any(c in "OoØøΘθ" for c in body):
+            letters = [c for c in body if c in "OoØøΘθ"]
+            if digits >= 1 or (len(letters) >= 2 and any(c in "$€£¥₹.,:" for c in body)) or (
+                    body.endswith("%") and set(body[:-1]) <= set("Oo")):
+                fixed = "".join("0" if c in "OoØøΘθ" else c for c in body)
+                return token.replace(core, prefix + fixed + unit)
+        if "0" in core and core.replace("0", "").isalpha() and len(core) >= 3 and digits == core.count("0"):
+            out = []
+            for i, c in enumerate(core):
+                if c == "0":
+                    neighbours = core[max(0, i - 1):i] + core[i + 1:i + 2]
+                    out.append("O" if i == 0 or neighbours.replace("0", "").isupper()
+                               or not neighbours.replace("0", "") else "o")
+                else:
+                    out.append(c)
+            return token.replace(core, "".join(out))
+        return token
+    return " ".join(fix(t) for t in text.split(" "))
 
 
 def run_windows_ocr(image, language_tag=None):
@@ -1042,8 +2051,25 @@ def run_windows_ocr(image, language_tag=None):
 
     result = asyncio.run(recognize())
 
+    # Plain copies of the lines and word boxes (the WinRT objects belong to
+    # this thread), so the window can re-format them without running OCR again
+    lines = []
+    for line in result.lines:
+        words = []
+        for word in line.words:
+            r = word.bounding_rect
+            words.append(SimpleNamespace(text=word.text, bounding_rect=SimpleNamespace(
+                x=r.x, y=r.y, width=r.width, height=r.height)))
+        lines.append(SimpleNamespace(text=line.text, words=words))
+
+    try:
+        _repair_symbols(lines, prepared)       # bullets, *, " and 0 checked against the image
+    except Exception:
+        pass
+
     return {
-        "text": _lines_to_text(list(result.lines)),
+        "text": _layout_text(lines),
+        "lines": lines,
         "language": engine.recognizer_language.display_name,
         "language_tag": engine.recognizer_language.language_tag,
         "languages": languages,
@@ -1063,9 +2089,12 @@ def extract_text_region():
     if not OCR_AVAILABLE:
         messagebox.showinfo(
             "Text extraction unavailable",
-            "Text extraction uses the OCR engine built into Windows 10/11.\n\n"
-            "Install its Python bindings with:\n"
-            f'  "{sys.executable}" -m pip install {" ".join(OCR_PACKAGES)}',
+            ("Text extraction uses the text recognition built into macOS (Vision).\n\n"
+             "Install its Python bindings with:\n"
+             f'  "{sys.executable}" -m pip install pyobjc-framework-Vision') if IS_MAC else
+            ("Text extraction uses the OCR engine built into Windows 10/11.\n\n"
+             "Install its Python bindings with:\n"
+             f'  "{sys.executable}" -m pip install {" ".join(OCR_PACKAGES)}'),
             parent=root)
         return
     start_region_selection(ocr_selected_region)
@@ -1073,7 +2102,7 @@ def extract_text_region():
 
 def ocr_selected_region(x1, y1, x2, y2):
     try:
-        image = ImageGrab.grab(bbox=(x1, y1, x2, y2), all_screens=True)
+        image = grab_screen((x1, y1, x2, y2))
     except Exception as e:
         root.deiconify()
         status_var.set(f"Could not capture the area: {e}")
@@ -1103,6 +2132,7 @@ class OcrWindow:
         self.language_map = {}
         self.first_result = True
         self.future = None
+        self.lines = None                       # the OCR result, kept for re-formatting
 
         self.win = tk.Toplevel(root)
         self.win.title("Extracted Text")
@@ -1139,6 +2169,13 @@ class OcrWindow:
         self.language_box.pack(side="left")
         self.language_box.bind("<<ComboboxSelected>>", self._language_changed)
 
+        # Keep layout: indentation, columns and spacing as on screen (code,
+        # tables, forms), shown in a fixed-width font so columns line up.
+        # Off: plain flowing text.
+        self.layout_var = tk.BooleanVar(value=True)
+        Toggle(lang_row, "Keep layout", self.layout_var, bg=BG).pack(side="left", padx=(S(16), 0))
+        self.layout_var.trace_add("write", lambda *a: self._reformat())
+
         open_button = FlatButton(lang_row, "Open image...", self.open_image)
         open_button.pack(side="right")
 
@@ -1146,14 +2183,16 @@ class OcrWindow:
         text_frame = tk.Frame(body, bg=CARD, highlightthickness=S(2) if S(2) > 1 else 1,
                               highlightbackground=FIELD_BORDER)
         text_frame.pack(fill="both", expand=True)
-        self.text = tk.Text(text_frame, wrap="word", font=font(11),
+        self.text = tk.Text(text_frame, wrap="none", font=font(10.5, "Consolas"),
                             fg=TEXT, bg=CARD, relief="flat", bd=0,
                             padx=S(12), pady=S(10), undo=True,
                             width=72, height=18, insertbackground=TEXT,
                             selectbackground="#C7CBF9", selectforeground=TEXT)
         scroll = tk.Scrollbar(text_frame, command=self.text.yview)
-        self.text.configure(yscrollcommand=scroll.set)
+        self.xscroll = tk.Scrollbar(text_frame, orient="horizontal", command=self.text.xview)
+        self.text.configure(yscrollcommand=scroll.set, xscrollcommand=self.xscroll.set)
         scroll.pack(side="right", fill="y")
+        self.xscroll.pack(side="bottom", fill="x")
         self.text.pack(side="left", fill="both", expand=True)
 
         # --- buttons -------------------------------------------------
@@ -1182,7 +2221,7 @@ class OcrWindow:
         self.info_label.configure(text=f"{self.source}  ·  "
                                        f"{self.image.width} x {self.image.height} px")
         self.copy_button.config(state="disabled")
-        self.future = OCR_WORKER.submit(run_windows_ocr, self.image, self.language_tag)
+        self.future = OCR_WORKER.submit(run_ocr, self.image, self.language_tag)
         self.win.after(100, self._poll)
 
     def _poll(self):
@@ -1200,6 +2239,9 @@ class OcrWindow:
             status_var.set("Could not extract text (see the text window)")
             return
 
+        self.lines = result.get("lines")
+        if self.lines is not None:
+            result["text"] = _layout_text(self.lines, self.layout_var.get())
         self.language_map = {name: tag for name, tag in result["languages"]}
         self.language_box.configure(values=list(self.language_map))
         self.language_var.set(result["language"])
@@ -1227,6 +2269,16 @@ class OcrWindow:
             self.first_result = False
             copy_to_clipboard(text)
             status_var.set(f"Text extracted and copied to clipboard ({words} words)")
+
+    def _reformat(self):
+        """Keep layout switched: fixed-width font and no wrapping for the
+        layout, flowing text otherwise; re-format the last result."""
+        if self.layout_var.get():
+            self.text.configure(font=font(10.5, "Consolas"), wrap="none")
+        else:
+            self.text.configure(font=font(11), wrap="word")
+        if self.lines is not None:
+            self._set_text(_layout_text(self.lines, self.layout_var.get()))
 
     def _set_text(self, value):
         self.text.delete("1.0", "end")
@@ -1350,6 +2402,8 @@ def image_to_dib(image):
 def copy_image_to_clipboard(image):
     """Put an image on the clipboard (as a bitmap and as PNG), so it can be
     pasted into Teams, Outlook, Word, Paint, etc. Returns True on success."""
+    if IS_MAC:
+        return mac_copy_image(image)
     from ctypes import wintypes
     user32 = ctypes.windll.user32
     kernel32 = ctypes.windll.kernel32
@@ -1475,7 +2529,7 @@ class AnnotateEditor:
         tk.Label(titles, text="Review & annotate" + (f"  ·  {title}" if title else ""),
                  font=F_TILE, fg="white", bg=HEADER_BG).pack(anchor="w")
         tk.Label(titles,
-                 text="Annotate if you like, then Copy, Save or Cancel.  Ctrl+C copy, Ctrl+Z undo",
+                 text=f"Annotate if you like, then Copy, Save or Cancel.  {KEY}+C copy, {KEY}+Z undo",
                  font=F_TILE_SUB, fg=HEADER_SUB, bg=HEADER_BG).pack(anchor="w")
         self.info = tk.Label(inner, text="", font=F_TILE_SUB, fg=HEADER_SUB, bg=HEADER_BG)
         self.info.pack(side="right")
@@ -1602,6 +2656,7 @@ class AnnotateEditor:
         self.win.bind("<Control-C>", lambda e: self.copy())
         self.win.bind("<Control-z>", lambda e: self.undo())
         self.win.bind("<Control-Z>", lambda e: self.undo())
+        mirror_control_keys(self.win)
         self.win.bind("<Return>", self._on_enter)
         self.win.bind("<Escape>", self._on_escape)
 
@@ -1844,7 +2899,7 @@ class AnnotateEditor:
 
     def _wheel(self, event):
         if self.tall:
-            self.canvas.yview_scroll(int(-event.delta / 120) * 3, "units")
+            self.canvas.yview_scroll(wheel_steps(event) * 3, "units")
 
     def _clamp(self, x, y):
         """Keep a canvas point on the image."""
@@ -2027,7 +3082,7 @@ class AnnotateEditor:
     # ---- text -------------------------------------------------------
 
     def _text_font(self):
-        return ("Segoe UI", -self._screen_width(), "bold")
+        return (UI_FAMILY, -self._screen_width(), "bold")
 
     def _start_text(self, x, y):
         """Open a small typing box where the user clicked."""
@@ -2225,7 +3280,7 @@ class AnnotateEditor:
         self.copy_button.config(text="Copied")
         self.win.after(1500, lambda: self.copy_button.winfo_exists()
                        and self.copy_button.config(text="Copy"))
-        status_var.set("Screenshot copied to the clipboard - paste it with Ctrl+V")
+        status_var.set(f"Screenshot copied to the clipboard - paste it with {KEY}+V")
 
     def cancel(self):
         self._commit_text()
@@ -2307,6 +3362,8 @@ def draw_shape(image, kind, box, color, width):
 
 
 TEXT_FONT_FILES = ["segoeuib.ttf", "arialbd.ttf", "seguisb.ttf", "segoeui.ttf", "arial.ttf",
+                   "/System/Library/Fonts/Supplemental/Arial Bold.ttf", "/Library/Fonts/Arial Bold.ttf",
+                   "/System/Library/Fonts/HelveticaNeue.ttc", "/System/Library/Fonts/Helvetica.ttc",
                    "DejaVuSans-Bold.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"]
 _TEXT_FONT_CACHE = {}
 
@@ -2550,6 +3607,9 @@ class ScrollingCapture:
 
     def _wheel(self, notches):
         """Scroll the page. Positive = down."""
+        if IS_MAC:                      # "message": scroll event at the point; "cursor": move there too
+            mac_scroll(self.mouse_at[0], self.mouse_at[1], notches, self.method != "message")
+            return
         if self.method == "message":
             self._wheel_message(notches)
         else:
@@ -2585,12 +3645,14 @@ class ScrollingCapture:
         user32.mouse_event(0x0800, 0, 0, int(-120 * notches), 0)   # MOUSEEVENTF_WHEEL
 
     def _grab(self):
-        return ImageGrab.grab(bbox=self.bbox, all_screens=True).convert("RGB")
+        return grab_screen(self.bbox).convert("RGB")
 
     def _escape_pressed(self):
         """Esc is down now, or was pressed since the last check (works
         whichever window has the focus)."""
         try:
+            if IS_MAC:
+                return mac_escape_down()
             return bool(ctypes.windll.user32.GetAsyncKeyState(0x1B) & 0x8001)
         except Exception:
             return False
@@ -2605,6 +3667,9 @@ class ScrollingCapture:
 
     def _save_cursor(self):
         try:
+            if IS_MAC:
+                self.saved_cursor = mac_pointer()
+                return
             from ctypes import wintypes
             point = wintypes.POINT()
             ctypes.windll.user32.GetCursorPos(ctypes.byref(point))
@@ -2614,7 +3679,9 @@ class ScrollingCapture:
 
     def _restore_cursor(self):
         try:
-            if self.saved_cursor:
+            if self.saved_cursor and IS_MAC:
+                mac["Quartz"].CGWarpMouseCursorPosition(self.saved_cursor)
+            elif self.saved_cursor:
                 ctypes.windll.user32.SetCursorPos(*self.saved_cursor)
         except Exception:
             pass
@@ -2787,8 +3854,15 @@ def full_page_capture():
     """Button: select the scrolling area, then capture the whole page."""
     if recorder is not None or ScrollingCapture.active is not None:
         return
-    if sys.platform != "win32":
-        messagebox.showinfo("Not available", "Full-page capture needs Windows.", parent=root)
+    if IS_MAC and not mac_accessibility_allowed(ask=True):
+        messagebox.showinfo(
+            "Allow scrolling",
+            "Full Page scrolls the page for you, which macOS only allows after you agree.\n\n"
+            "Open System Settings > Privacy & Security > Accessibility, switch on "
+            "Screen Capture Utility, then try again.", parent=root)
+        return
+    if not (IS_WINDOWS or IS_MAC):
+        messagebox.showinfo("Not available", "Full-page capture needs Windows or macOS.", parent=root)
         return
     if not ensure_save_folder():
         status_var.set("No save folder selected - capture cancelled")
@@ -3750,6 +4824,7 @@ class CompareWindow:
         self.win.bind("<Right>", lambda e: self.step(1))
         self.win.bind("<Control-c>", lambda e: self.copy_result())
         self.win.bind("<Control-C>", lambda e: self.copy_result())
+        mirror_control_keys(self.win)
         self.win.bind("<Down>", lambda e: self.step(1))
         self.win.bind("<Up>", lambda e: self.step(-1))
 
@@ -3888,7 +4963,7 @@ class CompareWindow:
 
     def _grab(self, i, bbox):
         try:
-            image = ImageGrab.grab(bbox=bbox, all_screens=True)
+            image = grab_screen(bbox)
         except Exception as e:
             image = None
             messagebox.showerror("Capture failed", str(e), parent=root)
@@ -4063,7 +5138,7 @@ class CompareWindow:
         return f"{diff.box1[2] - diff.box1[0]} × {diff.box1[3] - diff.box1[1]} px"
 
     def _list_wheel(self, event):
-        self.list_canvas.yview_scroll(int(-event.delta / 120) * 3, "units")
+        self.list_canvas.yview_scroll(wheel_steps(event) * 3, "units")
 
     def _highlight_item(self):
         for k, (item, widgets) in enumerate(self.items, 1):
@@ -4305,7 +5380,7 @@ class CompareWindow:
 
     def _canvas_wheel(self, event):
         if self.scroll.winfo_ismapped():
-            self.canvas.yview_scroll(int(-event.delta / 120) * 3, "units")
+            self.canvas.yview_scroll(wheel_steps(event) * 3, "units")
 
     # ---- output --------------------------------------------------------
 
@@ -4333,7 +5408,7 @@ class CompareWindow:
         self.copy_button.config(text="Copied")
         self.win.after(1500, lambda: self.copy_button.winfo_exists()
                        and self.copy_button.config(text="Copy result"))
-        status_var.set("Comparison copied to the clipboard - paste it with Ctrl+V")
+        status_var.set(f"Comparison copied to the clipboard - paste it with {KEY}+V")
 
     def save_result(self):
         """Open the result in the Review window (annotate, then save to the
@@ -4376,7 +5451,7 @@ def capture_screen():
 def perform_full_screen_capture():
     try:
         taken_at = datetime.now()
-        screenshot = ImageGrab.grab(all_screens=True)
+        screenshot = grab_screen()
         deliver_capture(screenshot, "Full screen", taken_at)
 
     except Exception as e:
@@ -4403,7 +5478,11 @@ def start_region_selection(on_selected, hint=None, on_cancel=None):
 
 def create_selection_overlay(on_selected, hint=None, on_cancel=None):
     overlay = tk.Toplevel(root)
-    overlay.attributes("-fullscreen", True)
+    if IS_MAC:     # macOS "full screen" opens a new Space; cover the screen instead
+        overlay.overrideredirect(True)
+        overlay.geometry(f"{overlay.winfo_screenwidth()}x{overlay.winfo_screenheight()}+0+0")
+    else:
+        overlay.attributes("-fullscreen", True)
     overlay.attributes("-topmost", True)
     overlay.attributes("-alpha", 0.25)
     overlay.configure(bg="black")
@@ -4495,7 +5574,7 @@ def select_region():
 def capture_selected_region(x1, y1, x2, y2):
     try:
         taken_at = datetime.now()
-        screenshot = ImageGrab.grab(bbox=(x1, y1, x2, y2), all_screens=True)
+        screenshot = grab_screen((x1, y1, x2, y2))
         deliver_capture(screenshot, "Region", taken_at)
 
     except Exception as e:
@@ -4967,7 +6046,7 @@ class ScreenRecorder:
 
                 # The moment this frame shows (on the shared clock)
                 capture_time = self.elapsed()
-                shot = ImageGrab.grab(bbox=bbox, all_screens=True)
+                shot = grab_screen(bbox)
 
                 # Paused while grabbing? Drop this frame.
                 if self.paused:
@@ -5042,6 +6121,8 @@ def set_capture_excluded(window, excluded):
     Returns True if Windows accepted the setting."""
     try:
         window.update_idletasks()
+        if IS_MAC:
+            return mac_set_windows_shared(not excluded)
         affinity = WDA_EXCLUDEFROMCAPTURE if excluded else WDA_NONE
         return bool(ctypes.windll.user32.SetWindowDisplayAffinity(
             window_handle(window), affinity))
@@ -5120,8 +6201,7 @@ def enter_recording_mode(area):
     if bar_excluded:
         print("Recording controls are hidden from the video.")
     else:
-        print("Note: this version of Windows can't hide the recording "
-              "controls from capture.")
+        print("Note: the recording controls can't be hidden from capture here.")
 
 
 def enter_compact_mode(bar, area, title):
@@ -5179,6 +6259,9 @@ recorder = None
 
 
 def primary_monitor_area():
+    if IS_MAC:                     # macOS records in screen points
+        return {"left": 0, "top": 0,
+                "width": root.winfo_screenwidth(), "height": root.winfo_screenheight()}
     # A plain grab() (without all_screens) captures the primary monitor
     width, height = ImageGrab.grab().size
     return {
@@ -5236,10 +6319,10 @@ def start_recording(area):
         enter_recording_mode(area)
 
         filename = get_recording_filename()
-        recorder = ScreenRecorder(
+        recorder = (MacScreenRecorder if IS_MAC else ScreenRecorder)(
             filename, area,
             record_mic=mic_var.get() and AUDIO_AVAILABLE,
-            record_system=system_audio_var.get() and AUDIO_AVAILABLE,
+            record_system=system_audio_var.get() and SYSTEM_AUDIO_AVAILABLE,
         )
         recorder.start()
         print(f"Recording started: {filename}")
@@ -5322,8 +6405,8 @@ def check_saving_done(current):
     if audio:
         message += f" - {audio}"
     if not bar_excluded:
-        message += ("\nNote: the controls may appear in the video "
-                    "(hiding them needs Windows 10 version 2004 or later).")
+        message += ("\nNote: the controls may appear in the video" +
+                    ("." if IS_MAC else " (hiding them needs Windows 10 version 2004 or later)."))
     status_var.set(message)
 
 
@@ -5434,6 +6517,11 @@ status_var = tk.StringVar(value="Choose a folder to save screenshots and recordi
 def screen_work_area():
     """(left, top, width, height) of the usable area (without the taskbar)
     of the monitor the mouse is on - the one the user is looking at."""
+    if IS_MAC:
+        try:
+            return mac_work_area()
+        except Exception:
+            return 0, 25, root.winfo_screenwidth(), root.winfo_screenheight() - 25
     try:
         from ctypes import wintypes
         user32 = ctypes.windll.user32
@@ -5507,9 +6595,26 @@ def S(pixels):
     return int(round(pixels * UI_SCALE))
 
 
+UI_FAMILY = "Helvetica Neue" if IS_MAC else "Segoe UI"
+MAC_FONTS = {"Segoe UI": ("Helvetica Neue", ()), "Segoe UI Semibold": ("Helvetica Neue", ("bold",)),
+             "Consolas": ("Menlo", ())}
+
+
 def font(points, family="Segoe UI", *style):
-    """A font sized for this screen (Tk: negative size = pixels)."""
+    """A font sized for this screen (Tk: negative size = pixels). On a Mac
+    the Windows fonts are swapped for their macOS counterparts."""
+    if IS_MAC and family in MAC_FONTS:
+        family, extra = MAC_FONTS[family]
+        style = tuple(dict.fromkeys(extra + style))
     return (family, -max(9, int(round(points * 4 / 3 * FONT_SCALE))), *style)
+
+
+def wheel_steps(event):
+    """Mouse wheel / trackpad as whole steps (Windows sends 120 per notch,
+    macOS small numbers)."""
+    if IS_MAC:
+        return -int(event.delta)
+    return int(-event.delta / 120)
 
 
 # Fonts (Segoe UI on Windows; Tk falls back elsewhere)
@@ -5712,7 +6817,38 @@ def switch_image(on, enabled=True):
 # Styled Widgets
 # ============================================================
 
-class FlatButton(tk.Button):
+class _LabelButton(tk.Label):
+    """A button made from a Label. macOS draws tk.Button natively and
+    ignores its colours, so the flat coloured buttons use this there."""
+
+    def __init__(self, parent, command=None, **kw):
+        kw.pop("relief", None)
+        self._command = command
+        super().__init__(parent, **kw)
+        self.bind("<ButtonRelease-1>", self._release)
+
+    def _release(self, event):
+        inside = 0 <= event.x < self.winfo_width() and 0 <= event.y < self.winfo_height()
+        if inside and str(self["state"]) != "disabled":
+            self.invoke()
+
+    def invoke(self):
+        if self._command is not None and str(self["state"]) != "disabled":
+            return self._command()
+
+    def configure(self, cnf=None, **kw):
+        if "command" in kw:
+            self._command = kw.pop("command")
+        kw.pop("relief", None)
+        return tk.Label.configure(self, cnf, **kw)
+
+    config = configure
+
+
+_BUTTON_BASE = _LabelButton if IS_MAC else tk.Button
+
+
+class FlatButton(_BUTTON_BASE):
     """Flat button with hover colour. style: primary | secondary | danger | dark"""
 
     STYLES = {
@@ -5743,7 +6879,7 @@ class FlatButton(tk.Button):
 
     def _hover_on(self, on):
         if str(self["state"]) != "disabled":
-            tk.Button.configure(self, bg=self._hover if on else self._bg)
+            _BUTTON_BASE.configure(self, bg=self._hover if on else self._bg)
 
     def configure(self, cnf=None, **kw):
         # Swap the icon together with the text (e.g. Pause <-> Resume)
@@ -5754,7 +6890,7 @@ class FlatButton(tk.Button):
             kw.setdefault("bg", self._bg)
         elif kw.get("state") == "normal":
             kw.setdefault("cursor", "hand2")
-        return tk.Button.configure(self, cnf, **kw)
+        return _BUTTON_BASE.configure(self, cnf, **kw)
 
     config = configure
 
@@ -6019,23 +7155,23 @@ tk.Frame(shot_card.body, bg=CARD, width=S(700), height=1).pack()
 shot_tiles.columnconfigure((0, 1, 2, 3, 4, 5), weight=1, uniform="tiles")
 
 capture_button = Tile(shot_tiles, icon("screen", ACCENT, 24), "Capture Screen",
-                      "Entire desktop\nCtrl+Shift+F", capture_screen)
+                      f"Entire desktop\n{KEY}+Shift+F", capture_screen)
 capture_button.grid(row=0, column=0, columnspan=2, sticky="nsew", padx=(0, S(5)))
 
 region_button = Tile(shot_tiles, icon("region", ACCENT, 24), "Capture Region",
-                     "Drag to select\nCtrl+Shift+R", select_region)
+                     f"Drag to select\n{KEY}+Shift+R", select_region)
 region_button.grid(row=0, column=2, columnspan=2, sticky="nsew", padx=(S(5), S(5)))
 
 fullpage_button = Tile(shot_tiles, icon("fullpage", ACCENT, 24), "Full Page",
-                       "Scrolls long pages\nCtrl+Shift+S", full_page_capture)
+                       f"Scrolls long pages\n{KEY}+Shift+S", full_page_capture)
 fullpage_button.grid(row=0, column=4, columnspan=2, sticky="nsew", padx=(S(5), 0))
 
 ocr_button = Tile(shot_tiles, icon("ocr", ACCENT, 24), "Extract Text",
-                  "Copy text (OCR)\nCtrl+Shift+T", extract_text_region)
+                  f"Copy text (OCR)\n{KEY}+Shift+T", extract_text_region)
 ocr_button.grid(row=1, column=0, columnspan=3, sticky="nsew", padx=(0, S(5)), pady=(S(8), 0))
 
 compare_button = Tile(shot_tiles, icon("compare", ACCENT, 24), "Compare Images",
-                      "Highlight differences\nCtrl+Shift+C", open_compare_window)
+                      f"Highlight differences\n{KEY}+Shift+C", open_compare_window)
 compare_button.grid(row=1, column=3, columnspan=3, sticky="nsew", padx=(S(5), 0), pady=(S(8), 0))
 
 if not OCR_AVAILABLE:
@@ -6055,7 +7191,7 @@ record_tiles.pack(fill="x")
 record_tiles.columnconfigure((0, 1), weight=1, uniform="tiles")
 
 record_button = Tile(record_tiles, icon("record", TEXT, 24), "Record Screen",
-                     "Full screen  ·  Ctrl+Shift+V", toggle_screen_recording,
+                     f"Full screen  ·  {KEY}+Shift+V", toggle_screen_recording,
                      hover_border=RED)
 record_button.grid(row=0, column=0, sticky="nsew", padx=(0, S(6)))
 
@@ -6066,7 +7202,7 @@ record_region_button.grid(row=0, column=1, sticky="nsew", padx=(S(6), 0))
 
 # Sound options
 mic_var = tk.BooleanVar(value=AUDIO_AVAILABLE)
-system_audio_var = tk.BooleanVar(value=AUDIO_AVAILABLE)
+system_audio_var = tk.BooleanVar(value=SYSTEM_AUDIO_AVAILABLE)
 
 audio_row = tk.Frame(record_frame.body, bg=CARD)
 audio_row.pack(fill="x", pady=(S(8), 0))
@@ -6084,6 +7220,10 @@ if not AUDIO_AVAILABLE:
     mic_check.config(state="disabled")
     system_audio_check.config(state="disabled")
     tk.Label(audio_row, text="unavailable", font=F_TILE_SUB, fg=FAINT, bg=CARD).pack(side="left", padx=(S(10), 0))
+elif not SYSTEM_AUDIO_AVAILABLE:
+    system_audio_check.config(state="disabled")
+    tk.Label(audio_row, text="not on Mac" if IS_MAC else "unavailable", font=F_TILE_SUB,
+             fg=FAINT, bg=CARD).pack(side="left", padx=(S(10), 0))
 
 if not RECORDING_AVAILABLE:
     record_button.config(state="disabled")
@@ -6266,6 +7406,7 @@ root.bind("<Control-Shift-T>",
           lambda event: extract_text_region() if recorder is None else None)
 root.bind("<Control-Shift-V>", lambda event: toggle_screen_recording())
 root.bind("<Control-Shift-P>", lambda event: toggle_pause())
+mirror_control_keys(root)                    # Cmd+Shift+... on a Mac
 
 
 # ============================================================
@@ -6273,6 +7414,17 @@ root.bind("<Control-Shift-P>", lambda event: toggle_pause())
 # ============================================================
 
 center_window()
+
+
+def check_mac_permissions():
+    """macOS: ask once for Screen Recording permission, without which
+    screenshots show only the desktop background."""
+    if IS_MAC and not mac_screen_capture_allowed(ask=True):
+        status_var.set("Allow Screen Recording for Screen Capture Utility in System Settings > "
+                       "Privacy & Security, then quit and reopen the app.")
+
+
+root.after(800, check_mac_permissions)
 
 print("Screen Capture Utility started.")
 print("Choose a save folder in the window (type a path or click Browse...).")
