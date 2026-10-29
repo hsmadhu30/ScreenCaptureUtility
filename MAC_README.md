@@ -27,17 +27,16 @@ The Mac version is the **same `main.py`** as the Windows version. When it runs o
 
 ## 2. Build the app (once, on a Mac)
 
-**You need:** a Mac with macOS 11 or later, and Python 3.10 or later **with Tk**.
-- The installer from [python.org](https://www.python.org/downloads/macos/) includes Tk (recommended).
-- With Homebrew: `brew install python python-tk`.
+**You need:** a Mac with macOS 11 or later, and **Python 3.13 from [python.org](https://www.python.org/downloads/macos/)** (Homebrew's `python` + `python-tk` also work).
+- **Don't use Apple's built-in `python3`** (the one that comes with Xcode or the Command Line Tools). It has an old Tk 8.5 that no longer works on current macOS. An app built with it sits in the Dock without ever opening, and can use enormous amounts of memory. The build script now checks for this and stops with a message.
 
 **Steps:**
 1. Put these files in one folder: `main.py`, `icon.ico`, `build_mac.sh`, `requirements-mac.txt`, `entitlements.plist`.
 2. Open **Terminal** in that folder and run:
    ```
-   chmod +x build_mac.sh
-   ./build_mac.sh
+   bash build_mac.sh
    ```
+   The script finds the python.org Python by itself. If an earlier build used another Python, the script rebuilds its environment.
 3. The script creates its own Python environment (`venv-mac`), installs the packages, and builds the app.
 4. The app is at **`dist/Screen Capture Utility.app`**. To share it, zip it with:
    ```
@@ -45,6 +44,10 @@ The Mac version is the **same `main.py`** as the Windows version. When it runs o
    ```
 
 Build on an Apple-silicon Mac (M1 or later) for Apple-silicon Macs. Build on an Intel Mac for Intel Macs, or build on each.
+
+---
+
+**Before rebuilding,** quit any copy that is stuck. Press Option + Command + Esc, choose **Screen Capture Utility** and click **Force Quit**, or run `killall -9 "Screen Capture Utility"` in Terminal. Then delete the old app from Applications.
 
 ---
 
@@ -108,3 +111,23 @@ The parts most likely to need a small fix on a real Mac:
 - **Recording:** uses macOS's `screencapture -v`. It's stopped by typing a character to it, with Ctrl+C as a backup.
 - **Full Page scrolling:** sends scroll-wheel events.
 - **Esc during Full Page:** macOS may only report the Esc key if the app also has the Input Monitoring permission. The Stop button always works.
+
+---
+
+## 6. If the app doesn't open
+
+The app writes a log file every time it starts:
+
+```
+~/Library/Logs/Screen Capture Utility/app.log
+```
+
+To open it, go to Finder, choose **Go > Go to Folder...**, and paste `~/Library/Logs/Screen Capture Utility`.
+
+- **If the window hasn't appeared after 20 seconds**, the log records exactly where the app is stuck, every 20 seconds.
+- **If the app ever uses more than 3 GB of memory**, it records where it was in the log and closes itself, instead of filling up the Mac.
+- **Only one copy runs at a time.** Opening the app again brings the running copy to the front.
+- **Cmd+Q, the app menu's Quit and the Dock's Quit always work.**
+
+Send the log file to whoever maintains the app. It shows the cause straight away.
+

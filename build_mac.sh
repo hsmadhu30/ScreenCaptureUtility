@@ -16,18 +16,52 @@ cd "$(dirname "$0")"
 
 APP_NAME="Screen Capture Utility"
 BUNDLE_ID="${BUNDLE_ID:-com.yourcompany.screencaptureutility}"
-PYTHON="${PYTHON:-python3}"
+
+# ---- Which Python ----------------------------------------------------
+# Apple's own /usr/bin/python3 (from the Command Line Tools) comes with an
+# old Tk 8.5 that no longer works on current macOS: an app built with it
+# sits in the Dock without ever showing its window. So use the python.org
+# Python (preferred) or Homebrew's, never Apple's.
+pick_python() {
+    if [ -n "${PYTHON:-}" ]; then echo "$PYTHON"; return; fi
+    for v in 3.13 3.12 3.11 3.14; do
+        p="/Library/Frameworks/Python.framework/Versions/$v/bin/python$v"
+        if [ -x "$p" ]; then echo "$p"; return; fi
+    done
+    for p in /opt/homebrew/bin/python3 /usr/local/bin/python3; do
+        if [ -x "$p" ]; then echo "$p"; return; fi
+    done
+    command -v python3
+}
+PYTHON="$(pick_python)"
 
 echo "=== Checking Python and Tk ==="
-"$PYTHON" -c "import sys, tkinter; print('Python', sys.version.split()[0], '- Tk', tkinter.TkVersion)" || {
-    echo "Python with Tk is needed. Install Python from python.org (includes Tk),"
-    echo "or with Homebrew: brew install python python-tk"
+echo "Using: $PYTHON"
+TK_OK=$("$PYTHON" - <<'PY' 2>/dev/null || echo "none"
+import sys, tkinter
+print("Python", sys.version.split()[0], "- Tk", tkinter.TkVersion, "-", sys.executable)
+print("ok" if tkinter.TkVersion >= 8.6 and not sys.executable.startswith(("/usr/bin/", "/Library/Developer/CommandLineTools/")) else "old")
+PY
+)
+echo "$TK_OK" | head -1
+if [ "$(echo "$TK_OK" | tail -1)" != "ok" ]; then
+    echo
+    echo "This Python can't build a working Mac app (it's Apple's built-in Python"
+    echo "with the old Tk 8.5, or it has no Tk at all)."
+    echo "  1. Install Python 3.13 from https://www.python.org/downloads/macos/"
+    echo "  2. Run this script again (it finds that Python by itself)."
     exit 1
-}
+fi
 
 echo "=== Creating the build environment (venv-mac) ==="
+# rebuild the environment if it was made with a different Python
+if [ -d venv-mac ] && [ "$(cat venv-mac/.made-with 2>/dev/null)" != "$PYTHON" ]; then
+    echo "Removing the old build environment (made with another Python)"
+    rm -rf venv-mac
+fi
 if [ ! -d venv-mac ]; then
     "$PYTHON" -m venv venv-mac
+    echo "$PYTHON" > venv-mac/.made-with
 fi
 source venv-mac/bin/activate
 python -m pip install --upgrade pip
@@ -43,7 +77,7 @@ fi
 
 echo "=== Building $APP_NAME.app ==="
 python -m PyInstaller \
-    --noconfirm \
+    --noconfirm --clean \
     --windowed \
     --name "$APP_NAME" \
     --osx-bundle-identifier "$BUNDLE_ID" \
@@ -85,6 +119,8 @@ echo
 echo "============================================================"
 echo " Done!  Your app is here:"
 echo "   $(pwd)/$APP"
+echo " If it doesn't open, its log is in:"
+echo "   ~/Library/Logs/Screen Capture Utility/app.log"
 echo " Zip it for sharing with:"
 echo "   ditto -c -k --keepParent \"$APP\" \"dist/$APP_NAME.zip\""
 echo "============================================================"

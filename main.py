@@ -24,6 +24,90 @@ from types import SimpleNamespace
 
 
 # ============================================================
+# macOS safety net (runs before anything else)
+# ============================================================
+# A Mac app opened from Finder has no console, so a problem at start-up is
+# invisible: the icon sits in the Dock and nothing appears. So on a Mac:
+#   - everything the app prints, and any error, goes to a log file:
+#       ~/Library/Logs/Screen Capture Utility/app.log
+#   - if the window hasn't appeared after 20 seconds, the log records
+#     exactly where the app is stuck (every 20 s until it appears)
+#   - if the app ever uses more than 3 GB of memory, it writes where it
+#     was to the log and closes itself, instead of filling the Mac's memory
+#   - only one copy runs at a time (opening it again doesn't start more)
+
+MAC_LOG_PATH = None
+MAC_MEMORY_LIMIT_MB = 3000
+
+
+def _mac_safety_net():
+    global MAC_LOG_PATH
+    import faulthandler
+    log_dir = Path.home() / "Library" / "Logs" / "Screen Capture Utility"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    MAC_LOG_PATH = log_dir / "app.log"
+    try:                                          # keep the log small: last run only
+        if MAC_LOG_PATH.exists() and MAC_LOG_PATH.stat().st_size > 2_000_000:
+            MAC_LOG_PATH.unlink()
+    except OSError:
+        pass
+    log = open(MAC_LOG_PATH, "a", buffering=1, encoding="utf-8", errors="replace")
+    log.write(f"\n===== started {datetime.now():%Y-%m-%d %H:%M:%S}  pid {os.getpid()}  "
+              f"Python {sys.version.split()[0]}  frozen={bool(getattr(sys, 'frozen', False))} =====\n")
+    if getattr(sys, "frozen", False) or sys.stdout is None:
+        sys.stdout = sys.stderr = log
+    faulthandler.enable(file=log, all_threads=True)
+    faulthandler.dump_traceback_later(20, repeat=True, file=log)   # cancelled once the window is up
+
+    # one copy at a time
+    import fcntl
+    lock_path = log_dir / "running.lock"
+    lock_file = open(lock_path, "w")
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        log.write("Another copy is already running - this one closes.\n")
+        try:                                      # bring the running copy to the front
+            subprocess.run(["/usr/bin/osascript", "-e",
+                            'tell application "Screen Capture Utility" to activate'],
+                           timeout=5, capture_output=True)
+        except Exception:
+            pass
+        os._exit(0)
+    _mac_safety_net.lock = lock_file             # keep the lock while running
+
+    # memory limit
+    import resource
+
+    unit = 1024 * 1024 if os.uname().sysname == "Darwin" else 1024     # peak memory: bytes on macOS, KB elsewhere
+
+    def watch_memory():
+        while True:
+            time.sleep(0.5)
+            peak_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / unit
+            if peak_mb > MAC_MEMORY_LIMIT_MB:
+                log.write(f"\n!!! Memory use reached {peak_mb:.0f} MB - closing to protect the Mac. "
+                          "Where the app was:\n")
+                faulthandler.dump_traceback(file=log, all_threads=True)
+                log.flush()
+                os._exit(70)
+
+    threading.Thread(target=watch_memory, name="memory-watch", daemon=True).start()
+
+
+def mac_startup_done():
+    """The window is on screen: stop the 'where is it stuck' reports."""
+    if MAC_LOG_PATH is not None:
+        import faulthandler
+        faulthandler.cancel_dump_traceback_later()
+        print(f"Window shown {datetime.now():%H:%M:%S}")
+
+
+if sys.platform == "darwin":
+    _mac_safety_net()
+
+
+# ============================================================
 # Optional packages (installed automatically if missing)
 # ============================================================
 # Screen recording uses ffmpeg (imageio-ffmpeg) and, for sound,
@@ -104,10 +188,26 @@ MAC_PACKAGES = [("objc", "pyobjc-core"),
                 ("Quartz", "pyobjc-framework-Quartz"),
                 ("Vision", "pyobjc-framework-Vision"),
                 ("ApplicationServices", "pyobjc-framework-ApplicationServices")]
-mac = {}
-if IS_MAC:
-    for _module, _pip_name in MAC_PACKAGES:
-        mac[_module] = ensure_package(_module, _pip_name)
+class _MacModules(dict):
+    """The pyobjc modules, imported the first time a Mac feature needs one
+    (not at start-up, so a problem in one can't stop the window opening)."""
+
+    PIP = dict(MAC_PACKAGES)
+
+    def __missing__(self, name):
+        module = None
+        if IS_MAC and name in self.PIP:
+            print(f"Loading {name}...")
+            module = ensure_package(name, self.PIP[name])
+        self[name] = module
+        return module
+
+    def get(self, name, default=None):
+        module = self[name]
+        return default if module is None else module
+
+
+mac = _MacModules()
 
 
 def mac_screen_capture_allowed(ask=False):
@@ -214,6 +314,9 @@ def mac_work_area():
     primary_height = appkit.NSScreen.screens()[0].frame().size.height
     top = primary_height - (visible.origin.y + visible.size.height)
     return (int(visible.origin.x), int(top), int(visible.size.width), int(visible.size.height))
+
+
+mac_work_area.ready = False      # set once the window is up (pyobjc is then safe to use)
 
 
 def mac_set_windows_shared(shared):
@@ -578,7 +681,8 @@ if sys.platform == "win32":
             print(f"Could not install OCR support: {e}")
     OCR_AVAILABLE = ocr_installed()
 elif IS_MAC:
-    OCR_AVAILABLE = mac.get("Vision") is not None and mac.get("objc") is not None
+    # only check that it's there; it's loaded the first time text is extracted
+    OCR_AVAILABLE = all(importlib.util.find_spec(m) is not None for m in ("Vision", "objc"))
 
 if not OCR_AVAILABLE:
     print("Text extraction (OCR) is disabled (needs Windows 10/11 and PyWinRT, "
@@ -6518,10 +6622,13 @@ def screen_work_area():
     """(left, top, width, height) of the usable area (without the taskbar)
     of the monitor the mouse is on - the one the user is looking at."""
     if IS_MAC:
-        try:
-            return mac_work_area()
-        except Exception:
-            return 0, 25, root.winfo_screenwidth(), root.winfo_screenheight() - 25
+        if mac_work_area.ready:
+            try:
+                return mac_work_area()
+            except Exception:
+                pass
+        # menu bar at the top (about 25-38 points), Dock at the bottom
+        return 0, 38, root.winfo_screenwidth(), root.winfo_screenheight() - 38 - 70
     try:
         from ctypes import wintypes
         user32 = ctypes.windll.user32
@@ -7305,6 +7412,18 @@ fit_to_screen()
 def center_window():
     """Show the window in the middle of the screen (monitor, laptop,
     any size or display scaling)."""
+    if IS_MAC:
+        # macOS places the title bar itself: no invisible-window measuring
+        root.update_idletasks()
+        left, top, width, height = screen_work_area()
+        x = left + max(0, (width - root.winfo_reqwidth()) // 2)
+        y = top + max(0, (height - root.winfo_reqheight() - 28) // 3)
+        root.geometry(f"+{x}+{y}")
+        root.deiconify()
+        root.lift()
+        root.attributes("-topmost", True)                  # come to the front once
+        root.after(300, lambda: root.attributes("-topmost", False))
+        return
     root.update_idletasks()
     left, top, width, height = screen_work_area()
 
@@ -7424,7 +7543,22 @@ def check_mac_permissions():
                        "Privacy & Security, then quit and reopen the app.")
 
 
-root.after(800, check_mac_permissions)
+def mac_after_start():
+    mac_startup_done()
+    mac_work_area.ready = True
+    check_mac_permissions()
+
+
+if IS_MAC:
+    # Cmd+Q, the app menu's Quit and the Dock's Quit go through on_close;
+    # clicking the Dock icon brings the window back
+    root.createcommand("tk::mac::Quit", on_close)
+    root.createcommand("tk::mac::ReopenApplication", lambda *a: (root.deiconify(), root.lift()))
+    try:
+        signal.signal(signal.SIGTERM, lambda *a: root.after(0, on_close))
+    except Exception:
+        pass
+    root.after(800, mac_after_start)
 
 print("Screen Capture Utility started.")
 print("Choose a save folder in the window (type a path or click Browse...).")

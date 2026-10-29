@@ -8,4 +8,4 @@ pyobjc-framework-Cocoa
 pyobjc-framework-Quartz
 pyobjc-framework-Vision
 pyobjc-framework-ApplicationServices
-pyinstaller
+pyinstaller>=6.11
