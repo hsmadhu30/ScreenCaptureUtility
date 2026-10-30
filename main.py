@@ -21,90 +21,127 @@ import concurrent.futures
 import tempfile
 import signal
 from types import SimpleNamespace
+import faulthandler
 
 
 # ============================================================
-# macOS safety net (runs before anything else)
+# Start-up log and safety guard
 # ============================================================
-# A Mac app opened from Finder has no console, so a problem at start-up is
-# invisible: the icon sits in the Dock and nothing appears. So on a Mac:
-#   - everything the app prints, and any error, goes to a log file:
-#       ~/Library/Logs/Screen Capture Utility/app.log
-#   - if the window hasn't appeared after 20 seconds, the log records
-#     exactly where the app is stuck (every 20 s until it appears)
-#   - if the app ever uses more than 3 GB of memory, it writes where it
-#     was to the log and closes itself, instead of filling the Mac's memory
-#   - only one copy runs at a time (opening it again doesn't start more)
+# An app opened from the Finder has no Terminal, so on a Mac everything the
+# app prints goes to ~/Library/Logs/Screen Capture Utility.log. If start-up
+# stalls, the log gets a stack trace of what the app was doing; if start-up
+# memory runs away, the app stops itself (instead of filling the Mac's
+# memory) and says where the log is.
+# "--selftest" starts the app, shows the window for a moment and quits; the
+# Mac build script uses it to check the finished app.
 
-MAC_LOG_PATH = None
-MAC_MEMORY_LIMIT_MB = 3000
+APP_NAME = "Screen Capture Utility"
+FROZEN = getattr(sys, "frozen", False)
+SELFTEST = "--selftest" in sys.argv
+STARTUP_MEMORY_LIMIT_MB = 1500        # the window normally starts with ~100 MB
+_T0 = time.time()
+_started = threading.Event()
 
 
-def _mac_safety_net():
-    global MAC_LOG_PATH
-    import faulthandler
-    log_dir = Path.home() / "Library" / "Logs" / "Screen Capture Utility"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    MAC_LOG_PATH = log_dir / "app.log"
-    try:                                          # keep the log small: last run only
-        if MAC_LOG_PATH.exists() and MAC_LOG_PATH.stat().st_size > 2_000_000:
-            MAC_LOG_PATH.unlink()
-    except OSError:
-        pass
-    log = open(MAC_LOG_PATH, "a", buffering=1, encoding="utf-8", errors="replace")
-    log.write(f"\n===== started {datetime.now():%Y-%m-%d %H:%M:%S}  pid {os.getpid()}  "
-              f"Python {sys.version.split()[0]}  frozen={bool(getattr(sys, 'frozen', False))} =====\n")
-    if getattr(sys, "frozen", False) or sys.stdout is None:
-        sys.stdout = sys.stderr = log
-    faulthandler.enable(file=log, all_threads=True)
-    faulthandler.dump_traceback_later(20, repeat=True, file=log)   # cancelled once the window is up
-
-    # one copy at a time
-    import fcntl
-    lock_path = log_dir / "running.lock"
-    lock_file = open(lock_path, "w")
+def peak_memory_mb():
+    """Highest memory use of this process so far (MB)."""
     try:
-        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        import resource
+        peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        return peak / (1024 * 1024) if os.uname().sysname == "Darwin" else peak / 1024   # bytes on macOS, KB on Linux
+    except Exception:
+        try:                                   # Windows
+            class PMC(ctypes.Structure):
+                _fields_ = [("cb", ctypes.c_ulong), ("PageFaultCount", ctypes.c_ulong),
+                            ("PeakWorkingSetSize", ctypes.c_size_t), ("WorkingSetSize", ctypes.c_size_t)] + \
+                           [(f"f{i}", ctypes.c_size_t) for i in range(6)]
+            pmc = PMC(); pmc.cb = ctypes.sizeof(PMC)
+            ctypes.windll.psapi.GetProcessMemoryInfo(ctypes.windll.kernel32.GetCurrentProcess(),
+                                                     ctypes.byref(pmc), pmc.cb)
+            return pmc.PeakWorkingSetSize / (1024 * 1024)
+        except Exception:
+            return 0.0
+
+
+def _open_log():
+    if sys.platform != "darwin" and not SELFTEST:
+        return None, None
+    try:
+        if sys.platform == "darwin":
+            folder = Path.home() / "Library" / "Logs"
+        else:
+            folder = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / APP_NAME
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / f"{APP_NAME}.log"
+        return open(path, "w", encoding="utf-8", buffering=1), path
     except OSError:
-        log.write("Another copy is already running - this one closes.\n")
-        try:                                      # bring the running copy to the front
-            subprocess.run(["/usr/bin/osascript", "-e",
-                            'tell application "Screen Capture Utility" to activate'],
-                           timeout=5, capture_output=True)
+        return None, None
+
+
+LOG_FILE, LOG_PATH = _open_log()
+
+
+class _Tee:
+    """Writes to the log and, when there is one, the Terminal."""
+
+    def __init__(self, *streams):
+        self.streams = [s for s in streams if s is not None]
+
+    def write(self, text):
+        for s in self.streams:
+            try:
+                s.write(text)
+            except Exception:
+                pass
+        return len(text)
+
+    def flush(self):
+        for s in self.streams:
+            try:
+                s.flush()
+            except Exception:
+                pass
+
+
+if LOG_FILE is not None:
+    sys.stdout = _Tee(sys.stdout, LOG_FILE)
+    sys.stderr = _Tee(sys.stderr, LOG_FILE)
+    faulthandler.enable(LOG_FILE)
+    faulthandler.dump_traceback_later(30, exit=False, file=LOG_FILE)   # stalled start-up -> stack trace
+
+
+def startup_step(name):
+    print(f"[start-up {time.time() - _T0:5.1f} s, {peak_memory_mb():5.0f} MB] {name}")
+
+
+def _tell_user_and_quit(message):
+    print(message)
+    if LOG_FILE is not None:
+        faulthandler.dump_traceback(LOG_FILE, all_threads=True)
+        LOG_FILE.flush()
+    if sys.platform == "darwin" and not SELFTEST:
+        text = message.replace('"', "'") + f"\\n\\nDetails: {LOG_PATH}"
+        try:
+            subprocess.Popen(["/usr/bin/osascript", "-e",
+                              f'display alert "{APP_NAME} could not start" message "{text}" as critical'])
         except Exception:
             pass
-        os._exit(0)
-    _mac_safety_net.lock = lock_file             # keep the lock while running
-
-    # memory limit
-    import resource
-
-    unit = 1024 * 1024 if os.uname().sysname == "Darwin" else 1024     # peak memory: bytes on macOS, KB elsewhere
-
-    def watch_memory():
-        while True:
-            time.sleep(0.5)
-            peak_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / unit
-            if peak_mb > MAC_MEMORY_LIMIT_MB:
-                log.write(f"\n!!! Memory use reached {peak_mb:.0f} MB - closing to protect the Mac. "
-                          "Where the app was:\n")
-                faulthandler.dump_traceback(file=log, all_threads=True)
-                log.flush()
-                os._exit(70)
-
-    threading.Thread(target=watch_memory, name="memory-watch", daemon=True).start()
+    os._exit(70)
 
 
-def mac_startup_done():
-    """The window is on screen: stop the 'where is it stuck' reports."""
-    if MAC_LOG_PATH is not None:
-        import faulthandler
-        faulthandler.cancel_dump_traceback_later()
-        print(f"Window shown {datetime.now():%H:%M:%S}")
+def _startup_guard():
+    """Stops a start-up whose memory runs away (seen on some Macs)."""
+    while not _started.is_set() and time.time() - _T0 < 120:
+        used = peak_memory_mb()
+        if used > STARTUP_MEMORY_LIMIT_MB:
+            _tell_user_and_quit(f"Start-up stopped: it was using {used:.0f} MB of memory "
+                                f"(normally about 100 MB).")
+        time.sleep(0.25)
 
 
-if sys.platform == "darwin":
-    _mac_safety_net()
+threading.Thread(target=_startup_guard, name="startup-guard", daemon=True).start()
+startup_step(f"Python {sys.version.split()[0]} on {sys.platform}, Tk {tk.TkVersion}, "
+             f"{'app' if FROZEN else 'script'}{', self-test' if SELFTEST else ''}")
 
 
 # ============================================================
@@ -188,26 +225,10 @@ MAC_PACKAGES = [("objc", "pyobjc-core"),
                 ("Quartz", "pyobjc-framework-Quartz"),
                 ("Vision", "pyobjc-framework-Vision"),
                 ("ApplicationServices", "pyobjc-framework-ApplicationServices")]
-class _MacModules(dict):
-    """The pyobjc modules, imported the first time a Mac feature needs one
-    (not at start-up, so a problem in one can't stop the window opening)."""
-
-    PIP = dict(MAC_PACKAGES)
-
-    def __missing__(self, name):
-        module = None
-        if IS_MAC and name in self.PIP:
-            print(f"Loading {name}...")
-            module = ensure_package(name, self.PIP[name])
-        self[name] = module
-        return module
-
-    def get(self, name, default=None):
-        module = self[name]
-        return default if module is None else module
-
-
-mac = _MacModules()
+mac = {}
+if IS_MAC:
+    for _module, _pip_name in MAC_PACKAGES:
+        mac[_module] = ensure_package(_module, _pip_name)
 
 
 def mac_screen_capture_allowed(ask=False):
@@ -309,14 +330,11 @@ def mac_work_area():
     """(left, top, width, height) of the usable part (without menu bar and
     Dock) of the screen that has the focus, in top-left screen points."""
     appkit = mac["AppKit"]
-    screen = appkit.NSScreen.mainScreen()
+    screen = appkit.NSScreen.mainScreen() or appkit.NSScreen.screens()[0]
     visible = screen.visibleFrame()
     primary_height = appkit.NSScreen.screens()[0].frame().size.height
     top = primary_height - (visible.origin.y + visible.size.height)
     return (int(visible.origin.x), int(top), int(visible.size.width), int(visible.size.height))
-
-
-mac_work_area.ready = False      # set once the window is up (pyobjc is then safe to use)
 
 
 def mac_set_windows_shared(shared):
@@ -368,9 +386,6 @@ def run_mac_ocr(image, language_tag=None):
 
     with objc.autorelease_pool():
         prepared = _prepare_for_ocr(image, 4096).convert("RGB")
-        buffer = BytesIO()
-        prepared.save(buffer, format="PNG")
-        data = buffer.getvalue()
 
         request = Vision.VNRecognizeTextRequest.alloc().init()
         request.setRecognitionLevel_(Vision.VNRequestTextRecognitionLevelAccurate)
@@ -385,34 +400,45 @@ def run_mac_ocr(image, language_tag=None):
         elif hasattr(request, "setAutomaticallyDetectsLanguage_"):
             request.setAutomaticallyDetectsLanguage_(True)       # macOS 13+
 
-        handler = Vision.VNImageRequestHandler.alloc().initWithData_options_(
-            Foundation.NSData.dataWithBytes_length_(data, len(data)), None)
-        ok, error = handler.performRequests_error_([request], None)
-        if not ok:
-            raise RuntimeError(f"Text recognition failed: {error}")
+        def recognize(picture):
+            """Vision on a PIL image -> lines in that image's pixels."""
+            buffer = BytesIO()
+            picture.convert("RGB").save(buffer, format="PNG")
+            data = buffer.getvalue()
+            handler = Vision.VNImageRequestHandler.alloc().initWithData_options_(
+                Foundation.NSData.dataWithBytes_length_(data, len(data)), None)
+            ok, error = handler.performRequests_error_([request], None)
+            if not ok:
+                raise RuntimeError(f"Text recognition failed: {error}")
+            width, height = picture.size
+            found = []
+            for observation in request.results() or []:
+                candidates = observation.topCandidates_(1)
+                if not candidates:
+                    continue
+                box = observation.boundingBox()           # 0..1, origin bottom-left
+                rect = SimpleNamespace(x=box.origin.x * width,
+                                       y=(1 - box.origin.y - box.size.height) * height,
+                                       width=box.size.width * width,
+                                       height=box.size.height * height)
+                text = str(candidates[0].string())
+                found.append(SimpleNamespace(text=text,
+                                             words=[SimpleNamespace(text=text, bounding_rect=rect)]))
+            found.sort(key=lambda line: (round(line.words[0].bounding_rect.y / 8),
+                                         line.words[0].bounding_rect.x))
+            return found
 
-        width, height = prepared.size
-        lines = []
-        for observation in request.results() or []:
-            candidates = observation.topCandidates_(1)
-            if not candidates:
-                continue
-            box = observation.boundingBox()           # 0..1, origin bottom-left
-            rect = SimpleNamespace(x=box.origin.x * width,
-                                   y=(1 - box.origin.y - box.size.height) * height,
-                                   width=box.size.width * width,
-                                   height=box.size.height * height)
-            text = str(candidates[0].string())
-            lines.append(SimpleNamespace(text=text,
-                                         words=[SimpleNamespace(text=text, bounding_rect=rect)]))
-        lines.sort(key=lambda line: (round(line.words[0].bounding_rect.y / 8),
-                                     line.words[0].bounding_rect.x))
+        lines = recognize(prepared)
+        try:
+            _reread_lines(lines, prepared, recognize)
+        except Exception as e:
+            print(f"Re-reading lines skipped: {e}")
 
     languages = [("Automatic", "")] + [(language_name(t), t) for t in supported]
     try:
-        _repair_symbols(lines, prepared)       # bullets, *, " and 0 checked against the image
-    except Exception:
-        pass
+        _repair_symbols(lines, prepared)       # bullets, *, ", ) and 0 checked against the image
+    except Exception as e:
+        print(f"Symbol check skipped: {e}")
 
     return {
         "text": _layout_text(lines),
@@ -681,8 +707,7 @@ if sys.platform == "win32":
             print(f"Could not install OCR support: {e}")
     OCR_AVAILABLE = ocr_installed()
 elif IS_MAC:
-    # only check that it's there; it's loaded the first time text is extracted
-    OCR_AVAILABLE = all(importlib.util.find_spec(m) is not None for m in ("Vision", "objc"))
+    OCR_AVAILABLE = mac.get("Vision") is not None and mac.get("objc") is not None
 
 if not OCR_AVAILABLE:
     print("Text extraction (OCR) is disabled (needs Windows 10/11 and PyWinRT, "
@@ -1690,6 +1715,9 @@ def _layout_text(lines, keep_layout=True):
                     parts.append(" " * max(2, column - len("".join(parts))))
                 elif gap < 0.35 * row_char_w and (_is_cjk(w.text) or _is_cjk(parts[-1])):
                     pass                                      # CJK text has no spaces
+                elif gap < 0.25 * row_char_w or (gap < 1.0 * row_char_w and (
+                        w.text[0] in ".,;:)]}" or parts[-1][-1:] in ("(", "[", "{"))):
+                    pass                                      # one word split in two: root.mainloop(), print("x")
                 else:
                     parts.append(" ")
             parts.append(w.text)
@@ -1717,6 +1745,7 @@ def _clean_ocr_text(text):
 
 
 OCR_INK = 140          # darker than this (in the prepared, dark-on-light image) is ink
+_INK_LUT = [1 if v < OCR_INK else 0 for v in range(256)]
 
 
 def _components(gray, box):
@@ -1728,12 +1757,11 @@ def _components(gray, box):
     w, h = x1 - x0, y1 - y0
     if w <= 0 or h <= 0:
         return []
-    data = gray.crop((x0, y0, x1, y1)).tobytes()
-    ink = bytearray(1 if v < OCR_INK else 0 for v in data)
+    ink = bytearray(gray.crop((x0, y0, x1, y1)).point(_INK_LUT).tobytes())   # 1 = ink
     blobs = []
-    for start in range(w * h):
-        if not ink[start]:
-            continue
+    start = ink.find(1)
+    while start != -1:
+        next_start = start
         ink[start] = 0
         stack = [start]
         bx0 = bx1 = start % w
@@ -1765,6 +1793,7 @@ def _components(gray, box):
         if by1 == h - 1: touches.add("bottom")
         blobs.append(SimpleNamespace(x0=x0 + bx0, y0=y0 + by0, x1=x0 + bx1 + 1, y1=y0 + by1 + 1,
                                      n=n, touches=touches))
+        start = ink.find(1, next_start + 1)
     return blobs
 
 
@@ -1783,6 +1812,14 @@ def _glyph_groups(blobs, min_size=2):
             groups.append(SimpleNamespace(parts=[b], x0=b.x0, y0=b.y0, x1=b.x1, y1=b.y1, n=b.n,
                                           touches=set(b.touches)))
     return groups
+
+
+def _line_glyphs(gray, region):
+    """Glyphs of one line inside region. Ink cut by the region's top or
+    bottom edge belongs to the lines above or below (tightly spaced code),
+    so it's left out before glyphs are put together."""
+    blobs = [b for b in _components(gray, region) if not (b.touches & {"top", "bottom"})]
+    return _glyph_groups(blobs)
 
 
 def _has_hole(gray, g):
@@ -1836,9 +1873,84 @@ def _classify_symbol(gray, groups, top, base):
             return "•"
         if hole and 0.3 <= fill < 0.75:
             return "◦"
-    if (0.25 * H <= h <= 0.7 * H and 0.5 <= aspect <= 1.5 and rel_top < 0.25 and rel_bottom < 0.72
+    if (0.25 * H <= h <= 0.7 * H and 0.5 <= aspect <= 1.5 and rel_top < 0.2 and rel_bottom < 0.66
             and 0.2 <= fill <= 0.65 and not _has_hole(gray, g)):
         return "*"
+    return None
+
+
+def _ink_spans(gray, g):
+    """Leftmost and rightmost ink of each row of a glyph (None for a blank row)."""
+    w, h = g.x1 - g.x0, g.y1 - g.y0
+    data = gray.crop((g.x0, g.y0, g.x1, g.y1)).tobytes()
+    spans = []
+    for y in range(h):
+        row = data[y * w:(y + 1) * w]
+        xs = [x for x in range(w) if row[x] < OCR_INK]
+        spans.append((xs[0], xs[-1]) if xs else None)
+    return spans
+
+
+def _classify_punct(gray, g, top, base):
+    """Small punctuation OCR engines drop at the end of a line or a word:
+    ) ( ] [ . , : ; - from the glyph's shape and position. None if unsure."""
+    H = max(4.0, base - top)
+    w, h = g.x1 - g.x0, g.y1 - g.y0
+    rel_top, rel_bottom = (g.y0 - top) / H, (g.y1 - top) / H
+    fill = g.n / float(max(1, w * h))
+
+    def dot_like(p):
+        pw, ph = p.x1 - p.x0, p.y1 - p.y0
+        return 0.07 * H <= ph <= 0.26 * H and 0.55 <= pw / float(max(1, ph)) <= 1.8
+
+    parts = getattr(g, "parts", [g])
+    if len(parts) == 2:
+        upper, lower = sorted(parts, key=lambda p: p.y0)
+        if dot_like(upper) and 0.25 <= ((upper.y0 + upper.y1) / 2 - top) / H <= 0.7:
+            if dot_like(lower) and 0.82 <= (lower.y1 - top) / H <= 1.15:
+                return ":"
+            if (lower.y1 - top) / H >= 1.05 and (lower.y1 - lower.y0) <= 0.5 * H:
+                return ";"
+        return None
+    if len(parts) != 1:
+        return None
+    if dot_like(g) and 0.82 <= rel_bottom <= 1.15 and fill >= 0.5:
+        return "."
+    if 0.15 * H <= h <= 0.45 * H and w <= 0.3 * H and rel_top >= 0.62 and rel_bottom >= 1.05:
+        return ","
+    if h <= 0.16 * H and 1.6 <= w / float(max(1, h)) and w <= 1.0 * H and 0.4 <= (rel_top + rel_bottom) / 2 <= 0.8:
+        return "-"
+    if 0.85 * H <= h <= 1.7 * H and w <= 0.5 * H and w <= 0.45 * h and rel_top <= 0.15 and rel_bottom >= 0.98:
+        spans = _ink_spans(gray, g)
+        n = len(spans)
+        band = max(1, n // 7)
+
+        def centre(rows):
+            rows = [r for r in rows if r]
+            return sum((a + b) / 2 for a, b in rows) / len(rows) if rows else None
+
+        def width(rows):
+            rows = [r for r in rows if r]
+            return max(b - a + 1 for a, b in rows) if rows else 0
+
+        top_rows, mid_rows, bot_rows = spans[:band], spans[n // 2 - band // 2:n // 2 + band // 2 + 1], spans[-band:]
+        edge_rows = max(1, n // 16)                     # a bracket's flat top and bottom
+        c_top, c_mid, c_bot = centre(top_rows), centre(mid_rows), centre(bot_rows)
+        if None in (c_top, c_mid, c_bot):
+            return None
+        # a square bracket has one straight side; a parenthesis is curved
+        body = [r for r in spans[n // 5:n - n // 5] if r]
+        lefts, rights = [a for a, _ in body], [b for _, b in body]
+        straight_left = body and max(lefts) - min(lefts) <= max(1, 0.12 * w)
+        straight_right = body and max(rights) - min(rights) <= max(1, 0.12 * w)
+        if (straight_left or straight_right) and width(spans[:edge_rows]) >= 0.6 * w \
+                and width(spans[-edge_rows:]) >= 0.6 * w and width(mid_rows) <= 0.6 * w and w >= 3:
+            return "[" if straight_left else "]"
+        bulge = c_mid - (c_top + c_bot) / 2
+        if bulge >= max(1.0, 0.18 * w):
+            return ")"
+        if bulge <= -max(1.0, 0.18 * w):
+            return "("
     return None
 
 
@@ -1850,18 +1962,254 @@ def _is_tick(g, top, H):
 
 
 BULLETS = ("•", "◦", "▪")
+PUNCTUATION = (")", "(", "]", "[", ".", ",", ":", ";", "-")
 QUOTE_LOOKALIKES = {"''", "``", "“", "”", "„", "″", "'", "`", "‘", "’", "*", "°", "^", "-"}
 STAR_LOOKALIKES = {"x", "X", "×", "+", "^", "°", "'", '"', "-", "#", "%", "¥"}
 SYMBOL_LOOKALIKES = set("•·∙●◦○▪■*¢«»©®°eoaOcCx×+'\"`^-—~#%")
 
 
-def _line_metrics(words):
-    """Top of capitals and baseline of a line of words (medians, so words
-    with descenders or without ascenders don't skew them)."""
-    tall = [w for w in words if len(w.text) >= 2] or words
+_TALL_CHARS = set("ABCDEFGHIJKLMNOPQRSTUVWXYZbdfhkl0123456789")
+_LOW_CHARS = set("gjpqy()[]{}|,;_$@Q")
+
+
+def _ink_baseline(gray, words, top):
+    """Baseline from the ink: the lowest row that still has a good share of
+    the line's ink (descenders - g p y, brackets - have much less)."""
+    x0 = int(min(w.x for w in words)); x1 = int(max(w.x + w.w for w in words))
+    y1 = int(max(w.y + w.h for w in words))
+    band = gray.crop((x0, int(top), x1, y1))
+    w, h = band.size
+    data = band.tobytes()
+    counts = [sum(1 for v in data[y * w:(y + 1) * w] if v < OCR_INK) for y in range(h)]
+    if not counts or max(counts) == 0:
+        return y1
+    peak = max(counts)
+    last = max(y for y, c in enumerate(counts) if c >= 0.3 * peak)
+    return int(top) + last + 1
+
+
+def _line_metrics(words, gray=None):
+    """Top of capitals and baseline of a line of words. The words' own text
+    says which boxes to trust: the top from words with capitals, digits or
+    tall letters (b d f h k l), the baseline from words with nothing below
+    the line (no g j p q y, brackets or commas). Medians, so one odd box
+    doesn't skew them."""
+    usable = [w for w in words if len(w.text) >= 2] or words
+    tall = [w for w in usable if any(c in _TALL_CHARS for c in w.text)] or usable
+    flat = [w for w in usable if not any(c in _LOW_CHARS for c in w.text)]
     tops = sorted(w.y for w in tall)
-    bottoms = sorted(w.y + w.h for w in tall)
-    return tops[len(tops) // 2], bottoms[len(bottoms) // 2]
+    top = tops[len(tops) // 2]
+    if gray is not None:                 # the ink is the most reliable guide
+        base = _ink_baseline(gray, words, top)
+    elif flat:
+        bottoms = sorted(w.y + w.h for w in flat)
+        base = bottoms[len(bottoms) // 2]
+    else:
+        bottoms = sorted(w.y + w.h for w in usable)
+        base = bottoms[len(bottoms) // 2]
+    if base - top < 4:
+        return min(w.y for w in words), max(w.y + w.h for w in words)
+    return top, base
+
+
+def _ink_lines(gray):
+    """Lines of ink in the prepared image: (top, bottom, left, right)."""
+    hist = gray.histogram()
+    background = max(range(256), key=hist.__getitem__)
+    mask = gray.point(lambda v: 255 if abs(v - background) > 60 else 0)
+    w, h = mask.size
+    folded, fw = mask, w
+    while fw > 1:                                  # fold columns: any ink in the row?
+        half = (fw + 1) // 2
+        folded = ImageChops.lighter(folded.crop((0, 0, half, h)), folded.crop((fw - half, 0, fw, h)))
+        fw = half
+    rows = folded.tobytes()
+    spans, start, gap = [], None, 0
+    for y in range(h + 2):
+        busy = y < h and rows[y] > 0
+        if busy:
+            if start is None:
+                start = y
+            gap = 0
+        elif start is not None:
+            gap += 1
+            if gap > 2:
+                y1 = y - gap + 1
+                box = mask.crop((0, start, w, y1)).getbbox()
+                if box and y1 - start >= 4:
+                    spans.append((start, y1, box[0], box[2]))
+                start, gap = None, 0
+    return spans
+
+
+def _reread_lines(lines, gray, recognize, limit=15):
+    """OCR engines (Windows OCR in particular) sometimes skip a whole line,
+    or stop before the end of one (a closing ") or ..." left off). Each line
+    of ink in the image that no word covers, or that has ink well past its
+    first or last word, is read again on its own - a single line is read
+    much more reliably - and the better reading is kept.
+    recognize(image) -> lines in that image's coordinates."""
+    import difflib
+    gray = gray.convert("L")
+    spans = _ink_lines(gray)
+    if not spans:
+        return lines
+    heights = sorted(y1 - y0 for y0, y1, _, _ in spans)
+    typical = heights[len(heights) // 2]
+    words = [(line, word) for line in lines for word in (getattr(line, "words", None) or []) if word.text.strip()]
+    done = 0
+    for y0, y1, ink_left, ink_right in spans:
+        bh = y1 - y0
+        if bh < 0.5 * typical or bh > 2.5 * typical or done >= limit:
+            continue
+        mine = [(line, word) for line, word in words
+                if y0 - 0.25 * bh <= word.bounding_rect.y + word.bounding_rect.height / 2 <= y1 + 0.25 * bh]
+        if mine:
+            left = min(word.bounding_rect.x for _, word in mine)
+            right = max(word.bounding_rect.x + word.bounding_rect.width for _, word in mine)
+            if right >= ink_right - 0.6 * bh and left <= ink_left + 0.6 * bh:
+                continue                                       # the words cover the line
+        done += 1
+        # just this line (the lines above and below would only confuse the engine)
+        top = max(0, y0 - 2)
+        left_x = max(0, int(ink_left - bh))
+        strip = gray.crop((left_x, top, min(gray.width, int(ink_right + bh)), min(gray.height, y1 + 2)))
+        margin = max(16, int(0.6 * bh))
+        canvas = Image.new("L", (strip.width + 2 * margin, strip.height + 2 * margin), 255)
+        canvas.paste(strip, (margin, margin))
+        try:
+            found = recognize(canvas)
+        except Exception:
+            continue
+        new_words = []
+        for line in found or []:
+            for word in getattr(line, "words", None) or []:
+                if not word.text.strip():
+                    continue
+                r = word.bounding_rect
+                if not y0 - 0.3 * bh <= r.y - margin + top + r.height / 2 <= y1 + 0.3 * bh:
+                    continue
+                new_words.append(SimpleNamespace(text=word.text, bounding_rect=SimpleNamespace(
+                    x=r.x - margin + left_x, y=r.y - margin + top, width=r.width, height=r.height)))
+        if not new_words:
+            continue
+        new_text = " ".join(w.text for w in new_words)
+        if mine:
+            old_text = " ".join(word.text for _, word in sorted(mine, key=lambda lw: lw[1].bounding_rect.x))
+            new_left = min(w.bounding_rect.x for w in new_words)
+            new_right = max(w.bounding_rect.x + w.bounding_rect.width for w in new_words)
+            better_reach = new_right > right + 0.3 * bh or new_left < left - 0.3 * bh
+            similar = difflib.SequenceMatcher(None, old_text, new_text).ratio() >= 0.6
+            if not (better_reach and similar and len(new_text) >= len(old_text)):
+                continue
+            for line, word in mine:                            # replace the short reading
+                line.words = [w for w in line.words if w is not word]
+            words = [(line, word) for line, word in words if all(word is not w for _, w in mine)]
+        line = SimpleNamespace(text=new_text, words=new_words)
+        lines.append(line)
+        words += [(line, w) for w in new_words]
+    lines[:] = [line for line in lines if getattr(line, "words", None) or not hasattr(line, "words")]
+    lines.sort(key=lambda line: min((w.bounding_rect.y for w in line.words), default=0))
+    for line in lines:
+        line.text = " ".join(w.text for w in line.words)
+    return lines
+
+
+END_MARKS = set('.,;:)]}"\'!?*')
+START_MARKS = set('([{"\'')
+ALL_MARKS = END_MARKS | START_MARKS | set("-")
+
+
+def _marks_from_glyphs(gray, groups, top, base):
+    """Read a run of small marks (left to right), e.g. ...") -> '...")'.
+    None if any glyph isn't a recognisable mark."""
+    out, i = [], 0
+    while i < len(groups):
+        if i + 1 < len(groups) and _classify_symbol(gray, groups[i:i + 2], top, base) == '"':
+            out.append('"'); i += 2; continue
+        mark = _classify_symbol(gray, [groups[i]], top, base)
+        if mark not in ('"', "'", "*"):
+            mark = _classify_punct(gray, groups[i], top, base)
+        if mark is None:
+            return None
+        out.append(mark); i += 1
+    return "".join(out)
+
+
+def _fix_word_ends(b, boxes, gray, top, base, line_glyphs=None):
+    """Compare the marks at the end (and start) of a word in the image with
+    its text, and add the ones the OCR dropped: 'Browse.' + image 'Browse...")'
+    -> 'Browse...")'. Only when every mark is recognised."""
+    H = max(4.0, base - top)
+    gap_limit = 0.6 * H
+    others = [o for o in boxes if o is not b]
+    next_x = min([o.x for o in others if o.x >= b.x + b.w - 1] + [b.x + b.w + 8 * H])
+    prev_x = max([o.x + o.w for o in others if o.x + o.w <= b.x + 1] + [b.x - 8 * H])
+    region = (max(prev_x + 1, b.x - 8 * H), top - 0.45 * H, min(next_x - 1, b.x + b.w + 8 * H), base + 0.6 * H)
+    if line_glyphs is not None:      # the line's glyphs, found once for all its words
+        groups = [g for g in line_glyphs if g.x0 >= region[0] and g.x1 <= region[2]]
+    else:
+        # (glyphs cut by the region's sides belong to the neighbouring words)
+        groups = [g for g in _line_glyphs(gray, region) if not (g.touches & {"left", "right"})]
+    # glyphs that another word's box claims are that word's (overlapping boxes)
+    groups = [g for g in groups
+              if not any(o.x <= (g.x0 + g.x1) / 2 <= o.x + o.w for o in others)]
+    inside = [g for g in groups if g.x1 > b.x + 1 and g.x0 < b.x + b.w - 1]
+    if not inside:
+        return
+    text = b.text
+    end_chars, start_chars = "".join(ALL_MARKS), "".join(START_MARKS)
+    new_x0, new_x1 = b.x, b.x + b.w
+
+    # marks just past the box (a quote or bracket that sits closer to the
+    # next word belongs to that word: are "hex")
+    has_next = any(o.x >= b.x + b.w - 1 for o in others)
+    has_prev = any(o.x + o.w <= b.x + 1 for o in others)
+    tail, edge = [], b.x + b.w
+    for g in groups:
+        if g.x0 >= b.x + b.w - 1 and g not in inside:
+            if g.x0 - edge > gap_limit or (has_next and next_x - g.x1 < g.x0 - edge):
+                break
+            tail.append(g); edge = g.x1
+    head, edge = [], b.x
+    for g in reversed(groups):
+        if g.x1 <= b.x + 1 and g not in inside:
+            if edge - g.x1 > gap_limit or (has_prev and g.x0 - prev_x < edge - g.x1):
+                break
+            head.insert(0, g); edge = g.x0
+
+    # --- end of the word: marks at the end of the box plus those past it ---
+    seq = inside + tail
+    best = None
+    for k in range(len(seq) - 1, 0, -1):            # keep at least one glyph that isn't a mark
+        found = _marks_from_glyphs(gray, seq[k:], top, base)
+        if found is None:
+            break
+        best = (k, found)
+    have = text[len(text.rstrip(end_chars)):]
+    if best and len(best[1]) > len(have) and best[1].startswith(have) and len(text) > len(have):
+        text = text[:len(text) - len(have)] + best[1]           # 'started.' + image '.")'
+        new_x1 = max(new_x1, seq[-1].x1)
+
+    # --- start of the word ---
+    seq = head + inside
+    best = None
+    for k in range(1, len(seq)):
+        found = _marks_from_glyphs(gray, seq[:k], top, base)
+        if found is None or not all(m in START_MARKS for m in found):
+            break
+        best = (k, found)
+    have = text[:len(text) - len(text.lstrip(start_chars))]
+    if best and len(best[1]) > len(have) and best[1].endswith(have) and len(text) > len(have):
+        text = best[1] + text[len(have):]                       # '"Screen' + image '("Screen'
+        new_x0 = min(new_x0, seq[0].x0)
+
+    if text != b.text:
+        b.word.text = b.text = text
+    if (new_x0, new_x1) != (b.x, b.x + b.w):                  # the box now covers the marks
+        r = b.word.bounding_rect
+        b.word.bounding_rect = SimpleNamespace(x=new_x0, y=r.y, width=new_x1 - new_x0, height=r.height)
+        b.x, b.w = new_x0, new_x1 - new_x0
 
 
 def _repair_symbols(lines, gray):
@@ -1890,8 +2238,25 @@ def _repair_symbols(lines, gray):
             continue
         boxes = [SimpleNamespace(text=w.text, x=w.bounding_rect.x, y=w.bounding_rect.y,
                                  w=w.bounding_rect.width, h=w.bounding_rect.height, word=w) for w in words]
-        top, base = _line_metrics(boxes)
+        top, base = _line_metrics(boxes, gray)
         H = max(4.0, base - top)
+
+        # the line's ink, found once; glyphs(x0, x1) = the glyphs between x0 and x1
+        # (a glyph that crosses x0 or x1 counts as touching that side, as if cut)
+        line_left = max(0, min(bb.x for bb in boxes) - 8 * H)
+        line_right = max(bb.x + bb.w for bb in boxes) + 8 * H
+        line_blobs = [bl for bl in _components(gray, (line_left, top - 0.45 * H, line_right, base + 0.6 * H))
+                      if not (bl.touches & {"top", "bottom"})]
+
+        def glyphs(x0, x1):
+            picked = []
+            for bl in line_blobs:
+                if bl.x1 > x0 and bl.x0 < x1:
+                    sides = set()
+                    if bl.x0 < x0: sides.add("left")
+                    if bl.x1 > x1: sides.add("right")
+                    picked.append(SimpleNamespace(x0=bl.x0, y0=bl.y0, x1=bl.x1, y1=bl.y1, n=bl.n, touches=sides))
+            return _glyph_groups(picked)
 
         # 1) a symbol read as something else: one- or two-character words
         first_box = min(boxes, key=lambda b: b.x)
@@ -1900,14 +2265,14 @@ def _repair_symbols(lines, gray):
             core = b.text.strip(".,;:!?()[]\"'")
             if core in ("O", "o", "Ø", "ø", "©", "Θ", "θ") and core != b.text:
                 # a lone 0 or O with punctuation ("Zone 0,"): judge the letter by its shape
-                groups = _glyph_groups(_components(gray, (b.x - 1, top - 0.3 * H, b.x + b.w + 1, base + 0.3 * H)))
+                groups = glyphs(b.x - 1, b.x + b.w + 1)
                 tall = [g for g in groups if g.y1 - g.y0 >= 0.85 * H and not (g.touches & {"top", "bottom"})]
                 if len(tall) == 1 and tall[0].x1 - tall[0].x0 < 0.82 * (tall[0].y1 - tall[0].y0):
                     b.word.text = b.text = b.text.replace(core, "0", 1)
                 continue
             if len(b.text) > 2 or (b.text.isalnum() and b.text not in SYMBOL_LOOKALIKES):
                 continue
-            groups = _glyph_groups(_components(gray, (b.x - 1, top - 0.3 * H, b.x + b.w + 1, base + 0.3 * H)))
+            groups = glyphs(b.x - 1, b.x + b.w + 1)
             groups = [g for g in groups if g.x1 > b.x and g.x0 < b.x + b.w and not (g.touches & {"top", "bottom"})]
             if not 1 <= len(groups) <= 2:
                 continue
@@ -1930,7 +2295,7 @@ def _repair_symbols(lines, gray):
             for side in ("left", "right"):
                 x0 = b.x - 1 if side == "left" else b.x + b.w - edge
                 x1 = b.x + edge if side == "left" else b.x + b.w + 1
-                groups = _glyph_groups(_components(gray, (x0, top - 0.3 * H, x1, base + 0.35 * H)))
+                groups = glyphs(x0, x1)
                 groups = [g for g in groups if g.x1 - g.x0 >= 1]
                 if not groups:
                     continue
@@ -2007,12 +2372,20 @@ def _repair_symbols(lines, gray):
                         text = text + symbol
                 b.word.text = b.text = text + trailing
 
+        # 2b) punctuation at the end or start of a word: ..."), ("  - OCR
+        #     engines often drop some of a run of small marks
+        line_glyphs = _glyph_groups(line_blobs)
+        for b in sorted(boxes, key=lambda bb: bb.x):
+            _fix_word_ends(b, boxes, gray, top, base, line_glyphs)
+
         # 3) symbols left out entirely: blobs on the line not inside any word
         left = min(b.x for b in boxes)
         right = max(b.x + b.w for b in boxes)
-        region = (max(0, left - 4 * H), top - 0.3 * H, right + 1.5 * H, base + 0.35 * H)
-        groups = [g for g in _glyph_groups(_components(gray, region))
-                  if not covered(g) and not (g.touches & {"top", "bottom"})]
+        region = (max(0, left - 4 * H), top - 0.45 * H, right + 4 * H, base + 0.6 * H)
+        all_words[:] = [(w.bounding_rect.x, w.bounding_rect.y, w.bounding_rect.x + w.bounding_rect.width,
+                         w.bounding_rect.y + w.bounding_rect.height)
+                        for ln in lines for w in (getattr(ln, "words", None) or [])]
+        groups = [g for g in glyphs(region[0], region[2]) if not covered(g)]
         # pair up quote ticks
         found, i = [], 0
         while i < len(groups):
@@ -2023,7 +2396,7 @@ def _repair_symbols(lines, gray):
                     found.append((symbol, g.x0, groups[i + 1].x1))
                     i += 2
                     continue
-            symbol = _classify_symbol(gray, [g], top, base)
+            symbol = _classify_symbol(gray, [g], top, base) or _classify_punct(gray, g, top, base)
             if symbol:
                 found.append((symbol, g.x0, g.x1))
             i += 1
@@ -2033,9 +2406,19 @@ def _repair_symbols(lines, gray):
             after = [b for b in boxes if b.x >= x1 - 1]
             near_after = min(after, key=lambda b: b.x) if after else None
             near_before = max(before, key=lambda b: b.x + b.w) if before else None
-            limit = (0.6 if symbol in ('"', "'") else 0.25) * H
+            punct = symbol in PUNCTUATION
+            limit = (0.6 if symbol in ('"', "'") or punct else 0.25) * H
             gap_after = near_after.x - x1 if near_after is not None else 1e9
             gap_before = x0 - (near_before.x + near_before.w) if near_before is not None else 1e9
+            if punct:
+                # next to a word: already handled by _fix_word_ends
+                if min(gap_after, gap_before) >= limit and symbol in "()[]:;":
+                    # on its own (a lone dot or comma could be a speck)
+                    new = SimpleNamespace(text=symbol, bounding_rect=SimpleNamespace(x=x0, y=top, width=x1 - x0, height=H))
+                    pass
+                    line.words.append(new)
+                    boxes.append(SimpleNamespace(text=symbol, x=x0, y=top, w=x1 - x0, h=H, word=new))
+                continue
             if symbol == "*" and near_after is not None and near_after.text.startswith("*") and gap_after < 0.45 * H:
                 gap_after = 0                                  # ** written as two marks
             if symbol == "*" and near_before is not None and near_before.text.endswith("*") and gap_before < 0.45 * H:
@@ -2106,6 +2489,10 @@ def _fix_zero_and_o(text):
                     body.endswith("%") and set(body[:-1]) <= set("Oo")):
                 fixed = "".join("0" if c in "OoØøΘθ" else c for c in body)
                 return token.replace(core, prefix + fixed + unit)
+        # 1 or | read for the letter l between lowercase letters: Optiona11y -> Optionally
+        if re.search(r"[a-z][1|]+[a-z]", core) and sum(c.isdigit() for c in core) == core.count("1") \
+                and sum(c.isalpha() for c in core) >= 3:
+            return token.replace(core, re.sub(r"(?<=[a-z])[1|]+(?=[a-z])", lambda m: "l" * len(m.group()), core))
         if "0" in core and core.replace("0", "").isalpha() and len(core) >= 3 and digits == core.count("0"):
             out = []
             for i, c in enumerate(core):
@@ -2144,32 +2531,39 @@ def run_windows_ocr(image, language_tag=None):
 
     prepared = _prepare_for_ocr(image, OcrEngine.max_image_dimension)
 
-    writer = DataWriter()
-    writer.write_bytes(prepared.tobytes())
-    bitmap = SoftwareBitmap.create_copy_from_buffer(
-        writer.detach_buffer(), BitmapPixelFormat.RGBA8,
-        prepared.width, prepared.height)
+    def recognize(picture):
+        """Windows OCR on a PIL image -> plain copies of the lines and word
+        boxes (the WinRT objects belong to this thread), so the window can
+        re-format them without running OCR again."""
+        picture = picture.convert("RGBA")
+        writer = DataWriter()
+        writer.write_bytes(picture.tobytes())
+        bitmap = SoftwareBitmap.create_copy_from_buffer(
+            writer.detach_buffer(), BitmapPixelFormat.RGBA8, picture.width, picture.height)
 
-    async def recognize():
-        return await engine.recognize_async(bitmap)
+        async def run():
+            return await engine.recognize_async(bitmap)
 
-    result = asyncio.run(recognize())
+        result = asyncio.run(run())
+        found = []
+        for line in result.lines:
+            words = []
+            for word in line.words:
+                r = word.bounding_rect
+                words.append(SimpleNamespace(text=word.text, bounding_rect=SimpleNamespace(
+                    x=r.x, y=r.y, width=r.width, height=r.height)))
+            found.append(SimpleNamespace(text=line.text, words=words))
+        return found
 
-    # Plain copies of the lines and word boxes (the WinRT objects belong to
-    # this thread), so the window can re-format them without running OCR again
-    lines = []
-    for line in result.lines:
-        words = []
-        for word in line.words:
-            r = word.bounding_rect
-            words.append(SimpleNamespace(text=word.text, bounding_rect=SimpleNamespace(
-                x=r.x, y=r.y, width=r.width, height=r.height)))
-        lines.append(SimpleNamespace(text=line.text, words=words))
-
+    lines = recognize(prepared)
     try:
-        _repair_symbols(lines, prepared)       # bullets, *, " and 0 checked against the image
-    except Exception:
-        pass
+        _reread_lines(lines, prepared, recognize)   # lines missed or cut short: read again on their own
+    except Exception as e:
+        print(f"Re-reading lines skipped: {e}")
+    try:
+        _repair_symbols(lines, prepared)       # bullets, *, ", ) and 0 checked against the image
+    except Exception as e:
+        print(f"Symbol check skipped: {e}")
 
     return {
         "text": _layout_text(lines),
@@ -6602,8 +6996,11 @@ def on_close():
 # Main Window
 # ============================================================
 
+startup_step("packages loaded")
 root = tk.Tk()
 root.withdraw()   # shown, centred, once the layout is built
+startup_step(f"window system ready (Tk {root.tk.call('info', 'patchlevel')}, "
+             f"{root.tk.call('tk', 'windowingsystem')})")
 root.title("Screen Capture Utility")
 root.resizable(False, False)
 root.protocol("WM_DELETE_WINDOW", on_close)
@@ -6622,13 +7019,10 @@ def screen_work_area():
     """(left, top, width, height) of the usable area (without the taskbar)
     of the monitor the mouse is on - the one the user is looking at."""
     if IS_MAC:
-        if mac_work_area.ready:
-            try:
-                return mac_work_area()
-            except Exception:
-                pass
-        # menu bar at the top (about 25-38 points), Dock at the bottom
-        return 0, 38, root.winfo_screenwidth(), root.winfo_screenheight() - 38 - 70
+        try:
+            return mac_work_area()
+        except Exception:
+            return 0, 25, root.winfo_screenwidth(), root.winfo_screenheight() - 25
     try:
         from ctypes import wintypes
         user32 = ctypes.windll.user32
@@ -6684,7 +7078,11 @@ BAR_BG = "#141824"
 #               screen a bit bigger than 1920 x 1080; on smaller screens (laptops, 1366 x 768)
 #               everything shrinks, on large ones it grows a little, so the
 #               window always takes up a similar share of the screen.
-DPI_SCALE = max(1.0, root.winfo_fpixels("1i") / 96.0)
+# On a Mac, Tk works in points and macOS itself makes Retina screens sharp,
+# so no extra scaling. (Some Mac set-ups report a nonsensical screen
+# resolution to Tk, which would blow every icon up to an enormous size.)
+_RAW_DPI = root.winfo_fpixels("1i")
+DPI_SCALE = 1.0 if IS_MAC else min(4.0, max(1.0, _RAW_DPI / 96.0))
 
 
 def _screen_fit():
@@ -6695,6 +7093,8 @@ def _screen_fit():
 
 UI_FIT = _screen_fit()
 UI_SCALE = DPI_SCALE * UI_FIT
+startup_step(f"scale: screen reports {_RAW_DPI:.0f} dpi -> {DPI_SCALE:.2f} x {UI_FIT:.2f}; "
+             f"work area {screen_work_area()}")
 FONT_SCALE = DPI_SCALE * max(0.86, UI_FIT)      # text never gets too small to read
 
 
@@ -6899,7 +7299,7 @@ def draw_icon(kind, color, size, accent=RED):
 def icon(kind, color=TEXT, size=20, accent=RED):
     key = (kind, color, size, accent)
     if key not in ICONS:
-        ICONS[key] = draw_icon(kind, color, S(size), accent)
+        ICONS[key] = draw_icon(kind, color, max(8, min(256, S(size))), accent)
     return ICONS[key]
 
 
@@ -7412,18 +7812,6 @@ fit_to_screen()
 def center_window():
     """Show the window in the middle of the screen (monitor, laptop,
     any size or display scaling)."""
-    if IS_MAC:
-        # macOS places the title bar itself: no invisible-window measuring
-        root.update_idletasks()
-        left, top, width, height = screen_work_area()
-        x = left + max(0, (width - root.winfo_reqwidth()) // 2)
-        y = top + max(0, (height - root.winfo_reqheight() - 28) // 3)
-        root.geometry(f"+{x}+{y}")
-        root.deiconify()
-        root.lift()
-        root.attributes("-topmost", True)                  # come to the front once
-        root.after(300, lambda: root.attributes("-topmost", False))
-        return
     root.update_idletasks()
     left, top, width, height = screen_work_area()
 
@@ -7532,7 +7920,20 @@ mirror_control_keys(root)                    # Cmd+Shift+... on a Mac
 # Start Application
 # ============================================================
 
+startup_step("window built")
 center_window()
+_started.set()
+faulthandler.cancel_dump_traceback_later()
+startup_step(f"window shown: {root.winfo_width()} x {root.winfo_height()}, {len(ICONS)} icons")
+
+if IS_MAC:
+    # Quit from the Dock, the app menu or Cmd+Q goes through the same checks
+    # as closing the window (recording still saving, screenshots pending...)
+    root.createcommand("tk::mac::Quit", on_close)
+    try:      # bring the app to the front (opened from the Finder it may start behind)
+        mac["AppKit"].NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
+    except Exception:
+        pass
 
 
 def check_mac_permissions():
@@ -7543,22 +7944,14 @@ def check_mac_permissions():
                        "Privacy & Security, then quit and reopen the app.")
 
 
-def mac_after_start():
-    mac_startup_done()
-    mac_work_area.ready = True
-    check_mac_permissions()
-
-
-if IS_MAC:
-    # Cmd+Q, the app menu's Quit and the Dock's Quit go through on_close;
-    # clicking the Dock icon brings the window back
-    root.createcommand("tk::mac::Quit", on_close)
-    root.createcommand("tk::mac::ReopenApplication", lambda *a: (root.deiconify(), root.lift()))
-    try:
-        signal.signal(signal.SIGTERM, lambda *a: root.after(0, on_close))
-    except Exception:
-        pass
-    root.after(800, mac_after_start)
+if SELFTEST:
+    def _selftest_done():
+        print(f"SELFTEST OK: window {root.winfo_width()} x {root.winfo_height()}, "
+              f"peak memory {peak_memory_mb():.0f} MB, start-up {time.time() - _T0:.1f} s")
+        root.destroy()
+    root.after(1500, _selftest_done)
+else:
+    root.after(800, check_mac_permissions)
 
 print("Screen Capture Utility started.")
 print("Choose a save folder in the window (type a path or click Browse...).")
